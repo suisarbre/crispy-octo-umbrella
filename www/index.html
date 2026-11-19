@@ -10,20 +10,37 @@
   body { font:15px/1.5 ui-monospace, "Cascadia Mono", Menlo, Consolas, "D2Coding", monospace; padding:20px; }
   main { width:max-content; max-width:100%; margin:0 auto; }
   canvas { display:block; cursor:crosshair; max-width:100%; }
-  pre { margin:14px 0; min-height:15em; white-space:pre-wrap; font:inherit; }
+  #panel { display:grid; grid-template-columns:24ch 1fr; gap:0 32px; margin:16px 0; font-variant-numeric:tabular-nums; }
+  #panel > div > * { margin:0; min-height:1.5em; white-space:pre; font:inherit; }
+  #link { color:var(--empire); }
+  #panel #unit { margin-bottom:12px; }
+  #panel #ledger { min-height:6em; }
+  #result { color:var(--brood); }
+  #log { margin:0; min-height:9em; white-space:pre-wrap; font:inherit; border-left:1px solid var(--dim); padding-left:32px; }
   nav { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
-  button { font:inherit; color:var(--fg); background:none; border:1px solid var(--dim); padding:3px 12px; cursor:pointer; }
+  button { font:inherit; color:var(--fg); background:none; border:1px solid var(--dim); padding:4px 12px; cursor:pointer; }
   button:hover, button:focus-visible { border-color:var(--fg); outline:none; }
-  #seed { color:var(--dim); margin-left:auto; }
+  kbd { font:inherit; font-size:12px; border:1px solid var(--dim); border-bottom-width:2px; padding:0 4px; margin-left:8px; }
+  #seed { margin-left:auto; }
+  @media (max-width:560px) { #panel { grid-template-columns:1fr; gap:16px 0; } #log { border-left:0; padding-left:0; } }
   #err { color:var(--empire); }
 </style>
 </head>
 <body>
 <main>
   <canvas id="screen" aria-label="전장"></canvas>
-  <pre id="text" aria-live="polite"></pre>
+  <section id="panel">
+    <div>
+      <p id="status"></p>
+      <p id="link" aria-label="제국 중계 링크"></p>
+      <p id="unit"></p>
+      <pre id="ledger"></pre>
+      <p id="result"></p>
+    </div>
+    <pre id="log" aria-live="polite"></pre>
+  </section>
   <nav>
-    <button id="end">턴 종료 [Space]</button>
+    <button id="end">턴 종료<kbd>Space</kbd></button>
     <button id="new">새 판</button>
     <button id="export">세이브 내보내기</button>
     <button id="import">불러오기</button>

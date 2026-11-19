@@ -1,7 +1,7 @@
 //! 브라우저와 코어 사이의 얇은 경계. wasm-bindgen 없이 숫자와 포인터만 주고받는다.
 //! JS는 `frame_ptr`에서 칸 배열을, `text_ptr`에서 상태 문구를 읽어 그리기만 한다.
 
-use sim::{Game, Pos, Side, Tile, H, W};
+use sim::{Class, Game, Pos, Side, Tile, Unit, H, W};
 
 /// 팔레트 번호. 실제 색은 www/main.js가 정한다.
 pub const BG: u32 = 0;
@@ -11,6 +11,9 @@ pub const BROOD: u32 = 3;
 pub const EMPIRE: u32 = 4;
 
 const CELLS: usize = (W * H) as usize;
+const LOG_LINES: usize = 6;
+/// 문구 구역 구분자. 순서: 상황, 중계 링크, 선택 유닛, 장부 내역, 장부 결과, 기록.
+const SEP: &str = "\u{1f}";
 
 struct State {
     game: Game,
@@ -75,56 +78,67 @@ fn render(s: &mut State) {
         }
     }
 
-    let mut t = String::new();
-    match g.outcome {
-        Some(Side::Brood) => t.push_str("제국 분대 전멸.\n"),
-        Some(Side::Empire) => t.push_str("전원 사망.\n"),
-        None => t.push_str(&format!("라운드 {}\n", g.round)),
-    }
-    t.push_str(if g.network_up() { "제국 중계: 연결\n" } else { "제국 중계: 두절\n" });
-    match g.selected {
-        Some(sel) => {
-            let u = &g.units[sel];
-            let d = u.class.def();
-            t.push_str(&format!("{} {}  체력 {}/{}  행동 {}\n", d.glyph, d.name, u.hp, d.hp, u.ap));
-        }
-        None => t.push_str("—\n"),
-    }
-    t.push_str(&hover_line(g, s.hover));
-    t.push('\n');
-    let from = g.log.len().saturating_sub(6);
-    for line in &g.log[from..] {
-        t.push('\n');
-        t.push_str(line);
-    }
-    s.text = t;
+    let (ledger, result) = ledger(g, s.hover);
+    let from = g.log.len().saturating_sub(LOG_LINES);
+    let sections = [
+        match g.outcome {
+            Some(Side::Brood) => "제국 분대 전멸".to_string(),
+            Some(Side::Empire) => "전원 사망".to_string(),
+            None => format!("라운드 {}", g.round),
+        },
+        link_line(g),
+        match g.selected {
+            Some(sel) => format!("{}  행동 {}", unit_line(&g.units[sel]), g.units[sel].ap),
+            None => "—".to_string(),
+        },
+        ledger,
+        result,
+        g.log[from..].join("\n"),
+    ];
+    s.text = sections.join(SEP);
 }
 
-fn hover_line(g: &Game, hover: Option<Pos>) -> String {
-    let Some(p) = hover else { return "—".into() };
-    let Some(t) = g.unit_at(p) else { return "—".into() };
-    let u = &g.units[t];
+/// 중계기에 누가 물려 있는지. 이 게임의 표식이다.
+fn link_line(g: &Game) -> String {
+    let up = g.network_up();
+    let mut line = String::from(if up { "& ──" } else { "×   " });
+    for u in g.units.iter().filter(|u| u.side == Side::Empire && u.class != Class::Relay) {
+        line.push(' ');
+        line.push(if u.alive() { u.class.def().glyph } else { '·' });
+    }
+    line.push_str(if up { "  연결" } else { "  두절" });
+    line
+}
+
+fn unit_line(u: &Unit) -> String {
     let d = u.class.def();
+    format!("{} {}  체력 {}/{}", d.glyph, d.name, u.hp, d.hp)
+}
+
+fn minus(v: i32) -> String {
+    if v > 0 { format!("−{v}") } else { "0".to_string() }
+}
+
+/// 명중률 장부. (내역, 결과) 두 조각으로 나눠서 결과만 따로 칠할 수 있게 한다.
+fn ledger(g: &Game, hover: Option<Pos>) -> (String, String) {
+    let none = || ("—".to_string(), String::new());
+    let Some(p) = hover else { return none() };
+    let Some(t) = g.unit_at(p) else { return none() };
+    let u = &g.units[t];
     if u.side == Side::Brood {
-        return format!("{} {}  체력 {}/{}", d.glyph, d.name, u.hp, d.hp);
+        return (unit_line(u), String::new());
     }
     if !g.seen_by(Side::Brood, p) {
-        return "—".into();
+        return none();
     }
-    let head = format!("{} {}  체력 {}/{}", d.glyph, d.name, u.hp, d.hp);
-    let Some(sel) = g.selected else { return head };
+    let head = unit_line(u);
+    let Some(sel) = g.selected else { return (head, String::new()) };
     match g.shot(sel, t) {
-        Some(s) => {
-            let mut parts = format!("조준 {}", s.aim);
-            if s.cover > 0 {
-                parts.push_str(&format!(" − 엄폐 {}", s.cover));
-            }
-            if s.falloff > 0 {
-                parts.push_str(&format!(" − 거리 {}", s.falloff));
-            }
-            format!("{head}   명중 {}%  ({parts})", s.chance)
-        }
-        None => format!("{head}   사선 없음"),
+        Some(s) => (
+            format!("{head}\n조준 {:>5}\n엄폐 {:>5}\n거리 {:>5}", s.aim, minus(s.cover), minus(s.falloff)),
+            format!("명중 {:>5}%", s.chance),
+        ),
+        None => (head, "사선 없음".to_string()),
     }
 }
 
@@ -205,6 +219,10 @@ mod tests {
         let s = state();
         assert!(s.frame.iter().any(|&c| c == cell('·', BROOD, BG)));
         end_turn();
-        assert!(state().text.starts_with("라운드 2"));
+        let text = state().text.clone();
+        let parts: Vec<&str> = text.split(SEP).collect();
+        assert_eq!(parts.len(), 6);
+        assert_eq!(parts[0], "라운드 2");
+        assert_eq!(parts[1], "& ── h h h h  연결");
     }
 }

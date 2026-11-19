@@ -6,6 +6,9 @@ const SAVE_VERSION = 1;
 const FONT_PX = 20;
 const FONT = `${FONT_PX}px ui-monospace, "Cascadia Mono", Menlo, Consolas, monospace`;
 
+// game.wasm이 넘기는 문구 구역 순서와 같다.
+const TEXT_REGIONS = ["status", "link", "unit", "ledger", "result", "log"];
+
 const $ = (id) => document.getElementById(id);
 const canvas = $("screen");
 const ctx = canvas.getContext("2d");
@@ -51,7 +54,12 @@ function draw() {
     }
   }
   const bytes = new Uint8Array(wasm.memory.buffer, wasm.text_ptr(), wasm.text_len());
-  $("text").textContent = new TextDecoder().decode(bytes);
+  const parts = new TextDecoder().decode(bytes).split("\u001f");
+  TEXT_REGIONS.forEach((id, i) => {
+    const el = $(id);
+    const next = parts[i] ?? "";
+    if (el.textContent !== next) el.textContent = next;
+  });
   $("seed").textContent = `시드 ${save.seed}`;
 }
 
