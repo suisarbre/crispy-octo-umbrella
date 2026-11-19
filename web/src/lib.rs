@@ -344,8 +344,8 @@ fn minus(v: i32) -> String {
 struct Lanes {
     /// 이동할 칸을 가리키는 중이면 true. 그때는 그 칸에서 본 사선이다.
     after_move: bool,
-    /// 이동에 마지막 행동을 써서, 가도 쏠 수 없다.
-    no_action_left: bool,
+    /// 이동에 마지막 행동을 쓴다. 사선은 다음 턴에 쏠 수 있는 것이다.
+    next_turn: bool,
     /// (적, 명중률). 높은 순.
     shots: Vec<(usize, i32)>,
 }
@@ -353,15 +353,12 @@ struct Lanes {
 /// 지금 보이는 적만 따진다. 옮겨 가서 새로 보일 적은 미리 알려주지 않는다.
 fn fire_lanes(s: &State, can_act: bool) -> Lanes {
     let g = &s.game;
-    let mut lanes = Lanes { after_move: false, no_action_left: false, shots: Vec::new() };
+    let mut lanes = Lanes { after_move: false, next_turn: false, shots: Vec::new() };
     let Some(sel) = g.selected.filter(|&i| can_act && g.units[i].ap > 0) else { return lanes };
     let mut from = g.units[sel].pos;
     if let Some(h) = s.hover.filter(|&h| g.path_to(sel, h).is_some()) {
         lanes.after_move = true;
-        if g.units[sel].ap < 2 {
-            lanes.no_action_left = true;
-            return lanes;
-        }
+        lanes.next_turn = g.units[sel].ap < 2;
         from = h;
     }
     for (t, u) in g.units.iter().enumerate() {
@@ -376,10 +373,11 @@ fn fire_lanes(s: &State, can_act: bool) -> Lanes {
 }
 
 fn lanes_text(s: &State, lanes: &Lanes) -> String {
-    let head = if lanes.after_move { "이동 후" } else { "여기서" };
-    if lanes.no_action_left {
-        return format!("{head}\n행동 없음");
-    }
+    let head = match (lanes.after_move, lanes.next_turn) {
+        (true, true) => "이동 후, 다음 턴",
+        (true, false) => "이동 후",
+        _ => "여기서",
+    };
     if lanes.shots.is_empty() {
         return format!("{head}\n사선 없음");
     }
@@ -572,11 +570,11 @@ mod tests {
         assert_eq!(s.frame[at], cell('h', EMPIRE, DIM));
         assert!(s.text.contains("이동 후\n"));
 
-        // 마지막 행동으로 가면 쏠 수 없으니 표시하지 않는다.
+        // 마지막 행동으로 가도 사선은 보여준다. 다음 턴 것이라고 밝힌다.
         s.game.units[0].ap = 1;
         render(&mut s);
-        assert_eq!(s.frame[at], cell('h', EMPIRE, BG));
-        assert!(s.text.contains("이동 후\n행동 없음"));
+        assert_eq!(s.frame[at], cell('h', EMPIRE, DIM));
+        assert!(s.text.contains("이동 후, 다음 턴\n"));
     }
 
     /// 끝까지 재생하면 어느 판이든 실제 상태에 도착하고, 사격은 탄 → 결과 순으로 나온다.
