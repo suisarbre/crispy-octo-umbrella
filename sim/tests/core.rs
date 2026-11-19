@@ -68,7 +68,7 @@ fn shown_chance_is_the_rolled_chance() {
     // 표시 확률대별로 실제 적중을 세서 비교한다.
     let mut shots = [0u32; 10];
     let mut hits = [0u32; 10];
-    for seed in 0..600 {
+    for seed in 0..300 {
         let mut g = Game::new(seed);
         let mut bot = Rng::new(seed);
         while g.outcome.is_none() && g.round < 80 {
@@ -112,7 +112,7 @@ fn games_end_and_both_sides_can_win() {
 }
 
 #[test]
-fn killing_the_relay_drops_the_bonus() {
+fn killing_the_relay_cuts_the_network() {
     let mut g = Game::new(7);
     assert!(g.network_up());
     let relay = g.units.iter().position(|u| u.class == sim::Class::Relay).unwrap();

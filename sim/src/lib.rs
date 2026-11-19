@@ -12,8 +12,6 @@ pub const W: i32 = 28;
 pub const H: i32 = 16;
 pub const SIGHT: i32 = 14;
 pub const AP_PER_TURN: u8 = 2;
-/// 중계기가 살아 있을 때 제국 병사가 받는 조준 보정.
-pub const NETWORK_AIM: i32 = 15;
 pub const COVER_LOW: i32 = 20;
 pub const COVER_WALL: i32 = 40;
 /// 이 거리까지는 감점 없음. 그 뒤로 칸당 `FALLOFF_PER_TILE`.
@@ -90,7 +88,6 @@ impl Unit {
 pub struct Shot {
     pub chance: i32,
     pub aim: i32,
-    pub network: i32,
     pub cover: i32,
     pub falloff: i32,
 }
@@ -173,7 +170,7 @@ impl Game {
         self.units.iter().position(|u| u.alive() && u.pos == p)
     }
 
-    /// 중계기가 하나라도 살아 있으면 제국 분대는 시야와 조준 보정을 공유한다.
+    /// 중계기가 하나라도 살아 있으면 제국 분대는 시야와 기억을 합쳐 한 머리로 둔다. 수치 보정은 없다.
     pub fn network_up(&self) -> bool {
         self.units.iter().any(|u| u.alive() && u.class == Class::Relay)
     }
@@ -236,11 +233,10 @@ impl Game {
         if d == 0 || d > def.range || !self.los(from, target) {
             return None;
         }
-        let network = if u.side == Side::Empire && self.network_up() { NETWORK_AIM } else { 0 };
         let cover = self.cover(from, target);
         let falloff = (d - FALLOFF_START).max(0) * FALLOFF_PER_TILE;
-        let chance = (def.aim + network - cover - falloff).clamp(0, 100);
-        Some(Shot { chance, aim: def.aim, network, cover, falloff })
+        let chance = (def.aim - cover - falloff).clamp(0, 100);
+        Some(Shot { chance, aim: def.aim, cover, falloff })
     }
 
     pub fn shot(&self, shooter: usize, target: usize) -> Option<Shot> {

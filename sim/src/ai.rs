@@ -1,13 +1,14 @@
 //! 수 고르기. 체스 엔진처럼 지금 판에서 제일 좋은 다음 행동을 찾되, 아는 것만 가지고 찾는다.
 //!
 //! - 확률은 기대값으로 센다. 피해가 고정이라 명중률 × 피해면 된다.
-//! - 한 턴 반을 본다: 내 행동과, 그 자리에서 상대가 한 번 움직여 쏠 수 있는 최선.
+//! - 두 턴 반을 본다: 내 행동, 상대의 반격(한 번 움직여 쏠 수 있는 최선), 살아남았을 때
+//!   그 자리에서 시작하는 내 다음 턴, 그리고 거기에 대한 반격.
 //! - 행동 하나를 하고 나면 결과를 보고 처음부터 다시 고른다.
 //! - 탐색량은 판의 크기로만 정해진다. 시간 제한은 쓰지 않는다. 기기마다 결과가 달라지면 세이브가 깨진다.
 //!
 //! 중계가 살아 있으면 분대가 한 머리로 둔다. 시야와 기억을 합치고, 매번 분대 전체에서
 //! 가장 이득이 큰 행동을 고른다. 중계가 끊기면 각자 번호 순서대로, 자기 눈에 보이는 것만 가지고,
-//! 상대가 움직일 것은 계산하지 않고 둔다.
+//! 상대가 움직일 것도 다음 턴도 계산하지 않고 둔다.
 
 use crate::{dist, Class, Game, Pos, Side, SIGHT, W};
 
@@ -26,11 +27,22 @@ pub struct Doctrine {
     pub step_cost: i32,
     /// 중계기는 받을 피해를 이만큼 더 크게 친다.
     pub relay_caution: i32,
+    /// 다음 턴에 얻을 것을 지금 것의 몇 퍼센트로 치는가.
+    pub foresight: i32,
+}
+
+impl Doctrine {
+    /// 제국 기본값. `sweep`으로 재서 골랐다: 덜 물러나고, 더 이기고, 판이 덜 늘어진다.
+    pub const STANDARD: Doctrine =
+        Doctrine { dmg: 10, kill: 15, threat: 2, approach: 40, step_cost: 10, relay_caution: 3, foresight: 70 };
+    /// 몸을 사리는 성향. 시험에서 아군 쪽을 두는 상대로 쓴다. 비교 기준이라 바꾸지 않는다.
+    pub const CAUTIOUS: Doctrine =
+        Doctrine { dmg: 10, kill: 15, threat: 6, approach: 20, step_cost: 10, relay_caution: 3, foresight: 70 };
 }
 
 impl Default for Doctrine {
     fn default() -> Self {
-        Doctrine { dmg: 10, kill: 15, threat: 6, approach: 20, step_cost: 10, relay_caution: 3 }
+        Doctrine::STANDARD
     }
 }
 
@@ -55,6 +67,10 @@ struct Plan<'a> {
     /// 아는 적마다, 그 적이 쏘기 시작할 수 있는 칸들.
     launch: Vec<Vec<Pos>>,
     threat: Vec<i32>,
+    /// 아래 둘은 `cached_for` 유닛 것이다. 칸마다 한 번만 계산한다.
+    cached_for: usize,
+    shot: Vec<i32>,
+    stand: Vec<i32>,
 }
 
 const UNSET: i32 = i32::MIN;
@@ -83,7 +99,8 @@ impl<'a> Plan<'a> {
                 }
             }
         }
-        let mut plan = Plan { g, side, shared: solo.is_none(), known, launch: Vec::new(), threat: vec![UNSET; g.tiles.len()] };
+        let n = g.tiles.len();
+        let mut plan = Plan { g, side, shared: solo.is_none(), known, launch: Vec::new(), threat: vec![UNSET; n], cached_for: usize::MAX, shot: vec![UNSET; n], stand: vec![UNSET; n] };
         plan.launch = (0..plan.known.len())
             .map(|k| {
                 let mut from = vec![plan.known[k].pos];
@@ -95,6 +112,15 @@ impl<'a> Plan<'a> {
             })
             .collect();
         plan
+    }
+
+    /// 제국은 판에 실린 가중치로, 아군 쪽(시험용 상대)은 기본값으로 둔다.
+    fn doctrine(&self) -> &'a Doctrine {
+        if self.side == Side::Empire {
+            &self.g.doctrine
+        } else {
+            &Doctrine::CAUTIOUS
+        }
     }
 
     /// 계획이 아는 한에서 막힌 칸. 모르는 적이 서 있는 칸은 비었다고 본다.
@@ -122,9 +148,9 @@ impl<'a> Plan<'a> {
         self.threat[i]
     }
 
-    /// 이 칸에서 턴을 마치는 것의 값.
-    fn stand(&mut self, me: usize, tile: Pos) -> i32 {
-        let d = &self.g.doctrine;
+    /// 이 칸에서 턴을 마치고 반격 한 번을 받는 것까지의 값.
+    fn rest(&mut self, me: usize, tile: Pos) -> i32 {
+        let d = self.doctrine();
         let relay = self.g.units[me].class == Class::Relay;
         let caution = if relay { d.relay_caution } else { 1 };
         let threat = self.threat_at(tile) * d.threat * caution;
@@ -141,9 +167,50 @@ impl<'a> Plan<'a> {
         -threat - pull
     }
 
+    /// 이 칸에서 턴을 마치는 것의 값. 분대로 둘 때는 살아남았을 경우의 다음 턴까지 본다.
+    fn stand(&mut self, me: usize, tile: Pos) -> i32 {
+        if self.cached_for != me {
+            self.cached_for = me;
+            self.shot.iter_mut().for_each(|v| *v = UNSET);
+            self.stand.iter_mut().for_each(|v| *v = UNSET);
+        }
+        let i = (tile.1 * W + tile.0) as usize;
+        if self.stand[i] == UNSET {
+            self.stand[i] = self.stand_uncached(me, tile);
+        }
+        self.stand[i]
+    }
+
+    fn stand_uncached(&mut self, me: usize, tile: Pos) -> i32 {
+        let now = self.rest(me, tile);
+        if !self.shared {
+            return now;
+        }
+        // 다음 턴: 여기서 쏘거나, 한 번 가서 쏘거나, 더 나은 자리로 간다. 그 끝에서 또 반격을 받는다.
+        let step = self.doctrine().step_cost;
+        let mv = self.g.units[me].class.def().mv;
+        let mut next = self.shot_value(me, tile);
+        for a in self.g.flood_from(tile, mv, |p| self.blocked(p)) {
+            let there = self.shot_value(me, a) + self.rest(me, a) - now - step;
+            next = next.max(there);
+        }
+        // 반격에 죽으면 다음 턴은 없다.
+        let hp = self.g.units[me].hp * 100;
+        let alive = (hp - self.threat_at(tile)).clamp(0, hp);
+        now + next * alive / hp * self.doctrine().foresight / 100
+    }
+
+    fn shot_value(&mut self, me: usize, from: Pos) -> i32 {
+        let i = (from.1 * W + from.0) as usize;
+        if self.shot[i] == UNSET {
+            self.shot[i] = self.best_shot(me, from).map_or(0, |(_, v)| v);
+        }
+        self.shot[i]
+    }
+
     /// `from`에서 쏠 수 있는 가장 값진 사격. (표적, 값)
     fn best_shot(&self, me: usize, from: Pos) -> Option<(usize, i32)> {
-        let d = &self.g.doctrine;
+        let d = self.doctrine();
         let dmg = self.g.units[me].class.def().dmg;
         let mut best: Option<(usize, i32)> = None;
         for k in self.known.iter().filter(|k| k.seen) {
@@ -162,7 +229,7 @@ impl<'a> Plan<'a> {
         let here = self.g.units[me].pos;
         let ap = self.g.units[me].ap;
         let mv = self.g.units[me].class.def().mv;
-        let step = self.g.doctrine.step_cost;
+        let step = self.doctrine().step_cost;
         let hold = self.stand(me, here);
         let mut best: Option<Act> = None;
         let mut best_value = hold;
@@ -355,18 +422,36 @@ mod tests {
         slowest: Duration,
         total: Duration,
         turns: u32,
+        /// 제국 병사가 턴을 마쳤을 때 가장 가까운 적과의 거리가 어떻게 됐는가.
+        closer: u32,
+        farther: u32,
+        rounds: u32,
+    }
+
+    fn gaps(g: &Game) -> Vec<Option<i32>> {
+        g.units
+            .iter()
+            .map(|u| {
+                if u.side != Side::Empire || !u.alive() || u.class == Class::Relay {
+                    return None;
+                }
+                g.units.iter().filter(|b| b.side == Side::Brood && b.alive()).map(|b| dist(u.pos, b.pos)).min()
+            })
+            .collect()
     }
 
     /// 아군도 탐색기가 둔다. 제국만 예전 교리와 새 탐색기를 바꿔 가며 붙인다.
-    fn tournament(games: u64, new_empire: bool) -> Tally {
-        let mut t = Tally { brood: 0, empire: 0, open: 0, slowest: Duration::ZERO, total: Duration::ZERO, turns: 0 };
+    fn tournament(games: u64, new_empire: bool, doctrine: &Doctrine) -> Tally {
+        let mut t = Tally { brood: 0, empire: 0, open: 0, slowest: Duration::ZERO, total: Duration::ZERO, turns: 0, closer: 0, farther: 0, rounds: 0 };
         for seed in 0..games {
             let mut g = Game::new(seed);
+            g.doctrine = doctrine.clone();
             while g.outcome.is_none() && g.round < 60 {
                 run(&mut g, Side::Brood);
                 if g.outcome.is_some() {
                     break;
                 }
+                let before = gaps(&g);
                 let start = Instant::now();
                 if new_empire {
                     run(&mut g, Side::Empire);
@@ -381,11 +466,18 @@ mod tests {
                 t.slowest = t.slowest.max(took);
                 t.total += took;
                 t.turns += 1;
+                for (b, a) in before.iter().zip(gaps(&g)) {
+                    if let (Some(b), Some(a)) = (b, a) {
+                        t.closer += (a < *b) as u32;
+                        t.farther += (a > *b) as u32;
+                    }
+                }
                 for u in &mut g.units {
                     u.ap = AP_PER_TURN;
                 }
                 g.round += 1;
             }
+            t.rounds += g.round;
             match g.outcome {
                 Some(Side::Brood) => t.brood += 1,
                 Some(Side::Empire) => t.empire += 1,
@@ -397,19 +489,46 @@ mod tests {
 
     #[test]
     fn search_beats_the_old_doctrine() {
-        let old = tournament(300, false);
-        let new = tournament(300, true);
+        let old = tournament(300, false, &Doctrine::STANDARD);
+        let new = tournament(300, true, &Doctrine::STANDARD);
         for (name, t) in [("예전", &old), ("탐색", &new)] {
             println!(
-                "{name}: 제국 승 {} / 패 {} / 미결 {}   턴당 평균 {:?}, 최장 {:?}",
+                "{name}: 제국 승 {} / 패 {} / 미결 {}   다가감 {} / 물러남 {}   판당 {} 라운드   턴당 평균 {:?}, 최장 {:?}",
                 t.empire,
                 t.brood,
                 t.open,
+                t.closer,
+                t.farther,
+                t.rounds / 300,
                 t.total / t.turns.max(1),
                 t.slowest
             );
         }
         assert!(new.empire > old.empire, "탐색 {} vs 예전 {}", new.empire, old.empire);
+    }
+
+    /// 가중치를 바꿔 가며 성향을 본다. `cargo test -p sim --release sweep -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn sweep() {
+        println!("위협 접근 예견 | 승  패 미결 | 다가감 물러남 | 라운드");
+        for threat in [1, 2, 3, 4, 6] {
+            for approach in [20, 40] {
+                for foresight in [70, 100] {
+                    let d = Doctrine { threat, approach, foresight, ..Doctrine::STANDARD };
+                    let t = tournament(120, true, &d);
+                    println!(
+                        "{threat:>4} {approach:>4} {foresight:>4} | {:>3} {:>3} {:>3} | {:>5} {:>5} | {:>3}",
+                        t.empire,
+                        t.brood,
+                        t.open,
+                        t.closer,
+                        t.farther,
+                        t.rounds / 120
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -419,7 +538,6 @@ mod tests {
             for seed in 0..300 {
                 let mut g = Game::new(seed);
                 if cut {
-                    // 조준 보정 없이 판단력만 견주려고, 양쪽 다 보정을 못 받는 조건으로 맞춘다.
                     let relay = g.units.iter().position(|u| u.class == Class::Relay).unwrap();
                     g.units[relay].hp = 0;
                 }
