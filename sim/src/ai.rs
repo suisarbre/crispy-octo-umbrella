@@ -31,8 +31,7 @@ pub(crate) fn act(g: &mut Game, me: usize) {
         }
 
         if best_tile != here {
-            g.units[me].pos = best_tile;
-            g.units[me].ap -= 1;
+            g.move_unit(me, best_tile);
             continue;
         }
         if let Some((t, chance)) = best_now {

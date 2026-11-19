@@ -95,6 +95,15 @@ pub struct Shot {
     pub falloff: i32,
 }
 
+/// 화면이 순서대로 보여줄 일들. 규칙에는 영향이 없고 지문에도 안 들어간다.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Event {
+    /// 한 칸 이동.
+    Step { unit: usize, from: Pos, to: Pos },
+    /// 사격 한 번. `log_lines`는 이 사격이 기록에 남긴 줄 수.
+    Shot { shooter: usize, target: usize, hit: bool, dmg: i32, killed: bool, log_lines: usize },
+}
+
 #[derive(Clone, Debug)]
 pub struct Game {
     pub seed: u64,
@@ -104,6 +113,7 @@ pub struct Game {
     pub selected: Option<usize>,
     pub outcome: Option<Side>,
     pub log: Vec<String>,
+    pub events: Vec<Event>,
     rng: Rng,
 }
 
@@ -141,7 +151,7 @@ impl Game {
             let x = if *c == Class::Relay { W - 1 } else { W - 2 };
             units.push(Unit { side: Side::Empire, class: *c, hp: c.def().hp, pos: (x, 2 + 3 * i as i32), ap: AP_PER_TURN });
         }
-        Game { seed, tiles, units, round: 1, selected: None, outcome: None, log: Vec::new(), rng }
+        Game { seed, tiles, units, round: 1, selected: None, outcome: None, log: Vec::new(), events: Vec::new(), rng }
     }
 
     pub fn tile(&self, p: Pos) -> Tile {
@@ -241,10 +251,11 @@ impl Game {
             .any(|u| u.alive() && u.side == side && dist(u.pos, p) <= SIGHT && self.los(u.pos, p))
     }
 
-    /// 행동 1회로 갈 수 있는 칸들.
-    pub fn reachable(&self, uid: usize) -> Vec<Pos> {
+    /// 행동 1회로 갈 수 있는 칸들과, 각 칸에 오기 직전 칸.
+    fn flood(&self, uid: usize) -> (Vec<Pos>, Vec<i32>) {
         let u = &self.units[uid];
         let mut cost = vec![-1i32; (W * H) as usize];
+        let mut prev = vec![-1i32; (W * H) as usize];
         let mut queue = vec![u.pos];
         cost[(u.pos.1 * W + u.pos.0) as usize] = 0;
         let mut out = Vec::new();
@@ -252,7 +263,8 @@ impl Game {
         while head < queue.len() {
             let p = queue[head];
             head += 1;
-            let c = cost[(p.1 * W + p.0) as usize];
+            let pi = p.1 * W + p.0;
+            let c = cost[pi as usize];
             if c == u.class.def().mv {
                 continue;
             }
@@ -266,8 +278,72 @@ impl Game {
                     continue;
                 }
                 cost[i] = c + 1;
+                prev[i] = pi;
                 queue.push(n);
                 out.push(n);
+            }
+        }
+        (out, prev)
+    }
+
+    /// 행동 1회로 갈 수 있는 칸들.
+    pub fn reachable(&self, uid: usize) -> Vec<Pos> {
+        self.flood(uid).0
+    }
+
+    /// `to`까지 가는 길. 출발 칸은 빼고 도착 칸은 넣는다. 못 가면 None.
+    pub fn path_to(&self, uid: usize, to: Pos) -> Option<Vec<Pos>> {
+        if !in_bounds(to) {
+            return None;
+        }
+        let (_, prev) = self.flood(uid);
+        let mut i = to.1 * W + to.0;
+        if prev[i as usize] < 0 {
+            return None;
+        }
+        let mut path = Vec::new();
+        while prev[i as usize] >= 0 {
+            path.push((i % W, i / W));
+            i = prev[i as usize];
+        }
+        path.reverse();
+        Some(path)
+    }
+
+    /// 행동 1을 써서 `to`로 옮긴다. 갈 수 없으면 false.
+    pub(crate) fn move_unit(&mut self, uid: usize, to: Pos) -> bool {
+        let Some(path) = self.path_to(uid, to) else { return false };
+        let mut from = self.units[uid].pos;
+        for p in path {
+            self.events.push(Event::Step { unit: uid, from, to: p });
+            from = p;
+        }
+        self.units[uid].pos = to;
+        self.units[uid].ap -= 1;
+        true
+    }
+
+    /// 사선이 지나는 칸들. 양 끝은 뺀다. 화면용.
+    pub fn line(a: Pos, b: Pos) -> Vec<Pos> {
+        let (mut x, mut y) = a;
+        let dx = (b.0 - x).abs();
+        let dy = -(b.1 - y).abs();
+        let sx = if x < b.0 { 1 } else { -1 };
+        let sy = if y < b.1 { 1 } else { -1 };
+        let mut err = dx + dy;
+        let mut out = Vec::new();
+        while (x, y) != b {
+            if (x, y) != a {
+                out.push((x, y));
+            }
+            let e2 = 2 * err;
+            if e2 >= dy {
+                err += dy;
+                x += sx;
+            }
+            if e2 <= dx {
+                err += dx;
+                y += sy;
             }
         }
         out
@@ -292,10 +368,8 @@ impl Game {
             return false;
         }
         if let Some(s) = self.selected {
-            if self.units[s].ap > 0 && self.reachable(s).contains(&p) {
-                self.units[s].pos = p;
-                self.units[s].ap -= 1;
-                return true;
+            if self.units[s].ap > 0 {
+                return self.move_unit(s, p);
             }
         }
         false
@@ -327,6 +401,7 @@ impl Game {
         let roll = self.rng.below(100) as i32;
         let hit = roll < shot.chance;
         self.units[s].ap = 0;
+        let log_before = self.log.len();
         let (sn, tn) = (self.units[s].class.def().name, self.units[t].class.def().name);
         if hit {
             let dmg = self.units[s].class.def().dmg;
@@ -345,6 +420,14 @@ impl Game {
         } else {
             self.log.push(format!("{sn} → {tn}  {}%  빗나감", shot.chance));
         }
+        self.events.push(Event::Shot {
+            shooter: s,
+            target: t,
+            hit,
+            dmg: if hit { self.units[s].class.def().dmg } else { 0 },
+            killed: !self.units[t].alive(),
+            log_lines: self.log.len() - log_before,
+        });
         for side in [Side::Brood, Side::Empire] {
             if !self.units.iter().any(|u| u.alive() && u.side == side) {
                 self.outcome = Some(if side == Side::Brood { Side::Empire } else { Side::Brood });

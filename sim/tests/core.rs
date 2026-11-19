@@ -119,3 +119,33 @@ fn killing_the_relay_drops_the_bonus() {
     g.units[relay].hp = 0;
     assert!(!g.network_up());
 }
+
+#[test]
+fn events_replay_to_the_same_positions() {
+    use sim::Event;
+    for seed in 0..40 {
+        let mut g = Game::new(seed);
+        let mut bot = Rng::new(seed);
+        let mut pos: Vec<_> = g.units.iter().map(|u| u.pos).collect();
+        let mut hp: Vec<_> = g.units.iter().map(|u| u.hp).collect();
+        while g.outcome.is_none() && g.round < 40 {
+            bot_turn(&mut g, &mut bot);
+            for e in std::mem::take(&mut g.events) {
+                match e {
+                    Event::Step { unit, from, to } => {
+                        assert_eq!(pos[unit], from);
+                        assert_eq!((from.0 - to.0).abs() + (from.1 - to.1).abs(), 1);
+                        pos[unit] = to;
+                    }
+                    Event::Shot { target, dmg, killed, .. } => {
+                        hp[target] -= dmg;
+                        assert_eq!(killed, hp[target] <= 0);
+                    }
+                }
+            }
+            for (i, u) in g.units.iter().enumerate() {
+                assert_eq!((pos[i], hp[i]), (u.pos, u.hp), "seed {seed} unit {i}");
+            }
+        }
+    }
+}

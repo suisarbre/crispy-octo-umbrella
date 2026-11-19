@@ -33,6 +33,49 @@ let view = { rot: false, cols: COLS, rows: ROWS, cw: BASE_W, ch: BASE_H, font: F
 // 터치에서는 첫 탭이 조준, 같은 칸을 한 번 더 누르면 실행이다. 게임 좌표.
 let pending = null;
 let lastPointer = "mouse";
+// 코어가 계산을 끝낸 뒤 그 과정을 박자별로 보여주는 중인가. 그동안 입력은 건너뛰기로만 쓴다.
+let playing = false;
+let skipRequested = false;
+const BEAT_HIT = 3;
+const BEAT_KILL = 5;
+const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/// 맞았을 때 화면이 한 번 튄다.
+function kick(kind) {
+  if (reducedMotion.matches || !canvas.animate) return;
+  const d = kind === BEAT_KILL ? 3 : 2;
+  canvas.animate(
+    [{ transform: `translate(${d}px, ${d - 1}px)` }, { transform: `translate(${-d + 1}px, -1px)` }, { transform: "none" }],
+    { duration: kind === BEAT_KILL ? 140 : 90, easing: "ease-out" },
+  );
+}
+
+async function play() {
+  if (playing) return;
+  playing = true;
+  skipRequested = false;
+  for (;;) {
+    const beat = wasm.advance();
+    if (!beat) break;
+    const kind = beat >>> 16;
+    draw();
+    if (kind === BEAT_HIT || kind === BEAT_KILL) kick(kind);
+    await sleep(beat & 0xffff);
+    if (skipRequested) {
+      wasm.skip();
+      break;
+    }
+  }
+  playing = false;
+  draw();
+}
+
+/// 재생 중이면 건너뛰기를 걸고 true.
+function skipIfPlaying() {
+  if (playing) skipRequested = true;
+  return playing;
+}
 
 function layout() {
   const narrow = window.innerWidth < 700;
@@ -118,6 +161,7 @@ function persist() {
 
 function newGame(seed) {
   pending = null;
+  skipRequested = true;
   save = { v: SAVE_VERSION, seed, events: [] };
   wasm.init(seed);
   persist();
@@ -134,6 +178,7 @@ function load(data) {
     else if (Array.isArray(e) && e.length === 2) wasm.click(e[0] | 0, e[1] | 0);
     else throw new Error("세이브 형식이 맞지 않음");
   }
+  wasm.skip();
   if (data.fp !== undefined && data.fp !== wasm.fingerprint_lo()) {
     throw new Error("다른 버전에서 만든 세이브라 재현이 안 됨");
   }
@@ -179,6 +224,7 @@ function act(x, y) {
     save.events.push([x, y]);
     persist();
   }
+  play();
 }
 
 function clearPending() {
@@ -198,6 +244,7 @@ canvas.addEventListener("pointerdown", (ev) => {
 });
 
 canvas.addEventListener("click", (ev) => {
+  if (skipIfPlaying()) return;
   if (lastPointer === "mouse") {
     const [x, y] = cellAt(ev, false);
     act(x, y);
@@ -220,7 +267,7 @@ canvas.addEventListener("click", (ev) => {
 });
 
 canvas.addEventListener("pointermove", (ev) => {
-  if (ev.pointerType !== "mouse") return;
+  if (ev.pointerType !== "mouse" || playing) return;
   lastPointer = "mouse";
   const [x, y] = cellAt(ev, false);
   wasm.hover(x, y);
@@ -228,13 +275,13 @@ canvas.addEventListener("pointermove", (ev) => {
 });
 
 canvas.addEventListener("pointerleave", (ev) => {
-  if (ev.pointerType !== "mouse") return;
+  if (ev.pointerType !== "mouse" || playing) return;
   wasm.hover(-1, -1);
   draw();
 });
 
 $("confirm").addEventListener("click", () => {
-  if (!pending) return;
+  if (skipIfPlaying() || !pending) return;
   const [x, y] = pending;
   clearPending();
   act(x, y);
@@ -251,11 +298,12 @@ window.addEventListener("resize", () => {
 });
 
 function endTurn() {
+  if (skipIfPlaying()) return;
   clearPending();
   wasm.end_turn();
   save.events.push("e");
   persist();
-  draw();
+  play();
 }
 
 $("end").addEventListener("click", endTurn);

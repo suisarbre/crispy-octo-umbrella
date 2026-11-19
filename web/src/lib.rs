@@ -1,7 +1,13 @@
 //! 브라우저와 코어 사이의 얇은 경계. wasm-bindgen 없이 숫자와 포인터만 주고받는다.
-//! JS는 `frame_ptr`에서 칸 배열을, `text_ptr`에서 상태 문구를 읽어 그리기만 한다.
+//! JS는 `frame_ptr`에서 칸 배열을, `text_ptr`에서 문구를 읽어 그리기만 한다.
+//!
+//! 코어는 입력을 받는 즉시 결과까지 계산한다. 여기서는 그 사이에 일어난 일(`sim::Event`)을
+//! 한 박자씩 풀어서 보여준다. 화면은 `view`(보여주는 중인 위치와 체력)를 그리고,
+//! 재생이 끝나면 `view`는 코어의 실제 상태와 같아진다.
 
-use sim::{Class, Game, Pos, Side, Tile, Unit, H, W};
+use std::collections::VecDeque;
+
+use sim::{dist, Class, Event, Game, Pos, Side, Tile, H, SIGHT, W};
 
 /// 팔레트 번호. 실제 색은 www/main.js가 정한다.
 pub const BG: u32 = 0;
@@ -10,16 +16,178 @@ pub const FG: u32 = 2;
 pub const BROOD: u32 = 3;
 pub const EMPIRE: u32 = 4;
 
+/// `advance`가 돌려주는 박자 종류. 상위 16비트에 종류, 하위 16비트에 길이(ms).
+pub const BEAT_STEP: u32 = 1;
+pub const BEAT_TRACER: u32 = 2;
+pub const BEAT_HIT: u32 = 3;
+pub const BEAT_MISS: u32 = 4;
+pub const BEAT_KILL: u32 = 5;
+
+const STEP_MS_BROOD: u32 = 55;
+const STEP_MS_EMPIRE: u32 = 90;
+const TRACER_MS: u32 = 110;
+const IMPACT_MS: u32 = 170;
+const KILL_MS: u32 = 240;
+/// 빗나간 탄이 표적을 지나 더 날아가는 칸 수.
+const OVERSHOOT: usize = 3;
+
 const CELLS: usize = (W * H) as usize;
 const LOG_LINES: usize = 6;
 /// 문구 구역 구분자. 순서: 상황, 중계 링크, 선택 유닛, 장부 내역, 장부 결과, 기록.
 const SEP: &str = "\u{1f}";
+
+#[derive(Clone, Copy)]
+struct ViewUnit {
+    pos: Pos,
+    hp: i32,
+}
+
+enum Fx {
+    None,
+    /// 날아가는 탄. `color`는 쏜 쪽 색.
+    Tracer { cells: Vec<Pos>, color: u32 },
+    /// 맞은 순간. 표적 칸이 번쩍인다.
+    Hit { target: usize },
+    /// 빗나간 탄의 자국.
+    Miss { cells: Vec<Pos> },
+    Death { pos: Pos },
+}
 
 struct State {
     game: Game,
     hover: Option<Pos>,
     frame: [u32; CELLS],
     text: String,
+    view: Vec<ViewUnit>,
+    queue: VecDeque<Event>,
+    /// 맨 앞 사격 이벤트를 어디까지 보여줬는지.
+    shot_stage: u8,
+    fx: Fx,
+    log_shown: usize,
+    empire_phase: bool,
+}
+
+impl State {
+    fn new(seed: u64) -> State {
+        let mut s = State {
+            game: Game::new(seed),
+            hover: None,
+            frame: [0; CELLS],
+            text: String::new(),
+            view: Vec::new(),
+            queue: VecDeque::new(),
+            shot_stage: 0,
+            fx: Fx::None,
+            log_shown: 0,
+            empire_phase: false,
+        };
+        s.sync();
+        s
+    }
+
+    fn playing(&self) -> bool {
+        !self.queue.is_empty() || !matches!(self.fx, Fx::None)
+    }
+
+    /// 재생을 버리고 실제 상태로 맞춘다.
+    fn sync(&mut self) {
+        self.queue.clear();
+        self.game.events.clear();
+        self.shot_stage = 0;
+        self.fx = Fx::None;
+        self.empire_phase = false;
+        self.view = self.game.units.iter().map(|u| ViewUnit { pos: u.pos, hp: u.hp }).collect();
+        self.log_shown = self.game.log.len();
+    }
+
+    /// 코어가 방금 쌓은 이벤트를 재생 줄에 올린다.
+    fn enqueue(&mut self, empire_phase: bool) {
+        let events = std::mem::take(&mut self.game.events);
+        if events.is_empty() && self.queue.is_empty() {
+            self.sync();
+            return;
+        }
+        self.queue.extend(events);
+        self.empire_phase = empire_phase;
+    }
+
+    /// 보여주는 중인 위치 기준으로 아군이 `p`를 보고 있는가.
+    fn seen(&self, p: Pos) -> bool {
+        self.view.iter().zip(&self.game.units).any(|(v, u)| {
+            u.side == Side::Brood && v.hp > 0 && dist(v.pos, p) <= SIGHT && self.game.los(v.pos, p)
+        })
+    }
+
+    fn view_unit_at(&self, p: Pos) -> Option<usize> {
+        self.view.iter().position(|v| v.hp > 0 && v.pos == p)
+    }
+
+    /// 다음 박자를 화면에 반영한다. 돌려주는 값은 종류<<16 | 길이(ms). 끝났으면 0.
+    fn advance(&mut self) -> u32 {
+        loop {
+            self.fx = Fx::None;
+            let Some(event) = self.queue.front().cloned() else {
+                self.sync();
+                return 0;
+            };
+            match event {
+                Event::Step { unit, from, to } => {
+                    self.queue.pop_front();
+                    let empire = self.game.units[unit].side == Side::Empire;
+                    let before = empire && self.seen(from);
+                    self.view[unit].pos = to;
+                    // 시야 밖에서 시야 밖으로 가는 적은 보여주지 않는다.
+                    if empire && !before && !self.seen(to) {
+                        continue;
+                    }
+                    return BEAT_STEP << 16 | if empire { STEP_MS_EMPIRE } else { STEP_MS_BROOD };
+                }
+                Event::Shot { shooter, target, hit, dmg, killed, log_lines } => {
+                    let (a, b) = (self.view[shooter].pos, self.view[target].pos);
+                    match self.shot_stage {
+                        0 => {
+                            let color = if self.game.units[shooter].side == Side::Brood { BROOD } else { EMPIRE };
+                            self.fx = Fx::Tracer { cells: Game::line(a, b), color };
+                            self.shot_stage = 1;
+                            return BEAT_TRACER << 16 | TRACER_MS;
+                        }
+                        1 => {
+                            self.log_shown += log_lines;
+                            self.shot_stage = 2;
+                            if hit {
+                                self.fx = Fx::Hit { target };
+                                return BEAT_HIT << 16 | IMPACT_MS;
+                            }
+                            self.fx = Fx::Miss { cells: self.overshoot(a, b) };
+                            return BEAT_MISS << 16 | IMPACT_MS;
+                        }
+                        _ => {
+                            self.queue.pop_front();
+                            self.shot_stage = 0;
+                            self.view[target].hp -= dmg;
+                            if killed {
+                                self.fx = Fx::Death { pos: b };
+                                return BEAT_KILL << 16 | KILL_MS;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// 표적을 지나친 탄이 더 날아간 칸들. 벽이나 유닛에서 멈춘다.
+    fn overshoot(&self, a: Pos, b: Pos) -> Vec<Pos> {
+        let far = (b.0 + (b.0 - a.0) * 2, b.1 + (b.1 - a.1) * 2);
+        let mut out = Vec::new();
+        for p in Game::line(b, far).into_iter().take(OVERSHOOT) {
+            if !in_frame(p) || self.game.tile(p) == Tile::Wall || self.view_unit_at(p).is_some() {
+                break;
+            }
+            out.push(p);
+        }
+        out
+    }
 }
 
 static mut STATE: Option<State> = None;
@@ -28,7 +196,7 @@ fn state() -> &'static mut State {
     // wasm은 단일 스레드고, 모든 export는 JS에서 순서대로 호출된다.
     unsafe {
         let slot = &mut *core::ptr::addr_of_mut!(STATE);
-        slot.get_or_insert_with(|| State { game: Game::new(0), hover: None, frame: [0; CELLS], text: String::new() })
+        slot.get_or_insert_with(|| State::new(0))
     }
 }
 
@@ -36,107 +204,156 @@ fn cell(glyph: char, fg: u32, bg: u32) -> u32 {
     glyph as u32 | fg << 24 | bg << 28
 }
 
+fn idx(p: Pos) -> usize {
+    (p.1 * W + p.0) as usize
+}
+
+fn in_frame(p: Pos) -> bool {
+    p.0 >= 0 && p.1 >= 0 && p.0 < W && p.1 < H
+}
+
 fn render(s: &mut State) {
+    let playing = s.playing();
     let g = &s.game;
     for y in 0..H {
         for x in 0..W {
-            s.frame[(y * W + x) as usize] = match g.tile((x, y)) {
+            s.frame[idx((x, y))] = match g.tile((x, y)) {
                 Tile::Floor => cell('·', DIM, BG),
                 Tile::Low => cell('▄', DIM, BG),
                 Tile::Wall => cell('█', DIM, BG),
             };
         }
     }
-    if let Some(sel) = g.selected {
-        if g.units[sel].ap > 0 && g.outcome.is_none() {
+
+    let can_act = !playing && g.outcome.is_none();
+    if let (Some(sel), true) = (g.selected, can_act) {
+        if g.units[sel].ap > 0 {
             for p in g.reachable(sel) {
-                s.frame[(p.1 * W + p.0) as usize] = cell('·', BROOD, BG);
+                s.frame[idx(p)] = cell('·', BROOD, BG);
             }
-        }
-    }
-    for (i, u) in g.units.iter().enumerate() {
-        if !u.alive() {
-            continue;
-        }
-        let idx = (u.pos.1 * W + u.pos.0) as usize;
-        let glyph = u.class.def().glyph;
-        match u.side {
-            Side::Brood => {
-                let spent = u.ap == 0;
-                s.frame[idx] = if g.selected == Some(i) {
-                    cell(glyph, BG, BROOD)
-                } else {
-                    cell(glyph, if spent { DIM } else { BROOD }, BG)
-                };
-            }
-            Side::Empire => {
-                if g.seen_by(Side::Brood, u.pos) {
-                    let targeted = s.hover == Some(u.pos);
-                    s.frame[idx] = if targeted { cell(glyph, BG, EMPIRE) } else { cell(glyph, EMPIRE, BG) };
+            // 가리킨 칸까지 실제로 걸어갈 길.
+            if let Some(path) = s.hover.and_then(|h| g.path_to(sel, h)) {
+                for p in path {
+                    s.frame[idx(p)] = cell('•', BROOD, BG);
                 }
             }
         }
     }
 
-    let (ledger, result) = ledger(g, s.hover);
-    let from = g.log.len().saturating_sub(LOG_LINES);
+    match &s.fx {
+        Fx::Tracer { cells, color } => {
+            for &p in cells {
+                // 엄폐물은 가리지 않는다. 탄은 바닥 칸에만 그린다.
+                if g.tile(p) == Tile::Floor {
+                    s.frame[idx(p)] = cell('•', *color, BG);
+                }
+            }
+        }
+        Fx::Miss { cells } => {
+            for &p in cells.iter().filter(|p| g.tile(**p) == Tile::Floor) {
+                s.frame[idx(p)] = cell('•', DIM, BG);
+            }
+        }
+        Fx::Death { pos } => s.frame[idx(*pos)] = cell('×', FG, BG),
+        Fx::Hit { .. } | Fx::None => {}
+    }
+
+    for (i, u) in g.units.iter().enumerate() {
+        let v = s.view[i];
+        if v.hp <= 0 {
+            continue;
+        }
+        let glyph = u.class.def().glyph;
+        let struck = matches!(s.fx, Fx::Hit { target } if target == i);
+        let shown = match u.side {
+            Side::Brood => Some(if struck {
+                cell(glyph, BG, FG)
+            } else if g.selected == Some(i) && can_act {
+                cell(glyph, BG, BROOD)
+            } else {
+                cell(glyph, if u.ap == 0 && !playing { DIM } else { BROOD }, BG)
+            }),
+            Side::Empire if s.seen(v.pos) => Some(if struck {
+                cell(glyph, BG, FG)
+            } else if s.hover == Some(v.pos) && can_act {
+                cell(glyph, BG, EMPIRE)
+            } else {
+                cell(glyph, EMPIRE, BG)
+            }),
+            Side::Empire => None,
+        };
+        if let Some(c) = shown {
+            s.frame[idx(v.pos)] = c;
+        }
+    }
+
+    let (ledger, result) = if can_act { ledger(s) } else { ("—".to_string(), String::new()) };
+    let shown = s.log_shown.min(g.log.len());
+    let from = shown.saturating_sub(LOG_LINES);
     let sections = [
-        match g.outcome {
-            Some(Side::Brood) => "제국 분대 전멸".to_string(),
-            Some(Side::Empire) => "전원 사망".to_string(),
-            None => format!("라운드 {}", g.round),
+        match (playing, g.outcome) {
+            (true, _) if s.empire_phase => "제국 행동".to_string(),
+            (false, Some(Side::Brood)) => "제국 분대 전멸".to_string(),
+            (false, Some(Side::Empire)) => "전원 사망".to_string(),
+            _ => format!("라운드 {}", g.round),
         },
-        link_line(g),
+        link_line(s),
         match g.selected {
-            Some(sel) => format!("{}  행동 {}", unit_line(&g.units[sel]), g.units[sel].ap),
+            Some(sel) => format!("{}  행동 {}", unit_line(s, sel), g.units[sel].ap),
             None => "—".to_string(),
         },
         ledger,
         result,
-        g.log[from..].join("\n"),
+        g.log[from..shown].join("\n"),
     ];
     s.text = sections.join(SEP);
 }
 
 /// 중계기에 누가 물려 있는지. 이 게임의 표식이다.
-fn link_line(g: &Game) -> String {
-    let up = g.network_up();
+fn link_line(s: &State) -> String {
+    let units = s.game.units.iter().zip(&s.view).filter(|(u, _)| u.side == Side::Empire);
+    let up = units.clone().any(|(u, v)| u.class == Class::Relay && v.hp > 0);
     let mut line = String::from(if up { "& ──" } else { "×   " });
-    for u in g.units.iter().filter(|u| u.side == Side::Empire && u.class != Class::Relay) {
+    for (u, v) in units.filter(|(u, _)| u.class != Class::Relay) {
         line.push(' ');
-        line.push(if u.alive() { u.class.def().glyph } else { '·' });
+        line.push(if v.hp > 0 { u.class.def().glyph } else { '·' });
     }
     line.push_str(if up { "  연결" } else { "  두절" });
     line
 }
 
-fn unit_line(u: &Unit) -> String {
-    let d = u.class.def();
-    format!("{} {}  체력 {}/{}", d.glyph, d.name, u.hp, d.hp)
+fn unit_line(s: &State, i: usize) -> String {
+    let d = s.game.units[i].class.def();
+    format!("{} {}  체력 {}/{}", d.glyph, d.name, s.view[i].hp.max(0), d.hp)
 }
 
 fn minus(v: i32) -> String {
-    if v > 0 { format!("−{v}") } else { "0".to_string() }
+    if v > 0 {
+        format!("−{v}")
+    } else {
+        "0".to_string()
+    }
 }
 
 /// 명중률 장부. (내역, 결과) 두 조각으로 나눠서 결과만 따로 칠할 수 있게 한다.
-fn ledger(g: &Game, hover: Option<Pos>) -> (String, String) {
+/// 재생 중이 아닐 때만 부르므로 `view`와 코어 상태가 같다.
+fn ledger(s: &State) -> (String, String) {
+    let g = &s.game;
     let none = || ("—".to_string(), String::new());
-    let Some(p) = hover else { return none() };
+    let Some(p) = s.hover else { return none() };
     let Some(t) = g.unit_at(p) else { return none() };
-    let u = &g.units[t];
-    if u.side == Side::Brood {
-        return (unit_line(u), String::new());
+    if g.units[t].side == Side::Brood {
+        return (unit_line(s, t), String::new());
     }
     if !g.seen_by(Side::Brood, p) {
         return none();
     }
-    let head = unit_line(u);
+    let head = unit_line(s, t);
     let Some(sel) = g.selected else { return (head, String::new()) };
     match g.shot(sel, t) {
-        Some(s) => (
-            format!("{head}\n조준 {:>5}\n엄폐 {:>5}\n거리 {:>5}", s.aim, minus(s.cover), minus(s.falloff)),
-            format!("명중 {:>5}%", s.chance),
+        Some(shot) => (
+            format!("{head}\n조준 {:>5}\n엄폐 {:>5}\n거리 {:>5}", shot.aim, minus(shot.cover), minus(shot.falloff)),
+            format!("명중 {:>5}%", shot.chance),
         ),
         None => (head, "사선 없음".to_string()),
     }
@@ -145,8 +362,7 @@ fn ledger(g: &Game, hover: Option<Pos>) -> (String, String) {
 #[no_mangle]
 pub extern "C" fn init(seed: u32) {
     let s = state();
-    s.game = Game::new(seed as u64);
-    s.hover = None;
+    *s = State::new(seed as u64);
     render(s);
 }
 
@@ -154,6 +370,7 @@ pub extern "C" fn init(seed: u32) {
 pub extern "C" fn click(x: i32, y: i32) -> u32 {
     let s = state();
     let changed = s.game.click((x, y));
+    s.enqueue(false);
     render(s);
     changed as u32
 }
@@ -162,6 +379,24 @@ pub extern "C" fn click(x: i32, y: i32) -> u32 {
 pub extern "C" fn end_turn() {
     let s = state();
     s.game.end_turn();
+    s.enqueue(true);
+    render(s);
+}
+
+/// 다음 박자로 넘긴다. 종류<<16 | 길이(ms)를 돌려주고, 보여줄 게 없으면 0.
+#[no_mangle]
+pub extern "C" fn advance() -> u32 {
+    let s = state();
+    let beat = s.advance();
+    render(s);
+    beat
+}
+
+/// 남은 재생을 건너뛰고 실제 상태를 바로 보여준다.
+#[no_mangle]
+pub extern "C" fn skip() {
+    let s = state();
+    s.sync();
     render(s);
 }
 
@@ -208,21 +443,110 @@ pub extern "C" fn fingerprint_lo() -> u32 {
 mod tests {
     use super::*;
 
+    fn glyph_at(p: Pos) -> u32 {
+        state().frame[idx(p)] & 0x1fffff
+    }
+
+    // 전역 상태 하나를 쓰므로 한 테스트 안에서 순서대로 본다.
     #[test]
-    fn frame_and_text_fill_in() {
+    fn playback() {
         init(3);
-        let s = state();
-        assert!(s.frame.iter().all(|&c| c != 0));
-        assert!(s.text.starts_with("라운드 1"));
-        // 아군 첫 유닛을 고르면 갈 수 있는 칸이 아군 색으로 칠해진다.
-        assert_eq!(click(1, 3), 1);
-        let s = state();
-        assert!(s.frame.iter().any(|&c| c == cell('·', BROOD, BG)));
-        end_turn();
-        let text = state().text.clone();
-        let parts: Vec<&str> = text.split(SEP).collect();
+        assert!(state().frame.iter().all(|&c| c != 0));
+        let parts: Vec<String> = state().text.split(SEP).map(String::from).collect();
         assert_eq!(parts.len(), 6);
-        assert_eq!(parts[0], "라운드 2");
+        assert_eq!(parts[0], "라운드 1");
         assert_eq!(parts[1], "& ── h h h h  연결");
+
+        // 선택은 보여줄 일이 없다.
+        assert_eq!(click(1, 3), 1);
+        assert_eq!(advance(), 0);
+        assert!(state().frame.iter().any(|&c| c == cell('·', BROOD, BG)));
+
+        // 가리킨 칸까지의 길이 굵은 점으로 뜬다.
+        let dest = *state().game.reachable(0).iter().max_by_key(|p| p.0).unwrap();
+        let path = state().game.path_to(0, dest).unwrap();
+        hover(dest.0, dest.1);
+        assert_eq!(state().frame.iter().filter(|&&c| c == cell('•', BROOD, BG)).count(), path.len());
+
+        // 이동은 한 칸에 한 박자. 그동안 유닛은 길 위에 있다.
+        assert_eq!(click(dest.0, dest.1), 1);
+        assert_eq!(state().game.units[0].pos, dest);
+        assert_eq!(glyph_at((1, 3)), 'ψ' as u32);
+        for p in &path {
+            assert_eq!(advance() >> 16, BEAT_STEP);
+            assert_eq!(glyph_at(*p), 'ψ' as u32);
+        }
+        assert_eq!(advance(), 0);
+
+        // 건너뛰면 실제 상태와 같아진다.
+        end_turn();
+        skip();
+        let s = state();
+        assert!(!s.playing());
+        for (v, u) in s.view.iter().zip(&s.game.units) {
+            assert_eq!((v.pos, v.hp), (u.pos, u.hp));
+        }
+        assert!(s.text.starts_with("라운드 2"));
+    }
+
+    /// 끝까지 재생하면 어느 판이든 실제 상태에 도착하고, 사격은 탄 → 결과 순으로 나온다.
+    #[test]
+    fn playback_always_lands_on_the_real_state() {
+        let (mut hits, mut misses, mut kills, mut hidden_steps) = (0, 0, 0, 0);
+        for seed in 0..60u64 {
+            let mut s = State::new(seed);
+            for _ in 0..25 {
+                for u in 0..s.game.units.len() {
+                    if s.game.units[u].side != Side::Brood || !s.game.units[u].alive() {
+                        continue;
+                    }
+                    s.game.click(s.game.units[u].pos);
+                    let target = (0..s.game.units.len()).find(|&t| s.game.shot(u, t).is_some());
+                    let to = match target {
+                        Some(t) => s.game.units[t].pos,
+                        None => match s.game.reachable(u).iter().max_by_key(|p| p.0) {
+                            Some(p) => *p,
+                            None => continue,
+                        },
+                    };
+                    s.game.click(to);
+                    s.enqueue(false);
+                }
+                s.game.end_turn();
+                s.enqueue(true);
+                let steps_queued = s.queue.iter().filter(|e| matches!(e, Event::Step { .. })).count();
+                let mut steps_shown = 0;
+                let mut last = 0;
+                let mut beats = 0;
+                loop {
+                    let kind = s.advance() >> 16;
+                    render(&mut s);
+                    match kind {
+                        0 => break,
+                        BEAT_STEP => steps_shown += 1,
+                        BEAT_HIT => hits += 1,
+                        BEAT_MISS => misses += 1,
+                        BEAT_KILL => kills += 1,
+                        _ => {}
+                    }
+                    if kind == BEAT_HIT || kind == BEAT_MISS {
+                        assert_eq!(last, BEAT_TRACER, "seed {seed}");
+                    }
+                    last = kind;
+                    beats += 1;
+                    assert!(beats < 2000, "seed {seed}: 재생이 안 끝남");
+                }
+                hidden_steps += steps_queued - steps_shown;
+                for (v, u) in s.view.iter().zip(&s.game.units) {
+                    assert_eq!((v.pos, v.hp), (u.pos, u.hp), "seed {seed}");
+                }
+                assert_eq!(s.log_shown, s.game.log.len());
+                if s.game.outcome.is_some() {
+                    break;
+                }
+            }
+        }
+        println!("적중 {hits} / 빗나감 {misses} / 사망 {kills} / 가려진 이동 {hidden_steps}");
+        assert!(hits > 0 && misses > 0 && kills > 0 && hidden_steps > 0);
     }
 }
