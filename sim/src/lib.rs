@@ -3,7 +3,7 @@
 //! (시드, 입력 목록)만 있으면 판 전체를 그대로 재현할 수 있다.
 #![forbid(unsafe_code)]
 
-mod ai;
+pub mod ai;
 pub mod rng;
 
 use rng::Rng;
@@ -114,6 +114,10 @@ pub struct Game {
     pub outcome: Option<Side>,
     pub log: Vec<String>,
     pub events: Vec<Event>,
+    /// 제국이 아군 유닛을 마지막으로 본 자리. 유닛 번호로 찾는다. 본 적 없거나 놓쳤으면 None.
+    pub memory: Vec<Option<Pos>>,
+    /// 제국이 수를 고를 때 쓰는 가중치.
+    pub doctrine: ai::Doctrine,
     rng: Rng,
 }
 
@@ -151,7 +155,10 @@ impl Game {
             let x = if *c == Class::Relay { W - 1 } else { W - 2 };
             units.push(Unit { side: Side::Empire, class: *c, hp: c.def().hp, pos: (x, 2 + 3 * i as i32), ap: AP_PER_TURN });
         }
-        Game { seed, tiles, units, round: 1, selected: None, outcome: None, log: Vec::new(), events: Vec::new(), rng }
+        let memory = vec![None; units.len()];
+        let mut g = Game { seed, tiles, units, round: 1, selected: None, outcome: None, log: Vec::new(), events: Vec::new(), memory, doctrine: ai::Doctrine::default(), rng };
+        g.observe();
+        g
     }
 
     pub fn tile(&self, p: Pos) -> Tile {
@@ -251,6 +258,36 @@ impl Game {
             .any(|u| u.alive() && u.side == side && dist(u.pos, p) <= SIGHT && self.los(u.pos, p))
     }
 
+    /// `start`에서 `mv`칸 안에 갈 수 있는 칸들. 막힌 칸은 `blocked`가 정한다. 계획용.
+    pub(crate) fn flood_from(&self, start: Pos, mv: i32, blocked: impl Fn(Pos) -> bool) -> Vec<Pos> {
+        let mut cost = vec![-1i32; (W * H) as usize];
+        let mut queue = vec![start];
+        cost[(start.1 * W + start.0) as usize] = 0;
+        let mut head = 0;
+        while head < queue.len() {
+            let p = queue[head];
+            head += 1;
+            let c = cost[(p.1 * W + p.0) as usize];
+            if c == mv {
+                continue;
+            }
+            for d in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+                let n = (p.0 + d.0, p.1 + d.1);
+                if !in_bounds(n) || self.tile(n) != Tile::Floor {
+                    continue;
+                }
+                let i = (n.1 * W + n.0) as usize;
+                if cost[i] >= 0 || blocked(n) {
+                    continue;
+                }
+                cost[i] = c + 1;
+                queue.push(n);
+            }
+        }
+        queue.remove(0);
+        queue
+    }
+
     /// 행동 1회로 갈 수 있는 칸들과, 각 칸에 오기 직전 칸.
     fn flood(&self, uid: usize) -> (Vec<Pos>, Vec<i32>) {
         let u = &self.units[uid];
@@ -317,10 +354,29 @@ impl Game {
         for p in path {
             self.events.push(Event::Step { unit: uid, from, to: p });
             from = p;
+            // 지나가는 길에 들킨 것도 기억에 남는다.
+            self.units[uid].pos = p;
+            self.observe();
         }
-        self.units[uid].pos = to;
         self.units[uid].ap -= 1;
         true
+    }
+
+    /// 제국의 기억을 지금 보이는 것으로 고친다. 보이면 그 자리, 기억한 자리를 봤는데 없으면 놓친 것.
+    pub(crate) fn observe(&mut self) {
+        for i in 0..self.units.len() {
+            if self.units[i].side != Side::Brood {
+                continue;
+            }
+            let pos = self.units[i].pos;
+            if !self.units[i].alive() {
+                self.memory[i] = None;
+            } else if self.seen_by(Side::Empire, pos) {
+                self.memory[i] = Some(pos);
+            } else if self.memory[i].is_some_and(|m| self.seen_by(Side::Empire, m)) {
+                self.memory[i] = None;
+            }
+        }
     }
 
     /// 사선이 지나는 칸들. 양 끝은 뺀다. 화면용.
@@ -381,13 +437,9 @@ impl Game {
             return;
         }
         self.selected = None;
-        for i in 0..self.units.len() {
-            if self.units[i].side == Side::Empire && self.units[i].alive() {
-                ai::act(self, i);
-            }
-            if self.outcome.is_some() {
-                return;
-            }
+        ai::run(self, Side::Empire);
+        if self.outcome.is_some() {
+            return;
         }
         for u in &mut self.units {
             u.ap = AP_PER_TURN;
@@ -428,6 +480,7 @@ impl Game {
             killed: !self.units[t].alive(),
             log_lines: self.log.len() - log_before,
         });
+        self.observe();
         for side in [Side::Brood, Side::Empire] {
             if !self.units.iter().any(|u| u.alive() && u.side == side) {
                 self.outcome = Some(if side == Side::Brood { Side::Empire } else { Side::Brood });
@@ -449,6 +502,9 @@ impl Game {
             mix(u.pos.0 as u64);
             mix(u.pos.1 as u64);
             mix(u.ap as u64);
+        }
+        for m in &self.memory {
+            mix(m.map_or(u64::MAX, |p| (p.1 * W + p.0) as u64));
         }
         h
     }
