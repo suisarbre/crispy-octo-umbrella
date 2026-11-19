@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>crispy-octo-umbrella</title>
+<style>
+  :root { --bg:#0c0f11; --dim:#38454a; --fg:#cfcabb; --brood:#63d6ac; --empire:#e8823f; }
+  html, body { margin:0; background:var(--bg); color:var(--fg); }
+  body { font:15px/1.5 ui-monospace, "Cascadia Mono", Menlo, Consolas, "D2Coding", monospace; padding:20px; }
+  main { width:max-content; max-width:100%; margin:0 auto; }
+  canvas { display:block; cursor:crosshair; max-width:100%; }
+  pre { margin:14px 0; min-height:15em; white-space:pre-wrap; font:inherit; }
+  nav { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+  button { font:inherit; color:var(--fg); background:none; border:1px solid var(--dim); padding:3px 12px; cursor:pointer; }
+  button:hover, button:focus-visible { border-color:var(--fg); outline:none; }
+  #seed { color:var(--dim); margin-left:auto; }
+  #err { color:var(--empire); }
+</style>
+</head>
+<body>
+<main>
+  <canvas id="screen" aria-label="전장"></canvas>
+  <pre id="text" aria-live="polite"></pre>
+  <nav>
+    <button id="end">턴 종료 [Space]</button>
+    <button id="new">새 판</button>
+    <button id="export">세이브 내보내기</button>
+    <button id="import">불러오기</button>
+    <input id="file" type="file" accept="application/json,.json" hidden>
+    <span id="seed"></span>
+  </nav>
+  <p id="err" role="alert"></p>
+</main>
+<script type="module" src="main.js"></script>
+</body>
+</html>
