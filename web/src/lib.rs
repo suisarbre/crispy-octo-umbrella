@@ -240,6 +240,8 @@ fn render(s: &mut State) {
         }
     }
 
+    let lanes = fire_lanes(s, can_act);
+
     match &s.fx {
         Fx::Tracer { cells, color } => {
             for &p in cells {
@@ -277,6 +279,9 @@ fn render(s: &mut State) {
                 cell(glyph, BG, FG)
             } else if s.hover == Some(v.pos) && can_act {
                 cell(glyph, BG, EMPIRE)
+            } else if lanes.shots.iter().any(|&(t, _)| t == i) {
+                // 사선에 들어온 적은 바탕이 밝다.
+                cell(glyph, EMPIRE, DIM)
             } else {
                 cell(glyph, EMPIRE, BG)
             }),
@@ -287,7 +292,7 @@ fn render(s: &mut State) {
         }
     }
 
-    let (ledger, result) = if can_act { ledger(s) } else { ("—".to_string(), String::new()) };
+    let (ledger, result) = if can_act { ledger(s, &lanes) } else { ("—".to_string(), String::new()) };
     let shown = s.log_shown.min(g.log.len());
     let from = shown.saturating_sub(LOG_LINES);
     let sections = [
@@ -335,11 +340,64 @@ fn minus(v: i32) -> String {
     }
 }
 
-/// 명중률 장부. (내역, 결과) 두 조각으로 나눠서 결과만 따로 칠할 수 있게 한다.
-/// 재생 중이 아닐 때만 부르므로 `view`와 코어 상태가 같다.
-fn ledger(s: &State) -> (String, String) {
+/// 선택한 유닛이 어디서 쏜다고 칠 때 누구를 쏠 수 있는가.
+struct Lanes {
+    /// 이동할 칸을 가리키는 중이면 true. 그때는 그 칸에서 본 사선이다.
+    after_move: bool,
+    /// 이동에 마지막 행동을 써서, 가도 쏠 수 없다.
+    no_action_left: bool,
+    /// (적, 명중률). 높은 순.
+    shots: Vec<(usize, i32)>,
+}
+
+/// 지금 보이는 적만 따진다. 옮겨 가서 새로 보일 적은 미리 알려주지 않는다.
+fn fire_lanes(s: &State, can_act: bool) -> Lanes {
     let g = &s.game;
-    let none = || ("—".to_string(), String::new());
+    let mut lanes = Lanes { after_move: false, no_action_left: false, shots: Vec::new() };
+    let Some(sel) = g.selected.filter(|&i| can_act && g.units[i].ap > 0) else { return lanes };
+    let mut from = g.units[sel].pos;
+    if let Some(h) = s.hover.filter(|&h| g.path_to(sel, h).is_some()) {
+        lanes.after_move = true;
+        if g.units[sel].ap < 2 {
+            lanes.no_action_left = true;
+            return lanes;
+        }
+        from = h;
+    }
+    for (t, u) in g.units.iter().enumerate() {
+        if u.side == Side::Empire && u.alive() && g.seen_by(Side::Brood, u.pos) {
+            if let Some(shot) = g.shot_from(sel, from, u.pos) {
+                lanes.shots.push((t, shot.chance));
+            }
+        }
+    }
+    lanes.shots.sort_by(|a, b| b.1.cmp(&a.1));
+    lanes
+}
+
+fn lanes_text(s: &State, lanes: &Lanes) -> String {
+    let head = if lanes.after_move { "이동 후" } else { "여기서" };
+    if lanes.no_action_left {
+        return format!("{head}\n행동 없음");
+    }
+    if lanes.shots.is_empty() {
+        return format!("{head}\n사선 없음");
+    }
+    let mut out = head.to_string();
+    for &(t, chance) in &lanes.shots {
+        let d = s.game.units[t].class.def();
+        out.push_str(&format!("\n{chance:>3}%  {} {}", d.glyph, d.name));
+    }
+    out
+}
+
+/// 장부. (내역, 결과) 두 조각으로 나눠서 결과만 따로 칠할 수 있게 한다.
+/// 적을 가리키면 그 사격의 명중률 내역, 아니면 선택한 유닛의 사선 목록.
+/// 재생 중이 아닐 때만 부르므로 `view`와 코어 상태가 같다.
+fn ledger(s: &State, lanes: &Lanes) -> (String, String) {
+    let g = &s.game;
+    let has_lanes = g.selected.is_some_and(|i| g.units[i].ap > 0);
+    let none = || (if has_lanes { lanes_text(s, lanes) } else { "—".to_string() }, String::new());
     let Some(p) = s.hover else { return none() };
     let Some(t) = g.unit_at(p) else { return none() };
     if g.units[t].side == Side::Brood {
@@ -487,6 +545,38 @@ mod tests {
             assert_eq!((v.pos, v.hp), (u.pos, u.hp));
         }
         assert!(s.text.starts_with("라운드 2"));
+    }
+
+    #[test]
+    fn enemies_in_the_line_of_fire_are_marked() {
+        let mut s = State::new(1);
+        s.game.tiles.iter_mut().for_each(|t| *t = Tile::Floor);
+        let enemy = s.game.units.iter().position(|u| u.class == Class::Trooper).unwrap();
+        s.game.units[0].pos = (5, 5);
+        s.game.units[enemy].pos = (10, 5);
+        s.game.click((5, 5));
+        s.sync();
+        let at = idx((10, 5));
+
+        render(&mut s);
+        assert_eq!(s.frame[at], cell('h', EMPIRE, DIM));
+        assert!(s.text.contains("여기서\n 80%  h 보병"), "{}", s.text);
+
+        // 벽 뒤로 들어가면 표시가 꺼지고, 벽을 비켜 설 칸을 가리키면 다시 켜진다.
+        s.game.tiles[idx((7, 5))] = Tile::Wall;
+        render(&mut s);
+        assert_eq!(s.frame[at], cell('h', EMPIRE, BG));
+        assert!(s.text.contains("여기서\n사선 없음"));
+        s.hover = Some((5, 8));
+        render(&mut s);
+        assert_eq!(s.frame[at], cell('h', EMPIRE, DIM));
+        assert!(s.text.contains("이동 후\n"));
+
+        // 마지막 행동으로 가면 쏠 수 없으니 표시하지 않는다.
+        s.game.units[0].ap = 1;
+        render(&mut s);
+        assert_eq!(s.frame[at], cell('h', EMPIRE, BG));
+        assert!(s.text.contains("이동 후\n행동 없음"));
     }
 
     /// 끝까지 재생하면 어느 판이든 실제 상태에 도착하고, 사격은 탄 → 결과 순으로 나온다.
