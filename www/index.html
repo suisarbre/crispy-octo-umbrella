@@ -9,7 +9,7 @@
   html, body { margin:0; background:var(--bg); color:var(--fg); }
   body { font:15px/1.5 ui-monospace, "Cascadia Mono", Menlo, Consolas, "D2Coding", monospace; padding:20px; }
   main { width:max-content; max-width:100%; margin:0 auto; }
-  canvas { display:block; cursor:crosshair; max-width:100%; }
+  canvas { display:block; cursor:crosshair; touch-action:manipulation; user-select:none; -webkit-user-select:none; -webkit-tap-highlight-color:transparent; }
   #panel { display:grid; grid-template-columns:24ch 1fr; gap:0 32px; margin:16px 0; font-variant-numeric:tabular-nums; }
   #panel > div > * { margin:0; min-height:1.5em; white-space:pre; font:inherit; }
   #link { color:var(--empire); }
@@ -22,6 +22,18 @@
   button:hover, button:focus-visible { border-color:var(--fg); outline:none; }
   kbd { font:inherit; font-size:12px; border:1px solid var(--dim); border-bottom-width:2px; padding:0 4px; margin-left:8px; }
   #seed { margin-left:auto; }
+  #bar { display:none; }
+  @media (max-width:699px) {
+    body { padding:8px 8px 72px; }
+    main { width:auto; }
+    canvas { margin:0 auto; }
+    #end { display:none; }
+    #bar { display:flex; position:fixed; left:0; right:0; bottom:0; gap:8px; align-items:center; padding:8px; background:var(--bg); border-top:1px solid var(--dim); font-variant-numeric:tabular-nums; }
+    #aim { flex:1; min-width:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    #bar button { min-height:44px; padding:4px 16px; flex:none; }
+    #confirm { border-color:var(--brood); color:var(--brood); }
+    nav button { min-height:44px; }
+  }
   @media (max-width:560px) { #panel { grid-template-columns:1fr; gap:16px 0; } #log { border-left:0; padding-left:0; } }
   #err { color:var(--empire); }
 </style>
@@ -48,6 +60,11 @@
     <span id="seed"></span>
   </nav>
   <p id="err" role="alert"></p>
+  <div id="bar">
+    <span id="aim"></span>
+    <button id="confirm" hidden>실행</button>
+    <button id="end2">턴 종료</button>
+  </div>
 </main>
 <script type="module" src="main.js"></script>
 </body>
