@@ -9,8 +9,10 @@
 //! 중계가 살아 있으면 분대가 한 머리로 둔다. 시야와 기억을 합치고, 매번 분대 전체에서
 //! 가장 이득이 큰 행동을 고른다. 중계가 끊기면 각자 번호 순서대로, 자기 눈에 보이는 것만 가지고,
 //! 상대가 움직일 것도 다음 턴도 계산하지 않고 둔다.
+//!
+//! 개조와 대응 장비도 같은 저울에 올린다. 숨기, 연막 던지기는 행동의 한 종류일 뿐이다.
 
-use crate::{dist, Class, Game, Pos, Side, SIGHT, W};
+use crate::{dist, Class, Game, Gene, Pos, Side, BURST_RANGE, SENSOR_RADIUS, SIGHT, SMOKE_RANGE, SMOKE_SIGHT, W};
 
 /// 수를 고를 때의 가중치. 탐색기는 그대로 두고 이 값만 바꿔서 성향을 바꾼다.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -25,7 +27,7 @@ pub struct Doctrine {
     pub approach: i32,
     /// 이동 한 번의 값. 얻는 게 없으면 안 움직이게 만든다.
     pub step_cost: i32,
-    /// 중계기는 받을 피해를 이만큼 더 크게 친다.
+    /// 중계기와 탐지기는 받을 피해를 이만큼 더 크게 친다.
     pub relay_caution: i32,
     /// 다음 턴에 얻을 것을 지금 것의 몇 퍼센트로 치는가.
     pub foresight: i32,
@@ -56,9 +58,22 @@ struct Known {
 enum Act {
     Shoot(usize),
     Move(Pos),
+    Burrow,
+    Smoke(Pos),
 }
 
-/// 한 번의 선택을 위한 판 읽기. `threat`는 칸마다 한 번만 계산한다.
+/// 사격을 언제 하는 것으로 치는가. 저격(안 움직였는가)과 화력(행동이 몇 남는가)이 여기에 달렸다.
+#[derive(Clone, Copy, PartialEq)]
+enum When {
+    /// 지금 제자리에서.
+    Now,
+    /// 한 번 움직인 다음.
+    AfterMove,
+    /// 다음 턴에, 그 자리에서 안 움직이고.
+    NextTurn,
+}
+
+/// 한 번의 선택을 위한 판 읽기. 칸마다 한 번만 계산하는 값들을 들고 있다.
 struct Plan<'a> {
     g: &'a Game,
     side: Side,
@@ -67,7 +82,7 @@ struct Plan<'a> {
     /// 아는 적마다, 그 적이 쏘기 시작할 수 있는 칸들.
     launch: Vec<Vec<Pos>>,
     threat: Vec<i32>,
-    /// 아래 둘은 `cached_for` 유닛 것이다. 칸마다 한 번만 계산한다.
+    /// 아래 둘은 `cached_for` 유닛 것이다.
     cached_for: usize,
     shot: Vec<i32>,
     stand: Vec<i32>,
@@ -83,24 +98,35 @@ impl<'a> Plan<'a> {
             if !u.alive() || u.side == side {
                 continue;
             }
+            let hidden = u.burrowed && !g.revealed(i);
             match solo {
                 Some(me) => {
                     let p = g.units[me].pos;
-                    if dist(p, u.pos) <= SIGHT && g.los(p, u.pos) {
+                    if !hidden && dist(p, u.pos) <= SIGHT && g.los(p, u.pos) {
                         known.push(Known { unit: i, pos: u.pos, seen: true });
                     }
                 }
                 None => {
-                    if g.seen_by(side, u.pos) {
+                    if g.visible_to(side, i) {
                         known.push(Known { unit: i, pos: u.pos, seen: true });
-                    } else if let (Side::Empire, Some(p)) = (side, g.memory[i]) {
+                    } else if let Some(p) = g.memory[i] {
                         known.push(Known { unit: i, pos: p, seen: false });
                     }
                 }
             }
         }
         let n = g.tiles.len();
-        let mut plan = Plan { g, side, shared: solo.is_none(), known, launch: Vec::new(), threat: vec![UNSET; n], cached_for: usize::MAX, shot: vec![UNSET; n], stand: vec![UNSET; n] };
+        let mut plan = Plan {
+            g,
+            side,
+            shared: solo.is_none(),
+            known,
+            launch: Vec::new(),
+            threat: vec![UNSET; n],
+            cached_for: usize::MAX,
+            shot: vec![UNSET; n],
+            stand: vec![UNSET; n],
+        };
         plan.launch = (0..plan.known.len())
             .map(|k| {
                 let mut from = vec![plan.known[k].pos];
@@ -128,32 +154,40 @@ impl<'a> Plan<'a> {
             || self.known.iter().any(|k| k.pos == p)
     }
 
-    /// 이 칸에 서 있으면 다음 상대 차례에 받을 피해의 기대값 × 100.
-    fn threat_at(&mut self, tile: Pos) -> i32 {
+    /// `me`가 이 칸에 서 있으면 다음 상대 차례에 받을 피해의 기대값 × 100.
+    /// 방패병은 서는 사람에 따라 값이 달라서 따로 센다.
+    fn threat_at(&mut self, me: usize, tile: Pos) -> i32 {
+        let shielded = self.g.units[me].class == Class::Shield;
         let i = (tile.1 * W + tile.0) as usize;
-        if self.threat[i] == UNSET {
-            let mut sum = 0;
-            for (k, known) in self.known.iter().enumerate() {
-                let best = self.launch[k]
-                    .iter()
-                    .filter_map(|&from| self.g.shot_from(known.unit, from, tile))
-                    .map(|s| s.chance)
-                    .max()
-                    .unwrap_or(0);
-                sum += best * self.g.units[known.unit].class.def().dmg;
-            }
+        if !shielded && self.threat[i] != UNSET {
+            return self.threat[i];
+        }
+        let mut sum = 0;
+        for (k, known) in self.known.iter().enumerate() {
+            let start = known.pos;
+            let best = self.launch[k]
+                .iter()
+                // 제자리에서 쏘면 안 움직인 것이다. 숨어 있었다면 기습이다.
+                .filter_map(|&from| {
+                    let stay = from == start;
+                    let ambush = stay && self.g.units[known.unit].burrowed;
+                    self.g.shot_calc(known.unit, from, tile, shielded.then_some(me), stay, ambush)
+                })
+                .map(|s| s.chance)
+                .max()
+                .unwrap_or(0);
+            sum += best * self.g.units[known.unit].class.def().dmg;
+        }
+        if !shielded {
             self.threat[i] = sum;
         }
-        self.threat[i]
+        sum
     }
 
-    /// 이 칸에서 턴을 마치고 반격 한 번을 받는 것까지의 값.
-    fn rest(&mut self, me: usize, tile: Pos) -> i32 {
+    /// 쏠 데가 없을 때 적 쪽으로 끌리는 정도. 클수록 나쁜 자리다.
+    fn pull(&self, me: usize, tile: Pos) -> i32 {
         let d = self.doctrine();
-        let relay = self.g.units[me].class == Class::Relay;
-        let caution = if relay { d.relay_caution } else { 1 };
-        let threat = self.threat_at(tile) * d.threat * caution;
-        let pull = if relay {
+        if self.g.units[me].class == Class::Relay {
             0
         } else if let Some(near) = self.known.iter().map(|k| dist(tile, k.pos)).min() {
             near * d.approach
@@ -162,17 +196,28 @@ impl<'a> Plan<'a> {
             (if self.side == Side::Empire { tile.0 } else { W - 1 - tile.0 }) * d.approach
         } else {
             0
-        };
-        -threat - pull
+        }
     }
 
-    /// 이 칸에서 턴을 마치는 것의 값. 분대로 둘 때는 살아남았을 경우의 다음 턴까지 본다.
-    fn stand(&mut self, me: usize, tile: Pos) -> i32 {
+    /// 이 칸에서 턴을 마치고 반격 한 번을 받는 것까지의 값.
+    fn rest(&mut self, me: usize, tile: Pos) -> i32 {
+        let d = self.doctrine();
+        let fragile = matches!(self.g.units[me].class, Class::Relay | Class::Sensor);
+        let caution = if fragile { d.relay_caution } else { 1 };
+        -self.threat_at(me, tile) * d.threat * caution - self.pull(me, tile)
+    }
+
+    fn reset_cache(&mut self, me: usize) {
         if self.cached_for != me {
             self.cached_for = me;
             self.shot.iter_mut().for_each(|v| *v = UNSET);
             self.stand.iter_mut().for_each(|v| *v = UNSET);
         }
+    }
+
+    /// 이 칸에서 턴을 마치는 것의 값. 분대로 둘 때는 살아남았을 경우의 다음 턴까지 본다.
+    fn stand(&mut self, me: usize, tile: Pos) -> i32 {
+        self.reset_cache(me);
         let i = (tile.1 * W + tile.0) as usize;
         if self.stand[i] == UNSET {
             self.stand[i] = self.stand_uncached(me, tile);
@@ -188,34 +233,64 @@ impl<'a> Plan<'a> {
         // 다음 턴: 여기서 쏘거나, 한 번 가서 쏘거나, 더 나은 자리로 간다. 그 끝에서 또 반격을 받는다.
         let step = self.doctrine().step_cost;
         let mv = self.g.units[me].class.def().mv;
-        let mut next = self.shot_value(me, tile);
+        let mut next = self.best_shot(me, tile, When::NextTurn, false).map_or(0, |(_, v)| v);
         for a in self.g.flood_from(tile, mv, |p| self.blocked(p)) {
-            let there = self.shot_value(me, a) + self.rest(me, a) - now - step;
+            let there = self.shot_after_move(me, a) + self.rest(me, a) - now - step;
             next = next.max(there);
         }
         // 반격에 죽으면 다음 턴은 없다.
         let hp = self.g.units[me].hp * 100;
-        let alive = (hp - self.threat_at(tile)).clamp(0, hp);
+        let alive = (hp - self.threat_at(me, tile)).clamp(0, hp);
         now + next * alive / hp * self.doctrine().foresight / 100
     }
 
-    fn shot_value(&mut self, me: usize, from: Pos) -> i32 {
+    /// 이 칸에 숨어서 턴을 마치는 것의 값. 탐지기가 닿는 곳이면 숨는 의미가 없다.
+    fn hide(&mut self, me: usize, tile: Pos) -> i32 {
+        let exposed = self
+            .known
+            .iter()
+            .any(|k| self.g.units[k.unit].class == Class::Sensor && dist(k.pos, tile) <= SENSOR_RADIUS);
+        if exposed {
+            return self.stand(me, tile);
+        }
+        let ambush = self.best_shot(me, tile, When::NextTurn, true).map_or(0, |(_, v)| v);
+        -self.pull(me, tile) + ambush * self.doctrine().foresight / 100
+    }
+
+    fn shot_after_move(&mut self, me: usize, from: Pos) -> i32 {
+        self.reset_cache(me);
         let i = (from.1 * W + from.0) as usize;
         if self.shot[i] == UNSET {
-            self.shot[i] = self.best_shot(me, from).map_or(0, |(_, v)| v);
+            self.shot[i] = self.best_shot(me, from, When::AfterMove, false).map_or(0, |(_, v)| v);
         }
         self.shot[i]
     }
 
     /// `from`에서 쏠 수 있는 가장 값진 사격. (표적, 값)
-    fn best_shot(&self, me: usize, from: Pos) -> Option<(usize, i32)> {
+    fn best_shot(&self, me: usize, from: Pos, when: When, ambush: bool) -> Option<(usize, i32)> {
         let d = self.doctrine();
-        let dmg = self.g.units[me].class.def().dmg;
+        let u = &self.g.units[me];
+        let dmg = u.class.def().dmg;
+        let settled = match when {
+            When::Now => !u.moved,
+            When::AfterMove => false,
+            When::NextTurn => true,
+        };
         let mut best: Option<(usize, i32)> = None;
         for k in self.known.iter().filter(|k| k.seen) {
-            let Some(shot) = self.g.shot_from(me, from, k.pos) else { continue };
+            let Some(shot) = self.g.shot_calc(me, from, k.pos, Some(k.unit), settled, ambush) else { continue };
+            // 화력 개조는 가까운 표적을 남은 행동만큼 쏜다.
+            let shots = if u.gene == Gene::Burst && dist(from, k.pos) <= BURST_RANGE {
+                match when {
+                    When::Now => u.ap as i32,
+                    When::AfterMove => 1,
+                    When::NextTurn => 2,
+                }
+            } else {
+                1
+            };
             let hp = self.g.units[k.unit].hp;
-            let value = shot.chance * (d.dmg * dmg.min(hp) + if dmg >= hp { d.kill } else { 0 });
+            let value = shot.chance * (d.dmg * (dmg * shots).min(hp) + if dmg * shots >= hp { d.kill } else { 0 });
             if value > 0 && best.map_or(true, |(_, v)| value > v) {
                 best = Some((k.unit, value));
             }
@@ -223,54 +298,125 @@ impl<'a> Plan<'a> {
         best
     }
 
+    /// 연막을 어디에 깔면 좋은가. 막는 적의 사격과 잃는 우리 사격을 같은 저울에 단다.
+    fn best_smoke(&self, me: usize) -> Option<(Pos, i32)> {
+        let u = &self.g.units[me];
+        if u.class != Class::Smoker || u.charges == 0 {
+            return None;
+        }
+        let allies: Vec<usize> = (0..self.g.units.len()).filter(|&i| self.g.units[i].alive() && self.g.units[i].side == self.side).collect();
+        let foes: Vec<&Known> = self.known.iter().filter(|k| k.seen).collect();
+        let veiled = |center: Pos, p: Pos, q: Pos| {
+            dist(p, q) > SMOKE_SIGHT
+                && std::iter::once(p).chain(Game::line(p, q)).chain(std::iter::once(q)).any(|t| dist(t, center) <= 1)
+        };
+        // (적, 아군) 쌍마다 지금의 명중률 × 피해. 한 번만 계산한다.
+        let incoming: Vec<Vec<i32>> = foes
+            .iter()
+            .map(|k| {
+                allies
+                    .iter()
+                    .map(|&a| {
+                        let hit = self.g.shot_calc(k.unit, k.pos, self.g.units[a].pos, Some(a), true, false);
+                        hit.map_or(0, |s| s.chance) * self.g.units[k.unit].class.def().dmg
+                    })
+                    .collect()
+            })
+            .collect();
+        let outgoing: Vec<Vec<i32>> = allies
+            .iter()
+            .map(|&a| {
+                foes.iter()
+                    .map(|k| {
+                        let hit = self.g.shot_calc(a, self.g.units[a].pos, k.pos, Some(k.unit), true, false);
+                        hit.map_or(0, |s| s.chance) * self.g.units[a].class.def().dmg
+                    })
+                    .collect()
+            })
+            .collect();
+        let best_of = |row: &[i32], keep: &dyn Fn(usize) -> bool| row.iter().enumerate().filter(|(i, _)| keep(*i)).map(|(_, v)| *v).max().unwrap_or(0);
+
+        // 우리 위에 깔아 가리거나, 적 위에 깔아 눈을 가린다.
+        let centers = allies.iter().map(|&a| self.g.units[a].pos).chain(foes.iter().map(|k| k.pos));
+        let mut best: Option<(Pos, i32)> = None;
+        for center in centers {
+            if dist(u.pos, center) > SMOKE_RANGE || !self.g.los(u.pos, center) {
+                continue;
+            }
+            let mut saved = 0;
+            for (ki, k) in foes.iter().enumerate() {
+                let open = |ai: usize| !veiled(center, k.pos, self.g.units[allies[ai]].pos);
+                saved += best_of(&incoming[ki], &|_| true) - best_of(&incoming[ki], &open);
+            }
+            let mut lost = 0;
+            for (ai, &a) in allies.iter().enumerate() {
+                let open = |ki: usize| !veiled(center, self.g.units[a].pos, foes[ki].pos);
+                lost += best_of(&outgoing[ai], &|_| true) - best_of(&outgoing[ai], &open);
+            }
+            let value = (saved - lost) * self.doctrine().dmg;
+            if value > 0 && best.map_or(true, |(_, v)| value > v) {
+                best = Some((center, value));
+            }
+        }
+        best
+    }
+
     /// 이 유닛의 가장 좋은 다음 행동과, 가만히 있는 것보다 얼마나 나은지.
     fn best_action(&mut self, me: usize) -> Option<(Act, i32)> {
-        let here = self.g.units[me].pos;
-        let ap = self.g.units[me].ap;
-        let mv = self.g.units[me].class.def().mv;
+        let u = &self.g.units[me];
+        let (here, ap, burrowed) = (u.pos, u.ap, u.burrowed);
+        let can_hide = u.gene == Gene::Burrow;
+        let mv = u.class.def().mv;
         let step = self.doctrine().step_cost;
-        let hold = self.stand(me, here);
+        let hold = if burrowed { self.hide(me, here) } else { self.stand(me, here) };
         let mut best: Option<Act> = None;
         let mut best_value = hold;
+        let mut offer = |act: Act, value: i32| {
+            if value > best_value {
+                best_value = value;
+                best = Some(act);
+            }
+        };
 
-        if let Some((t, v)) = self.best_shot(me, here) {
-            best = Some(Act::Shoot(t));
-            best_value = hold + v;
+        // 쏘고 나면 드러난 채로 그 자리에 남는다.
+        if let Some((t, v)) = self.best_shot(me, here, When::Now, burrowed) {
+            offer(Act::Shoot(t), self.stand(me, here) + v);
+        }
+        if can_hide && !burrowed {
+            offer(Act::Burrow, self.hide(me, here) - step);
+        }
+        if let Some((center, v)) = self.best_smoke(me) {
+            offer(Act::Smoke(center), hold + v - step);
         }
         for a in self.g.flood_from(here, mv, |p| self.blocked(p)) {
             let at_a = self.stand(me, a);
             let mut value = at_a;
             if ap >= 2 {
-                // 가서 쏘거나, 한 번 더 간다.
-                if let Some((_, v)) = self.best_shot(me, a) {
-                    value = value.max(at_a + v);
+                // 가서 쏘거나, 가서 숨거나, 한 번 더 간다.
+                value = value.max(at_a + self.shot_after_move(me, a));
+                if can_hide {
+                    value = value.max(self.hide(me, a) - step);
                 }
                 for b in self.g.flood_from(a, mv, |p| self.blocked(p)) {
                     value = value.max(self.stand(me, b) - step);
                 }
             }
-            value -= step;
-            if value > best_value {
-                best_value = value;
-                best = Some(Act::Move(a));
-            }
+            offer(Act::Move(a), value - step);
         }
         best.map(|act| (act, best_value - hold))
     }
 }
 
-/// 실행한다. 못 가는 칸이었으면(모르는 적이 길을 막고 있었다) false.
+/// 실행한다. 안 되는 행동이었으면(모르는 적이 길을 막고 있었다) false.
 fn apply(g: &mut Game, me: usize, act: Act) -> bool {
     match act {
         Act::Shoot(t) => {
             g.fire(me, t);
             true
         }
-        Act::Move(p) => {
-            let moved = g.move_unit(me, p);
-            g.observe();
-            moved
-        }
+        Act::Move(p) => g.move_unit(me, p),
+        Act::Burrow => g.dig_in(me),
+        Act::Smoke(center) => g.throw_smoke(me, center),
     }
 }
 
@@ -411,7 +557,6 @@ mod legacy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::AP_PER_TURN;
     use std::time::{Duration, Instant};
 
     struct Tally {
@@ -471,10 +616,7 @@ mod tests {
                         t.farther += (a > *b) as u32;
                     }
                 }
-                for u in &mut g.units {
-                    u.ap = AP_PER_TURN;
-                }
-                g.round += 1;
+                g.next_round();
             }
             t.rounds += g.round;
             match g.outcome {
@@ -540,10 +682,7 @@ mod tests {
             if g.outcome.is_none() {
                 run(&mut g, Side::Empire);
             }
-            for u in &mut g.units {
-                u.ap = AP_PER_TURN;
-            }
-            g.round += 1;
+            g.next_round();
         }
         g.outcome
     }
@@ -638,8 +777,9 @@ mod tests {
     #[test]
     #[ignore]
     fn big_battle() {
-        use Class::*;
-        let brood = [Lancer, Lancer, Lancer, Shell, Shell, Shell, Shell, Stalker, Stalker, Stalker, Stalker, Stalker];
+        use Class::{Relay, Trooper};
+        use Gene::*;
+        let brood = [Sniper, Sniper, Sniper, Burst, Burst, Burst, Burst, Burrow, Burrow, Burrow, Plain, Plain];
         let mut empire = [Trooper; 12];
         empire[6] = Relay;
         for (label, b, e) in [("4 대 5", &brood[..0], &empire[..0]), ("8 대 8", &brood[2..10], &empire[2..10]), ("12 대 12", &brood[..], &empire[..])] {
@@ -660,10 +800,7 @@ mod tests {
                         turns += 1;
                         actions += g.events.len() - before;
                     }
-                    for u in &mut g.units {
-                        u.ap = AP_PER_TURN;
-                    }
-                    g.round += 1;
+                    g.next_round();
                 }
                 rounds += g.round;
                 match g.outcome {
@@ -682,6 +819,71 @@ mod tests {
         }
     }
 
+    /// 판 하나를 끝까지 기계끼리.
+    fn fight(mut g: Game) -> Option<Side> {
+        while g.outcome.is_none() && g.round < 40 {
+            run(&mut g, Side::Brood);
+            if g.outcome.is_none() {
+                run(&mut g, Side::Empire);
+            }
+            g.next_round();
+        }
+        g.outcome
+    }
+
+    /// 여러 판의 (제국 승, 제국 패).
+    fn tally(seeds: std::ops::Range<u64>, make: &(dyn Fn(u64) -> Game + Sync)) -> (i32, i32) {
+        let threads = std::thread::available_parallelism().map_or(1, |n| n.get()) as u64;
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..threads)
+                .map(|k| {
+                    let seeds = seeds.clone();
+                    scope.spawn(move || {
+                        let (mut won, mut lost) = (0, 0);
+                        for seed in seeds.filter(|s| s % threads == k) {
+                            match fight(make(seed)) {
+                                Some(Side::Empire) => won += 1,
+                                Some(Side::Brood) => lost += 1,
+                                None => {}
+                            }
+                        }
+                        (won, lost)
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1))
+        })
+    }
+
+    /// 갈래와 대응의 상성표. 칸마다 아군 승 − 아군 패.
+    /// 대응이 통한다면 자기 대응 칸이 그 줄에서 제일 낮아야 한다.
+    /// `cargo test -p sim --release matchups -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn matchups() {
+        use Class::*;
+        use Gene::*;
+        const GAMES: u64 = 120;
+        let broods = [("원형", [Plain; 4]), ("저격", [Sniper; 4]), ("화력", [Burst; 4]), ("잠복", [Burrow; 4])];
+        let empires = [
+            ("기본", [Trooper, Trooper, Relay, Trooper, Trooper]),
+            ("탐지기", [Trooper, Trooper, Relay, Trooper, Sensor]),
+            ("연막", [Trooper, Trooper, Relay, Trooper, Smoker]),
+            ("방패 둘", [Trooper, Shield, Relay, Trooper, Shield]),
+        ];
+        println!("아군 \\ 제국 | {}", empires.iter().map(|(n, _)| format!("{n:>6}")).collect::<Vec<_>>().join(" "));
+        for (bn, brood) in &broods {
+            let cells: Vec<String> = empires
+                .iter()
+                .map(|(_, empire)| {
+                    let (won, lost) = tally(0..GAMES, &|seed| Game::with_units(seed, brood, empire));
+                    format!("{:>+6}", lost - won)
+                })
+                .collect();
+            println!("{bn:<8} | {}", cells.join(" "));
+        }
+    }
+
     #[test]
     fn a_cut_relay_makes_the_squad_worse() {
         let mut wins = [0u32; 2];
@@ -697,10 +899,7 @@ mod tests {
                     if g.outcome.is_none() {
                         run(&mut g, Side::Empire);
                     }
-                    for u in &mut g.units {
-                        u.ap = AP_PER_TURN;
-                    }
-                    g.round += 1;
+                    g.next_round();
                 }
                 if g.outcome == Some(Side::Empire) {
                     wins[k] += 1;
@@ -709,5 +908,77 @@ mod tests {
         }
         println!("제국 승: 연결 {} / 두절 {} (300판씩)", wins[0], wins[1]);
         assert!(wins[0] > wins[1]);
+    }
+}
+
+#[cfg(test)]
+mod probe {
+    use super::*;
+    use crate::Event;
+
+    /// 대응 장비가 실제로 쓰이는지 센다. `cargo test -p sim --release usage -- --ignored --nocapture`
+    /// 기본 판의 균형. 제국 인원을 바꿔 가며 본다. `cargo test -p sim --release default_balance -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn default_balance() {
+        use Class::*;
+        use Gene::*;
+        let brood = [Sniper, Burst, Burrow, Plain];
+        for (label, extra) in [("제국 5", 0), ("제국 6", 1), ("제국 7", 2)] {
+            let (mut won, mut lost, mut open, mut rounds) = (0, 0, 0, 0);
+            let games = 90u64;
+            for seed in 0..games {
+                let counter = [Sensor, Smoker, Shield][(seed % 3) as usize];
+                let mut empire = vec![Trooper, Trooper, Relay, Trooper, counter];
+                empire.extend(std::iter::repeat(Trooper).take(extra));
+                let mut g = Game::with_units(seed, &brood, &empire);
+                while g.outcome.is_none() && g.round < 40 {
+                    run(&mut g, Side::Brood);
+                    if g.outcome.is_none() {
+                        run(&mut g, Side::Empire);
+                    }
+                    g.next_round();
+                }
+                rounds += g.round;
+                match g.outcome {
+                    Some(Side::Empire) => won += 1,
+                    Some(Side::Brood) => lost += 1,
+                    None => open += 1,
+                }
+            }
+            println!("{label}: 제국 승 {won} / 패 {lost} / 미결 {open}   판당 {} 라운드", rounds / games as u32);
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn usage() {
+        use Class::*;
+        let games = 40;
+        for (label, brood, counter) in [("저격 대 연막", Gene::Sniper, Smoker), ("화력 대 방패", Gene::Burst, Shield), ("잠복 대 탐지기", Gene::Burrow, Sensor)] {
+            let (mut smokes, mut burrows, mut shots_at_counter, mut covered, mut counter_died, mut rounds) = (0, 0, 0, 0, 0, 0);
+            for seed in 0..games {
+                let mut g = Game::with_units(seed, &[brood; 4], &[Trooper, Trooper, Relay, Trooper, counter]);
+                while g.outcome.is_none() && g.round < 40 {
+                    run(&mut g, Side::Brood);
+                    if g.outcome.is_none() {
+                        run(&mut g, Side::Empire);
+                    }
+                    g.next_round();
+                }
+                rounds += g.round;
+                counter_died += (!g.units[8].alive()) as u32;
+                for e in &g.events {
+                    match e {
+                        Event::Smoke { .. } => smokes += 1,
+                        Event::Burrow { .. } => burrows += 1,
+                        Event::Shot { target: 8, .. } => shots_at_counter += 1,
+                        _ => {}
+                    }
+                }
+                covered += g.log.iter().filter(|l| l.contains("방패병") && l.contains("→ 방패병")).count();
+            }
+            println!("{label}: 판당 {} 라운드, 연막 {smokes}회, 잠복 {burrows}회, 대응 유닛 피격 시도 {shots_at_counter}회 (방패병 대상 {covered}), 대응 유닛 사망 {counter_died}/{games}", rounds / games as u32);
+        }
     }
 }

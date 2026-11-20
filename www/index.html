@@ -27,7 +27,8 @@
     body { padding:8px 8px 72px; }
     main { width:auto; }
     canvas { margin:0 auto; }
-    #end { display:none; }
+    #end, kbd { display:none; }
+    #ability { border-color:var(--brood); color:var(--brood); }
     #bar { display:flex; position:fixed; left:0; right:0; bottom:0; gap:8px; align-items:center; padding:8px; background:var(--bg); border-top:1px solid var(--dim); font-variant-numeric:tabular-nums; }
     #aim { flex:1; min-width:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
     #bar button { min-height:44px; padding:4px 16px; flex:none; }
@@ -52,6 +53,7 @@
     <pre id="log" aria-live="polite"></pre>
   </section>
   <nav>
+    <button id="ability" hidden><span id="ability-name"></span><kbd>B</kbd></button>
     <button id="end">턴 종료<kbd>Space</kbd></button>
     <button id="new">새 판</button>
     <button id="export">세이브 내보내기</button>

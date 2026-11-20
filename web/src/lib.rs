@@ -22,24 +22,29 @@ pub const BEAT_TRACER: u32 = 2;
 pub const BEAT_HIT: u32 = 3;
 pub const BEAT_MISS: u32 = 4;
 pub const BEAT_KILL: u32 = 5;
+pub const BEAT_BURROW: u32 = 6;
+pub const BEAT_SMOKE: u32 = 7;
 
 const STEP_MS_BROOD: u32 = 55;
 const STEP_MS_EMPIRE: u32 = 90;
 const TRACER_MS: u32 = 110;
 const IMPACT_MS: u32 = 170;
 const KILL_MS: u32 = 240;
+const BURROW_MS: u32 = 160;
+const SMOKE_MS: u32 = 240;
 /// 빗나간 탄이 표적을 지나 더 날아가는 칸 수.
 const OVERSHOOT: usize = 3;
 
 const CELLS: usize = (W * H) as usize;
 const LOG_LINES: usize = 6;
-/// 문구 구역 구분자. 순서: 상황, 중계 링크, 선택 유닛, 장부 내역, 장부 결과, 기록.
+/// 문구 구역 구분자. 순서: 상황, 중계 링크, 선택 유닛, 장부 내역, 장부 결과, 기록, 쓸 수 있는 능력.
 const SEP: &str = "\u{1f}";
 
 #[derive(Clone, Copy)]
 struct ViewUnit {
     pos: Pos,
     hp: i32,
+    burrowed: bool,
 }
 
 enum Fx {
@@ -59,6 +64,8 @@ struct State {
     frame: [u32; CELLS],
     text: String,
     view: Vec<ViewUnit>,
+    /// 보여주는 중인 연막.
+    view_smoke: Vec<bool>,
     queue: VecDeque<Event>,
     /// 맨 앞 사격 이벤트를 어디까지 보여줬는지.
     shot_stage: u8,
@@ -75,6 +82,7 @@ impl State {
             frame: [0; CELLS],
             text: String::new(),
             view: Vec::new(),
+            view_smoke: Vec::new(),
             queue: VecDeque::new(),
             shot_stage: 0,
             fx: Fx::None,
@@ -96,7 +104,8 @@ impl State {
         self.shot_stage = 0;
         self.fx = Fx::None;
         self.empire_phase = false;
-        self.view = self.game.units.iter().map(|u| ViewUnit { pos: u.pos, hp: u.hp }).collect();
+        self.view = self.game.units.iter().map(|u| ViewUnit { pos: u.pos, hp: u.hp, burrowed: u.burrowed }).collect();
+        self.view_smoke = self.game.smoke.iter().map(|&s| s > 0).collect();
         self.log_shown = self.game.log.len();
     }
 
@@ -136,6 +145,7 @@ impl State {
                     let empire = self.game.units[unit].side == Side::Empire;
                     let before = empire && self.seen(from);
                     self.view[unit].pos = to;
+                    self.view[unit].burrowed = false;
                     // 시야 밖에서 시야 밖으로 가는 적은 보여주지 않는다.
                     if empire && !before && !self.seen(to) {
                         continue;
@@ -147,6 +157,7 @@ impl State {
                     match self.shot_stage {
                         0 => {
                             let color = if self.game.units[shooter].side == Side::Brood { BROOD } else { EMPIRE };
+                            self.view[shooter].burrowed = false;
                             self.fx = Fx::Tracer { cells: Game::line(a, b), color };
                             self.shot_stage = 1;
                             return BEAT_TRACER << 16 | TRACER_MS;
@@ -171,6 +182,22 @@ impl State {
                             }
                         }
                     }
+                }
+                Event::Burrow { unit } => {
+                    self.queue.pop_front();
+                    self.view[unit].burrowed = true;
+                    return BEAT_BURROW << 16 | BURROW_MS;
+                }
+                Event::Smoke { center, .. } => {
+                    self.queue.pop_front();
+                    for y in center.1 - 1..=center.1 + 1 {
+                        for x in center.0 - 1..=center.0 + 1 {
+                            if in_frame((x, y)) && self.game.tile((x, y)) != Tile::Wall {
+                                self.view_smoke[idx((x, y))] = true;
+                            }
+                        }
+                    }
+                    return BEAT_SMOKE << 16 | SMOKE_MS;
                 }
             }
         }
@@ -218,6 +245,7 @@ fn render(s: &mut State) {
     for y in 0..H {
         for x in 0..W {
             s.frame[idx((x, y))] = match g.tile((x, y)) {
+                Tile::Floor if s.view_smoke[idx((x, y))] => cell('≈', DIM, BG),
                 Tile::Floor => cell('·', DIM, BG),
                 Tile::Low => cell('▄', DIM, BG),
                 Tile::Wall => cell('█', DIM, BG),
@@ -265,7 +293,8 @@ fn render(s: &mut State) {
         if v.hp <= 0 {
             continue;
         }
-        let glyph = u.class.def().glyph;
+        // 땅에 숨은 아군은 흙더미로 보인다.
+        let glyph = if v.burrowed { '∩' } else { u.glyph() };
         let struck = matches!(s.fx, Fx::Hit { target } if target == i);
         let shown = match u.side {
             Side::Brood => Some(if struck {
@@ -310,6 +339,7 @@ fn render(s: &mut State) {
         ledger,
         result,
         g.log[from..shown].join("\n"),
+        if can_act && g.can_burrow() { "잠복".to_string() } else { String::new() },
     ];
     s.text = sections.join(SEP);
 }
@@ -321,15 +351,16 @@ fn link_line(s: &State) -> String {
     let mut line = String::from(if up { "& ──" } else { "×   " });
     for (u, v) in units.filter(|(u, _)| u.class != Class::Relay) {
         line.push(' ');
-        line.push(if v.hp > 0 { u.class.def().glyph } else { '·' });
+        line.push(if v.hp > 0 { u.glyph() } else { '·' });
     }
     line.push_str(if up { "  연결" } else { "  두절" });
     line
 }
 
 fn unit_line(s: &State, i: usize) -> String {
-    let d = s.game.units[i].class.def();
-    format!("{} {}  체력 {}/{}", d.glyph, d.name, s.view[i].hp.max(0), d.hp)
+    let u = &s.game.units[i];
+    let hidden = if s.view[i].burrowed { "  숨음" } else { "" };
+    format!("{} {}  체력 {}/{}{hidden}", u.glyph(), u.name(), s.view[i].hp.max(0), u.class.def().hp)
 }
 
 fn minus(v: i32) -> String {
@@ -361,9 +392,13 @@ fn fire_lanes(s: &State, can_act: bool) -> Lanes {
         lanes.next_turn = g.units[sel].ap < 2;
         from = h;
     }
+    // 제자리면 지금 상태 그대로, 옮겨 가면 움직인 것으로 친다. 다음 턴 것이면 그 자리에서 안 움직이고 쏘는 것이다.
+    let me = &g.units[sel];
+    let settled = if lanes.after_move { lanes.next_turn } else { !me.moved };
+    let ambush = !lanes.after_move && me.burrowed;
     for (t, u) in g.units.iter().enumerate() {
-        if u.side == Side::Empire && u.alive() && g.seen_by(Side::Brood, u.pos) {
-            if let Some(shot) = g.shot_from(sel, from, u.pos) {
+        if u.side == Side::Empire && g.visible_to(Side::Brood, t) {
+            if let Some(shot) = g.shot_calc(sel, from, u.pos, Some(t), settled, ambush) {
                 lanes.shots.push((t, shot.chance));
             }
         }
@@ -383,8 +418,8 @@ fn lanes_text(s: &State, lanes: &Lanes) -> String {
     }
     let mut out = head.to_string();
     for &(t, chance) in &lanes.shots {
-        let d = s.game.units[t].class.def();
-        out.push_str(&format!("\n{chance:>3}%  {} {}", d.glyph, d.name));
+        let u = &s.game.units[t];
+        out.push_str(&format!("\n{chance:>3}%  {} {}", u.glyph(), u.name()));
     }
     out
 }
@@ -437,6 +472,16 @@ pub extern "C" fn end_turn() {
     s.game.end_turn();
     s.enqueue(true);
     render(s);
+}
+
+/// 선택한 유닛의 능력을 쓴다. 지금은 잠복 하나다.
+#[no_mangle]
+pub extern "C" fn ability() -> u32 {
+    let s = state();
+    let changed = s.game.burrow();
+    s.enqueue(false);
+    render(s);
+    changed as u32
 }
 
 /// 다음 박자로 넘긴다. 종류<<16 | 길이(ms)를 돌려주고, 보여줄 게 없으면 0.
@@ -509,9 +554,9 @@ mod tests {
         init(3);
         assert!(state().frame.iter().all(|&c| c != 0));
         let parts: Vec<String> = state().text.split(SEP).map(String::from).collect();
-        assert_eq!(parts.len(), 6);
+        assert_eq!(parts.len(), 7);
         assert_eq!(parts[0], "라운드 1");
-        assert_eq!(parts[1], "& ── h h h h  연결");
+        assert_eq!(parts[1], "& ── h h h s h  연결");
 
         // 선택은 보여줄 일이 없다.
         assert_eq!(click(1, 3), 1);
@@ -543,6 +588,17 @@ mod tests {
             assert_eq!((v.pos, v.hp), (u.pos, u.hp));
         }
         assert!(s.text.starts_with("라운드 2"));
+
+        // 잠복 개조 유닛을 고르면 능력이 뜨고, 쓰면 흙더미가 된다.
+        assert_eq!(click(1, 9), 1);
+        assert!(state().text.ends_with("잠복"));
+        assert_eq!(ability(), 1);
+        assert_eq!(advance() >> 16, BEAT_BURROW);
+        assert_eq!(glyph_at((1, 9)), '∩' as u32);
+        assert_eq!(advance(), 0);
+        assert!(state().game.units[2].burrowed);
+        assert!(!state().text.ends_with("잠복"));
+        assert_eq!(ability(), 0);
     }
 
     #[test]
@@ -558,7 +614,7 @@ mod tests {
 
         render(&mut s);
         assert_eq!(s.frame[at], cell('h', EMPIRE, DIM));
-        assert!(s.text.contains("여기서\n 80%  h 보병"), "{}", s.text);
+        assert!(s.text.contains("여기서\n 85%  h 보병"), "{}", s.text);
 
         // 벽 뒤로 들어가면 표시가 꺼지고, 벽을 비켜 설 칸을 가리키면 다시 켜진다.
         s.game.tiles[idx((7, 5))] = Tile::Wall;
