@@ -70,6 +70,7 @@ function draw() {
       ctx.fillText(String.fromCodePoint(glyph), dx * cw + cw / 2, dy * ch + ch / 2 + 1);
     }
   }
+  drawLabels();
   const bytes = new Uint8Array(wasm.memory.buffer, wasm.w_text_ptr(), wasm.w_text_len());
   const parts = new TextDecoder().decode(bytes).split("\u001f");
   TEXT_REGIONS.forEach((id, i) => {
@@ -79,6 +80,39 @@ function draw() {
   });
   $("seed").textContent = `시드 ${save.seed}`;
   $("day").disabled = playing || !!wasm.w_halted();
+}
+
+// 부대 위에 인원을 적는다. 한 칸에 여러 부대가 있으면 위에서 아래로 쌓는다. 고른 부대는 뒤집어 칠한다.
+function drawLabels() {
+  const labels = new Uint32Array(wasm.memory.buffer, wasm.w_labels_ptr(), wasm.w_labels_len());
+  const { cw, ch } = view;
+  const size = Math.max(10, Math.round(view.font * 0.72));
+  const line = size + 2;
+  ctx.font = `${size}px ${FONT_FAMILY}`;
+  for (let i = 0; i < labels.length; ) {
+    // 같은 칸의 표시는 연달아 온다.
+    let n = 1;
+    while (i + n < labels.length && (labels[i + n] & 0xffff) === (labels[i] & 0xffff)) n++;
+    const [dx, dy] = toDisplay(labels[i] & 0xff, (labels[i] >>> 8) & 0xff);
+    const cx = dx * cw + cw / 2;
+    // 부대 바로 위에 쌓는다. 위에 자리가 없으면 아래에.
+    let top = dy * ch - n * line;
+    if (top < 0) top = (dy + 1) * ch;
+    for (let k = 0; k < n; k++) {
+      const l = labels[i + k];
+      const text = String((l >>> 16) & 0xfff);
+      const color = PALETTE[l & (1 << 28) ? 4 : 3];
+      const selected = !!(l & (1 << 29));
+      const w = Math.max(line, ctx.measureText(text).width + 4);
+      const x = Math.min(Math.max(cx - w / 2, 0), view.cols * cw - w);
+      const y = top + k * line;
+      ctx.fillStyle = selected ? color : PALETTE[0];
+      ctx.fillRect(x, y, w, line);
+      ctx.fillStyle = selected ? PALETTE[0] : color;
+      ctx.fillText(text, x + w / 2, y + line / 2 + 1);
+    }
+    i += n;
+  }
 }
 
 function persist() {

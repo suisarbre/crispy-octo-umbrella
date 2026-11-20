@@ -9,11 +9,18 @@ const CELLS: usize = (WW * WH) as usize;
 /// 문구 구역 구분자. 순서: 날짜, 고른 부대, 알림.
 const SEP: &str = "\u{1f}";
 
+/// 인원 표시 하나의 비트 배치: x | y<<8 | 인원<<16 | 인류면 `LABEL_EMPIRE` | 고른 부대면 `LABEL_SELECTED`.
+/// 같은 칸의 부대는 연달아 나온다. 화면은 그 순서대로 위에서 아래로 쌓는다.
+pub const LABEL_EMPIRE: u32 = 1 << 28;
+pub const LABEL_SELECTED: u32 = 1 << 29;
+
 struct State {
     world: World,
     frame: [u32; CELLS],
     text: String,
     popup: String,
+    /// 부대마다 인원 표시 하나. `LABEL_*` 참고.
+    labels: Vec<u32>,
 }
 
 static mut STATE: Option<State> = None;
@@ -22,7 +29,7 @@ fn state() -> &'static mut State {
     // wasm은 단일 스레드고, 모든 export는 JS에서 순서대로 호출된다.
     unsafe {
         let slot = &mut *core::ptr::addr_of_mut!(STATE);
-        slot.get_or_insert_with(|| State { world: World::new(0), frame: [0; CELLS], text: String::new(), popup: String::new() })
+        slot.get_or_insert_with(|| State { world: World::new(0), frame: [0; CELLS], text: String::new(), popup: String::new(), labels: Vec::new() })
     }
 }
 
@@ -77,6 +84,19 @@ fn render(s: &mut State) {
         }
         s.frame[idx(f.pos)] = if w.selected == Some(i) { cell('◆', BG, color) } else { cell('◆', color, BG) };
     }
+
+    // 인원 표시. 같은 칸끼리 모이도록 칸 순서로, 그 안에서는 부대 번호 순서로.
+    let mut order: Vec<usize> = (0..w.forces.len()).collect();
+    order.sort_by_key(|&i| (idx(w.forces[i].pos), i));
+    s.labels = order
+        .into_iter()
+        .map(|i| {
+            let f = &w.forces[i];
+            let side = if f.side == Side::Empire { LABEL_EMPIRE } else { 0 };
+            let selected = if w.selected == Some(i) { LABEL_SELECTED } else { 0 };
+            f.pos.0 as u32 | (f.pos.1 as u32) << 8 | f.size.min(0xfff) << 16 | side | selected
+        })
+        .collect();
 
     let sections = [
         format!("D+{}", w.day()),
@@ -170,6 +190,16 @@ pub extern "C" fn w_frame_ptr() -> *const u32 {
 }
 
 #[no_mangle]
+pub extern "C" fn w_labels_ptr() -> *const u32 {
+    state().labels.as_ptr()
+}
+
+#[no_mangle]
+pub extern "C" fn w_labels_len() -> usize {
+    state().labels.len()
+}
+
+#[no_mangle]
 pub extern "C" fn w_text_ptr() -> *const u8 {
     state().text.as_ptr()
 }
@@ -205,7 +235,7 @@ pub fn dump(seed: u32, clicks: &[Pos], ticks: u32) -> String {
     }
     w_tick(ticks);
     let s = state();
-    format!("{{\"frame\":{:?},\"text\":{:?}}}", s.frame.to_vec(), s.text)
+    format!("{{\"frame\":{:?},\"labels\":{:?},\"text\":{:?}}}", s.frame.to_vec(), s.labels, s.text)
 }
 
 #[cfg(test)]
@@ -221,6 +251,13 @@ mod tests {
         assert_eq!(w_ticks_left_today(), 24);
         assert_eq!(s.frame[idx(home)], cell('◆', BROOD, BG));
 
+        // 부대마다 인원 표시가 하나씩. 본진의 셋은 한 칸에 6, 6, 2 순서로 쌓인다.
+        assert_eq!(s.labels.len(), s.world.forces.len());
+        let at_home: Vec<u32> = s.labels.iter().filter(|&&l| (l & 0xff, (l >> 8) & 0xff) == (home.0 as u32, home.1 as u32)).map(|l| (l >> 16) & 0xfff).collect();
+        assert_eq!(at_home, vec![6, 6, 2]);
+        assert_eq!(s.labels.iter().filter(|&&l| l & LABEL_EMPIRE != 0).count(), 3);
+        assert!(s.labels.iter().all(|&l| l & LABEL_SELECTED == 0));
+
         // 본진 칸에는 본진과 부대 셋이 있다.
         assert!(w_inspect(home.0, home.1) > 0);
         assert_eq!(state().popup.lines().count(), 4);
@@ -228,6 +265,7 @@ mod tests {
 
         // 부대를 골라 다른 거점으로 보내면 길이 그려지고, 시간이 가면 움직인다.
         assert_eq!(w_click(home.0, home.1), 1);
+        assert_eq!(state().labels.iter().filter(|&&l| l & LABEL_SELECTED != 0).count(), 1);
         let dest = state().world.sites.iter().map(|x| x.pos).find(|&p| p != home).unwrap();
         assert_eq!(w_click(dest.0, dest.1), 1);
         assert!(state().frame.iter().any(|&c| c == cell('•', BROOD, BG)));
