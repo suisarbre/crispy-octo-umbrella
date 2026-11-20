@@ -138,11 +138,11 @@ function draw() {
     ctx.lineWidth = 1;
     ctx.strokeRect(dx * cw + 0.5, dy * ch + 0.5, cw - 1, ch - 1);
   }
-  // 맞은 순간, 깎인 체력을 표적 위에 띄운다.
+  // 맞은 순간에는 깎인 체력을, 빗나간 순간에는 빗나감을 표적 위에 띄운다.
   const float = wasm.damage_float();
   if (float) {
     const [dx, dy] = toDisplay((float >>> 8) & 0xff, (float >>> 16) & 0xff);
-    const label = `−${float & 0xff}`;
+    const label = float & (1 << 24) ? "빗나감!" : `−${float & 0xff}`;
     const row = dy > 0 ? dy - 1 : dy + 1;
     const w = Math.max(cw, ctx.measureText(label).width + 6);
     const left = Math.min(Math.max(dx * cw + cw / 2 - w / 2, 0), view.cols * cw - w);

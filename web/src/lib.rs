@@ -53,7 +53,7 @@ enum Fx {
     /// 맞은 순간. 표적 칸이 번쩍인다.
     Hit { target: usize, dmg: i32 },
     /// 빗나간 탄의 자국.
-    Miss { cells: Vec<Pos> },
+    Miss { cells: Vec<Pos>, target: usize },
     Death { pos: Pos },
 }
 
@@ -171,7 +171,7 @@ impl State {
                                 self.fx = Fx::Hit { target, dmg };
                                 return BEAT_HIT << 16 | IMPACT_MS;
                             }
-                            self.fx = Fx::Miss { cells: self.overshoot(a, b) };
+                            self.fx = Fx::Miss { cells: self.overshoot(a, b), target };
                             return BEAT_MISS << 16 | IMPACT_MS;
                         }
                         _ => {
@@ -281,7 +281,7 @@ fn render(s: &mut State) {
                 }
             }
         }
-        Fx::Miss { cells } => {
+        Fx::Miss { cells, .. } => {
             for &p in cells.iter().filter(|p| g.tile(**p) == Tile::Floor) {
                 s.frame[idx(p)] = cell('•', DIM, BG);
             }
@@ -547,15 +547,20 @@ pub extern "C" fn popup_ptr() -> *const u8 {
     state().popup.as_ptr()
 }
 
-/// 지금 박자에 띄울 피해 숫자. 없으면 0. 있으면 피해 | x<<8 | y<<16.
+/// 빗나간 사격이면 `damage_float`의 이 비트가 켜진다.
+pub const FLOAT_MISS: u32 = 1 << 24;
+
+/// 지금 박자에 표적 위로 띄울 것. 없으면 0. 맞았으면 피해 | x<<8 | y<<16, 빗나갔으면 거기에 `FLOAT_MISS`.
 #[no_mangle]
 pub extern "C" fn damage_float() -> u32 {
     let s = state();
-    match s.fx {
-        Fx::Hit { target, dmg } => {
-            let p = s.view[target].pos;
-            dmg as u32 | (p.0 as u32) << 8 | (p.1 as u32) << 16
-        }
+    let at = |target: usize| {
+        let p = s.view[target].pos;
+        (p.0 as u32) << 8 | (p.1 as u32) << 16
+    };
+    match &s.fx {
+        Fx::Hit { target, dmg } => *dmg as u32 | at(*target),
+        Fx::Miss { target, .. } => FLOAT_MISS | at(*target),
         _ => 0,
     }
 }
@@ -718,6 +723,14 @@ mod tests {
                     if kind == BEAT_HIT || kind == BEAT_MISS {
                         assert_eq!(last, BEAT_TRACER, "seed {seed}");
                     }
+                    // 맞으면 피해 숫자, 빗나가면 빗나감 표시, 그 밖에는 아무것도 안 뜬다.
+                    let float = match &s.fx {
+                        Fx::Hit { dmg, .. } => *dmg as u32,
+                        Fx::Miss { .. } => FLOAT_MISS,
+                        _ => 0,
+                    };
+                    assert_eq!(float != 0, kind == BEAT_HIT || kind == BEAT_MISS);
+                    assert_eq!(float == FLOAT_MISS, kind == BEAT_MISS);
                     last = kind;
                     beats += 1;
                     assert!(beats < 2000, "seed {seed}: 재생이 안 끝남");
