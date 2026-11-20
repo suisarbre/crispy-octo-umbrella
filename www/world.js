@@ -70,6 +70,7 @@ function draw() {
       ctx.fillText(String.fromCodePoint(glyph), dx * cw + cw / 2, dy * ch + ch / 2 + 1);
     }
   }
+  drawPulses(frame);
   drawLabels();
   const bytes = new Uint8Array(wasm.memory.buffer, wasm.w_text_ptr(), wasm.w_text_len());
   const parts = new TextDecoder().decode(bytes).split("\u001f");
@@ -82,6 +83,48 @@ function draw() {
   $("day").disabled = playing || !!wasm.w_halted();
 }
 
+// 가는 방향을 보여주는 빛. 부대에서 출발해 길을 따라 한 칸씩 흘러간다. 빠른 부대의 빛이 더 빨리 흐른다.
+// 길이 겹쳐도 빛은 부대마다 따로 흐르므로 누가 어느 쪽으로 가는지 가려진다.
+const PULSE_MS_PER_TICK = 18;
+/// 한 번 흐른 뒤 다시 출발하기까지 쉬는 칸 수.
+const PULSE_REST = 5;
+const stillness = window.matchMedia("(prefers-reduced-motion: reduce)");
+
+function drawPulses(frame) {
+  const len = wasm.w_routes_len();
+  if (!len || stillness.matches) return;
+  const routes = new Uint32Array(wasm.memory.buffer, wasm.w_routes_ptr(), len);
+  const { cw, ch } = view;
+  const now = performance.now();
+  for (let i = 0, k = 0; i < len; k++) {
+    const head = routes[i];
+    const n = head & 0xffff;
+    const selected = !!(head & (1 << 16));
+    const interval = (head >>> 20) * PULSE_MS_PER_TICK;
+    // 길마다 출발 시각을 조금씩 어긋나게 해서 겹친 길의 빛이 한 덩어리로 보이지 않게 한다.
+    const at = Math.floor(((now + k * 310) % ((n + PULSE_REST) * interval)) / interval);
+    if (at < n) {
+      const cell = routes[i + 1 + at];
+      const [x, y] = [cell & 0xff, (cell >>> 8) & 0xff];
+      const glyph = frame[y * COLS + x] & 0x1fffff;
+      // 부대나 거점 위는 건너뛴다.
+      if (glyph === 0x2022 || glyph === 0x25c7) {
+        const [dx, dy] = toDisplay(x, y);
+        ctx.fillStyle = PALETTE[0];
+        ctx.fillRect(dx * cw, dy * ch, cw, ch);
+        ctx.fillStyle = PALETTE[selected ? 2 : 3];
+        ctx.fillText(String.fromCodePoint(glyph), dx * cw + cw / 2, dy * ch + ch / 2 + 1);
+      }
+    }
+    i += 1 + n;
+  }
+}
+
+// 움직이는 부대가 있는 동안에만 빛을 흘린다. 하루가 재생되는 중에는 재생이 화면을 그린다.
+setInterval(() => {
+  if (!playing && !stillness.matches && !document.hidden && wasm.w_routes_len()) draw();
+}, 60);
+
 // 부대 위에 인원을 적는다. 한 칸에 여러 부대가 있으면 위에서 아래로 쌓는다. 고른 부대는 뒤집어 칠한다.
 function drawLabels() {
   const labels = new Uint32Array(wasm.memory.buffer, wasm.w_labels_ptr(), wasm.w_labels_len());
@@ -89,15 +132,24 @@ function drawLabels() {
   const size = Math.max(10, Math.round(view.font * 0.72));
   const line = size + 2;
   ctx.font = `${size}px ${FONT_FAMILY}`;
+  // 표시가 옆 칸의 다른 부대를 덮지 않게, 부대가 선 칸들을 먼저 적어 둔다.
+  const taken = new Set();
+  for (const l of labels) taken.add(toDisplay(l & 0xff, (l >>> 8) & 0xff).join());
   for (let i = 0; i < labels.length; ) {
     // 같은 칸의 표시는 연달아 온다.
     let n = 1;
     while (i + n < labels.length && (labels[i + n] & 0xffff) === (labels[i] & 0xffff)) n++;
     const [dx, dy] = toDisplay(labels[i] & 0xff, (labels[i] >>> 8) & 0xff);
-    const cx = dx * cw + cw / 2;
-    // 부대 바로 위에 쌓는다. 위에 자리가 없으면 아래에.
+    let cx = dx * cw + cw / 2;
+    // 부대 바로 위에 쌓는다. 위에 다른 부대가 있거나 자리가 없으면 아래에, 아래도 막혔으면 오른쪽에.
     let top = dy * ch - n * line;
-    if (top < 0) top = (dy + 1) * ch;
+    if (top < 0 || taken.has([dx, dy - 1].join())) {
+      top = (dy + 1) * ch;
+      if (taken.has([dx, dy + 1].join()) || top + n * line > view.rows * ch) {
+        top = dy * ch + ch / 2 - (n * line) / 2;
+        cx = (dx + 1) * cw + line / 2;
+      }
+    }
     for (let k = 0; k < n; k++) {
       const l = labels[i + k];
       const text = String((l >>> 16) & 0xfff);

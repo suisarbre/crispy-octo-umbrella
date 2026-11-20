@@ -230,8 +230,8 @@ impl World {
     }
 
     /// 플레이어 입력: 칸 하나를 누른다. 상태가 바뀌었으면 true.
-    /// 아군 부대가 있는 칸이면 고른다 (겹쳐 있으면 누를 때마다 다음 부대).
-    /// 부대를 고른 채 길 위의 칸을 누르면 거기로 보낸다. 그 밖의 칸이면 선택을 푼다.
+    /// 아군 부대가 있는 칸이면 고른다. 겹쳐 있으면 대기 중인 부대부터 잡고, 누를 때마다 다음 부대로 넘어간다.
+    /// 부대를 고른 채 길 위의 칸을 누르면 거기로 보내고 선택을 푼다. 그 밖의 칸이어도 선택을 푼다.
     pub fn click(&mut self, p: Pos) -> bool {
         if !in_world(p) {
             return false;
@@ -241,7 +241,8 @@ impl World {
         if !mine.is_empty() && !moving_here {
             let next = match self.selected.and_then(|s| mine.iter().position(|&i| i == s)) {
                 Some(k) => mine[(k + 1) % mine.len()],
-                None => mine[0],
+                // 처음 누를 때는 아직 명령을 안 받은 부대부터 잡는다. 겹친 부대에 차례로 명령을 내리기 쉽게.
+                None => *mine.iter().find(|&&i| self.forces[i].order == Order::Hold).unwrap_or(&mine[0]),
             };
             let changed = self.selected != Some(next);
             self.selected = Some(next);
@@ -254,8 +255,10 @@ impl World {
                 self.forces[s].progress = 0;
                 self.clash = None;
             }
-            _ => self.selected = None,
+            _ => {}
         }
+        // 명령은 내리는 즉시 들어간다. 다음 부대를 바로 고를 수 있게 선택은 푼다.
+        self.selected = None;
         true
     }
 
@@ -355,8 +358,9 @@ mod tests {
         let dest = w.sites.iter().map(|s| s.pos).find(|&p| p != start && w.route(start, p).unwrap().len() < 14).unwrap();
         let path = w.route(start, dest).unwrap();
         assert!(w.click(start));
-        assert!(w.click(dest));
         let s = w.selected.unwrap();
+        assert!(w.click(dest));
+        assert!(w.selected.is_none(), "명령을 내리면 선택이 풀린다");
         let per_tile = w.forces[s].step_ticks() as usize;
         for (n, p) in path.iter().enumerate() {
             for _ in 0..per_tile {
@@ -384,6 +388,21 @@ mod tests {
     }
 
     #[test]
+    fn after_an_order_the_next_click_picks_an_idle_force() {
+        let mut w = World::new(3);
+        let start = home(&w);
+        let dest = w.sites.iter().map(|s| s.pos).find(|&p| p != start).unwrap();
+        let mut ordered = Vec::new();
+        for _ in 0..3 {
+            w.click(start);
+            ordered.push(w.selected.unwrap());
+            w.click(dest);
+        }
+        ordered.sort();
+        assert_eq!(ordered, vec![0, 1, 2], "세 번 누르고 보내면 세 부대가 다 명령을 받는다");
+    }
+
+    #[test]
     fn clicking_off_the_road_deselects() {
         let mut w = World::new(3);
         w.click(home(&w));
@@ -399,8 +418,8 @@ mod tests {
         let enemy = w.forces.iter().position(|f| f.side == Side::Empire).unwrap();
         let target = w.forces[enemy].pos;
         w.click(start);
-        w.click(target);
         let s = w.selected.unwrap();
+        w.click(target);
         for _ in 0..5000 {
             w.tick();
         }

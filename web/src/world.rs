@@ -14,6 +14,9 @@ const SEP: &str = "\u{1f}";
 pub const LABEL_EMPIRE: u32 = 1 << 28;
 pub const LABEL_SELECTED: u32 = 1 << 29;
 
+/// 길 하나의 머리말: 칸 수 | 고른 부대면 `ROUTE_SELECTED` | 한 칸 가는 틱 수<<20. 그 뒤로 칸마다 x | y<<8.
+pub const ROUTE_SELECTED: u32 = 1 << 16;
+
 struct State {
     world: World,
     frame: [u32; CELLS],
@@ -21,6 +24,8 @@ struct State {
     popup: String,
     /// 부대마다 인원 표시 하나. `LABEL_*` 참고.
     labels: Vec<u32>,
+    /// 움직이는 아군 부대의 길. `w_routes_ptr` 참고.
+    routes: Vec<u32>,
 }
 
 static mut STATE: Option<State> = None;
@@ -29,7 +34,7 @@ fn state() -> &'static mut State {
     // wasm은 단일 스레드고, 모든 export는 JS에서 순서대로 호출된다.
     unsafe {
         let slot = &mut *core::ptr::addr_of_mut!(STATE);
-        slot.get_or_insert_with(|| State { world: World::new(0), frame: [0; CELLS], text: String::new(), popup: String::new(), labels: Vec::new() })
+        slot.get_or_insert_with(|| State { world: World::new(0), frame: [0; CELLS], text: String::new(), popup: String::new(), labels: Vec::new(), routes: Vec::new() })
     }
 }
 
@@ -67,14 +72,32 @@ fn render(s: &mut State) {
             };
         }
     }
-    if let Some(sel) = w.selected {
-        if let Order::Move(path) = &w.forces[sel].order {
-            for &p in path {
-                if w.ground(p) == Ground::Road {
-                    s.frame[idx(p)] = cell('•', BROOD, BG);
-                }
+    // 움직이는 아군 부대의 길은 고르지 않아도 흐리게 보인다. 고른 부대의 길은 아군 색으로 그 위에 그린다.
+    // 길이 겹치는 칸은 한 번만 찍힌다. 누가 어느 쪽으로 가는지는 끝점 표시와 흐르는 빛으로 가린다.
+    s.routes.clear();
+    let mut moving: Vec<usize> = (0..w.forces.len()).filter(|&i| w.forces[i].side == Side::Brood).collect();
+    moving.sort_by_key(|&i| w.selected == Some(i));
+    for &i in &moving {
+        let Order::Move(path) = &w.forces[i].order else { continue };
+        let color = if w.selected == Some(i) { BROOD } else { DIM };
+        for &p in path.iter().filter(|&&p| w.ground(p) == Ground::Road) {
+            s.frame[idx(p)] = cell('•', color, BG);
+        }
+    }
+    // 끝점은 길을 다 그린 뒤에 찍는다. 다른 부대의 길이 지나가도 끝점 표시가 남게.
+    for i in moving {
+        let Order::Move(path) = &w.forces[i].order else { continue };
+        let selected = w.selected == Some(i);
+        if let Some(&end) = path.last() {
+            match w.ground(end) {
+                Ground::Road => s.frame[idx(end)] = cell('◇', if selected { BROOD } else { FG }, BG),
+                // 목적지가 거점이면 거점을 아군 색으로 칠한다.
+                Ground::Site(site) if w.sites[site].kind == SiteKind::Plain => s.frame[idx(end)] = cell('○', BROOD, BG),
+                _ => {}
             }
         }
+        s.routes.push(path.len() as u32 | if selected { ROUTE_SELECTED } else { 0 } | w.forces[i].step_ticks() << 20);
+        s.routes.extend(path.iter().map(|p| p.0 as u32 | (p.1 as u32) << 8));
     }
     for (i, f) in w.forces.iter().enumerate() {
         let color = side_color(f.side);
@@ -189,6 +212,17 @@ pub extern "C" fn w_frame_ptr() -> *const u32 {
     state().frame.as_ptr()
 }
 
+/// 움직이는 아군 부대의 길들. 길마다 머리말 하나와 칸들. 화면이 방향을 보여주는 빛을 흘리는 데 쓴다.
+#[no_mangle]
+pub extern "C" fn w_routes_ptr() -> *const u32 {
+    state().routes.as_ptr()
+}
+
+#[no_mangle]
+pub extern "C" fn w_routes_len() -> usize {
+    state().routes.len()
+}
+
 #[no_mangle]
 pub extern "C" fn w_labels_ptr() -> *const u32 {
     state().labels.as_ptr()
@@ -235,7 +269,7 @@ pub fn dump(seed: u32, clicks: &[Pos], ticks: u32) -> String {
     }
     w_tick(ticks);
     let s = state();
-    format!("{{\"frame\":{:?},\"labels\":{:?},\"text\":{:?}}}", s.frame.to_vec(), s.labels, s.text)
+    format!("{{\"frame\":{:?},\"labels\":{:?},\"routes\":{:?},\"text\":{:?}}}", s.frame.to_vec(), s.labels, s.routes, s.text)
 }
 
 #[cfg(test)]
@@ -263,14 +297,33 @@ mod tests {
         assert_eq!(state().popup.lines().count(), 4);
         assert!(state().popup.starts_with("◉ 아군 본진"));
 
-        // 부대를 골라 다른 거점으로 보내면 길이 그려지고, 시간이 가면 움직인다.
+        // 부대를 골라 다른 거점으로 보내면 선택이 풀리고, 길은 흐리게 남는다.
         assert_eq!(w_click(home.0, home.1), 1);
         assert_eq!(state().labels.iter().filter(|&&l| l & LABEL_SELECTED != 0).count(), 1);
-        let dest = state().world.sites.iter().map(|x| x.pos).find(|&p| p != home).unwrap();
-        assert_eq!(w_click(dest.0, dest.1), 1);
-        assert!(state().frame.iter().any(|&c| c == cell('•', BROOD, BG)));
-        assert_eq!(w_tick(30), 30);
         let sel = state().world.selected.unwrap();
+        let dest = state().world.sites.iter().find(|x| x.kind == SiteKind::Plain).unwrap().pos;
+        assert_eq!(w_click(dest.0, dest.1), 1);
+        let s = state();
+        assert!(s.world.selected.is_none());
+        assert!(s.frame.iter().any(|&c| c == cell('•', DIM, BG)));
+        assert!(!s.frame.iter().any(|&c| c == cell('•', BROOD, BG)));
+        assert_eq!(s.frame[idx(dest)], cell('○', BROOD, BG), "목적지 거점은 아군 색");
+        let Order::Move(path) = &s.world.forces[sel].order else { panic!("이동 중이어야 한다") };
+        assert_eq!(s.routes.len(), path.len() + 1);
+        assert_eq!(s.routes[0] & 0xffff, path.len() as u32);
+        assert_eq!(s.routes[0] & ROUTE_SELECTED, 0);
+        assert_eq!(s.routes[1], path[0].0 as u32 | (path[0].1 as u32) << 8);
+
+        // 다시 고르면 그 길이 아군 색으로 바뀐다.
+        let at = s.world.forces[sel].pos;
+        while state().world.selected != Some(sel) {
+            w_click(at.0, at.1);
+        }
+        assert!(state().frame.iter().any(|&c| c == cell('•', BROOD, BG)));
+        assert_ne!(state().routes[0] & ROUTE_SELECTED, 0);
+
+        // 시간이 가면 움직인다.
+        assert_eq!(w_tick(30), 30);
         assert_ne!(state().world.forces[sel].pos, home);
         assert!(state().text.starts_with("D+1"));
         assert_eq!(w_ticks_left_today(), 18);
