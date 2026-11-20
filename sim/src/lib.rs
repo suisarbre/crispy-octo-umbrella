@@ -629,9 +629,12 @@ impl Game {
             return false;
         }
         if let Some(s) = self.selected {
-            if self.units[s].ap > 0 {
-                return self.move_unit(s, p);
+            if self.units[s].ap > 0 && self.move_unit(s, p) {
+                return true;
             }
+            // 갈 수 없는 빈 칸을 누르면 선택을 푼다.
+            self.selected = None;
+            return true;
         }
         false
     }

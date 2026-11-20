@@ -9,17 +9,18 @@
   html, body { margin:0; background:var(--bg); color:var(--fg); }
   body { font:15px/1.5 ui-monospace, "Cascadia Mono", Menlo, Consolas, "D2Coding", monospace; padding:20px; }
   main { width:max-content; max-width:100%; margin:0 auto; }
-  canvas { display:block; cursor:crosshair; touch-action:manipulation; user-select:none; -webkit-user-select:none; -webkit-tap-highlight-color:transparent; }
-  #panel { display:grid; grid-template-columns:24ch 1fr; gap:0 32px; margin:16px 0; font-variant-numeric:tabular-nums; }
+  canvas { display:block; cursor:crosshair; touch-action:manipulation; -webkit-touch-callout:none; user-select:none; -webkit-user-select:none; -webkit-tap-highlight-color:transparent; }
+  #panel { margin:16px 0; font-variant-numeric:tabular-nums; }
   #panel > div > * { margin:0; min-height:1.5em; white-space:pre; font:inherit; }
   #link { color:var(--empire); }
-  #panel #unit { margin-bottom:12px; }
+  #panel #link { margin-bottom:12px; }
   #panel #ledger { min-height:9em; }
   #result { color:var(--brood); }
-  #log { margin:0; min-height:9em; white-space:pre-wrap; font:inherit; border-left:1px solid var(--dim); padding-left:32px; }
+  #pop { position:absolute; z-index:2; margin:0; padding:4px 8px; white-space:pre; pointer-events:none; background:var(--bg); border:1px solid var(--fg); font-variant-numeric:tabular-nums; }
   nav { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
   button { font:inherit; color:var(--fg); background:none; border:1px solid var(--dim); padding:4px 12px; cursor:pointer; }
   button:hover, button:focus-visible { border-color:var(--fg); outline:none; }
+  #ability[data-off] { visibility:hidden; }
   kbd { font:inherit; font-size:12px; border:1px solid var(--dim); border-bottom-width:2px; padding:0 4px; margin-left:8px; }
   #seed { margin-left:auto; }
   #bar { display:none; }
@@ -35,7 +36,6 @@
     #confirm { border-color:var(--brood); color:var(--brood); }
     nav button { min-height:44px; }
   }
-  @media (max-width:560px) { #panel { grid-template-columns:1fr; gap:16px 0; } #log { border-left:0; padding-left:0; } }
   #err { color:var(--empire); }
 </style>
 </head>
@@ -46,14 +46,12 @@
     <div>
       <p id="status"></p>
       <p id="link" aria-label="제국 중계 링크"></p>
-      <p id="unit"></p>
       <pre id="ledger"></pre>
       <p id="result"></p>
     </div>
-    <pre id="log" aria-live="polite"></pre>
   </section>
   <nav>
-    <button id="ability" hidden><span id="ability-name"></span><kbd>B</kbd></button>
+    <button id="ability" data-off><span id="ability-name"></span><kbd>B</kbd></button>
     <button id="end">턴 종료<kbd>Space</kbd></button>
     <button id="new">새 판</button>
     <button id="export">세이브 내보내기</button>
@@ -62,6 +60,7 @@
     <span id="seed"></span>
   </nav>
   <p id="err" role="alert"></p>
+  <pre id="pop" role="status" hidden></pre>
   <div id="bar">
     <span id="aim"></span>
     <button id="confirm" hidden>실행</button>

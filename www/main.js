@@ -7,7 +7,7 @@ const FONT_PX = 20;
 const FONT_FAMILY = 'ui-monospace, "Cascadia Mono", Menlo, Consolas, monospace';
 
 // game.wasm이 넘기는 문구 구역 순서와 같다.
-const TEXT_REGIONS = ["status", "link", "unit", "ledger", "result", "log"];
+const TEXT_REGIONS = ["status", "link", "ledger", "result"];
 
 const $ = (id) => document.getElementById(id);
 const canvas = $("screen");
@@ -98,6 +98,8 @@ function layout() {
   canvas.height = rows * ch * dpr;
   canvas.style.width = `${cols * cw}px`;
   canvas.style.height = `${rows * ch}px`;
+  // 본문 폭을 전장에 맞춘다. 아래 버튼이나 글자가 바뀌어도 전장이 옆으로 밀리지 않는다.
+  document.querySelector("main").style.width = narrow ? "" : `${cols * cw}px`;
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 }
 
@@ -136,6 +138,19 @@ function draw() {
     ctx.lineWidth = 1;
     ctx.strokeRect(dx * cw + 0.5, dy * ch + 0.5, cw - 1, ch - 1);
   }
+  // 맞은 순간, 깎인 체력을 표적 위에 띄운다.
+  const float = wasm.damage_float();
+  if (float) {
+    const [dx, dy] = toDisplay((float >>> 8) & 0xff, (float >>> 16) & 0xff);
+    const label = `−${float & 0xff}`;
+    const row = dy > 0 ? dy - 1 : dy + 1;
+    const w = Math.max(cw, ctx.measureText(label).width + 6);
+    const left = Math.min(Math.max(dx * cw + cw / 2 - w / 2, 0), view.cols * cw - w);
+    ctx.fillStyle = PALETTE[0];
+    ctx.fillRect(left, row * ch, w, ch);
+    ctx.fillStyle = PALETTE[2];
+    ctx.fillText(label, left + w / 2, row * ch + ch / 2 + 1);
+  }
   const bytes = new Uint8Array(wasm.memory.buffer, wasm.text_ptr(), wasm.text_len());
   const parts = new TextDecoder().decode(bytes).split("\u001f");
   TEXT_REGIONS.forEach((id, i) => {
@@ -146,10 +161,11 @@ function draw() {
   // 일곱 번째 구역은 지금 쓸 수 있는 능력의 이름이다. 없으면 버튼을 감춘다.
   const ability = parts[TEXT_REGIONS.length] ?? "";
   $("ability-name").textContent = ability;
-  $("ability").hidden = !ability;
+  // 자리는 그대로 두고 감춘다. 버튼이 생겼다 없어질 때 화면이 밀리지 않게.
+  $("ability").toggleAttribute("data-off", !ability);
   // 하단 바: 조준 중인 칸의 장부를 한 줄로.
   // 좁은 화면에서 잘려도 결과가 먼저 보이게 결과를 앞에 둔다.
-  const aim = pending ? [parts[4] ?? "", ...(parts[3] ?? "").split("\n").slice(1), (parts[3] ?? "").split("\n")[0]].filter((t) => t && t !== "—").join("  ").replace(/ {3,}/g, " ") : "";
+  const aim = pending ? [parts[3] ?? "", ...(parts[2] ?? "").split("\n").slice(1), (parts[2] ?? "").split("\n")[0]].filter((t) => t && t !== "—").join("  ").replace(/ {3,}/g, " ") : "";
   $("aim").textContent = pending ? aim || "이동" : "";
   $("confirm").hidden = !pending;
   $("seed").textContent = `시드 ${save.seed}`;
@@ -245,15 +261,79 @@ function isOwnUnit(x, y) {
   return !TERRAIN.has(c & 0x1fffff) && (fg === BROOD || bg === BROOD || fg === 1);
 }
 
+function isReachable(x, y) {
+  const c = frameNow()[y * COLS + x];
+  const glyph = c & 0x1fffff;
+  return (glyph === 0xb7 || glyph === 0x2022) && ((c >>> 24) & 0xf) === BROOD;
+}
+
+function isEnemyUnit(x, y) {
+  return !TERRAIN.has(frameNow()[y * COLS + x] & 0x1fffff) && !isOwnUnit(x, y);
+}
+
+// 유닛 정보 창. 마우스는 올리면, 터치는 길게 누르면 뜬다.
+const pop = $("pop");
+const HOLD_MS = 350;
+let holdTimer = 0;
+let holdStart = null;
+// 길게 눌러 창을 본 손가락을 뗄 때 생기는 클릭은 버린다.
+let swallowClick = false;
+
+function showPop(x, y) {
+  const len = x >= 0 && y >= 0 && x < COLS && y < ROWS ? wasm.inspect(x, y) : 0;
+  if (!len) {
+    pop.hidden = true;
+    return false;
+  }
+  pop.textContent = new TextDecoder().decode(new Uint8Array(wasm.memory.buffer, wasm.popup_ptr(), len));
+  pop.hidden = false;
+  const r = canvas.getBoundingClientRect();
+  const [dx, dy] = toDisplay(x, y);
+  const cellX = r.left + window.scrollX + ((dx + 0.5) * r.width) / view.cols;
+  const cellY = r.top + window.scrollY + (dy * r.height) / view.rows;
+  const left = Math.min(Math.max(cellX - pop.offsetWidth / 2, window.scrollX + 4), window.scrollX + document.documentElement.clientWidth - pop.offsetWidth - 4);
+  // 손가락에 가리지 않게 위쪽에. 자리가 없으면 아래쪽에.
+  let top = cellY - pop.offsetHeight - 8;
+  if (top < window.scrollY + 4) top = cellY + r.height / view.rows + 8;
+  pop.style.left = `${left}px`;
+  pop.style.top = `${top}px`;
+  return true;
+}
+
+function hidePop() {
+  clearTimeout(holdTimer);
+  holdStart = null;
+  pop.hidden = true;
+}
+
 canvas.addEventListener("pointerdown", (ev) => {
   lastPointer = ev.pointerType;
+  swallowClick = false;
+  if (ev.pointerType === "mouse") return;
+  holdStart = [ev.clientX, ev.clientY];
+  clearTimeout(holdTimer);
+  holdTimer = setTimeout(() => {
+    const [x, y] = cellAt(ev, true);
+    if (showPop(x, y)) swallowClick = true;
+  }, HOLD_MS);
 });
 
+canvas.addEventListener("pointerup", (ev) => {
+  if (ev.pointerType !== "mouse") hidePop();
+});
+canvas.addEventListener("pointercancel", hidePop);
+canvas.addEventListener("contextmenu", (ev) => ev.preventDefault());
+
 canvas.addEventListener("click", (ev) => {
+  if (swallowClick) {
+    swallowClick = false;
+    return;
+  }
   if (skipIfPlaying()) return;
   if (lastPointer === "mouse") {
     const [x, y] = cellAt(ev, false);
     act(x, y);
+    showPop(x, y);
     draw();
     return;
   }
@@ -265,23 +345,35 @@ canvas.addEventListener("click", (ev) => {
     // 아군 선택은 되돌릴 게 없으니 바로.
     clearPending();
     act(x, y);
-  } else {
+  } else if (isEnemyUnit(x, y) || isReachable(x, y)) {
     pending = [x, y];
     wasm.hover(x, y);
+  } else {
+    // 행동 범위 밖: 선택을 푼다.
+    clearPending();
+    act(x, y);
   }
   draw();
 });
 
 canvas.addEventListener("pointermove", (ev) => {
-  if (ev.pointerType !== "mouse" || playing) return;
+  if (ev.pointerType !== "mouse") {
+    // 누른 채 손가락이 움직이면 길게 누르기가 아니다.
+    if (holdStart && Math.hypot(ev.clientX - holdStart[0], ev.clientY - holdStart[1]) > 10) hidePop();
+    return;
+  }
   lastPointer = "mouse";
   const [x, y] = cellAt(ev, false);
+  showPop(x, y);
+  if (playing) return;
   wasm.hover(x, y);
   draw();
 });
 
 canvas.addEventListener("pointerleave", (ev) => {
-  if (ev.pointerType !== "mouse" || playing) return;
+  if (ev.pointerType !== "mouse") return;
+  hidePop();
+  if (playing) return;
   wasm.hover(-1, -1);
   draw();
 });
@@ -313,7 +405,7 @@ function endTurn() {
 }
 
 function useAbility() {
-  if (skipIfPlaying()) return;
+  if ($("ability").hasAttribute("data-off") || skipIfPlaying()) return;
   clearPending();
   if (wasm.ability()) {
     save.events.push("b");
@@ -335,7 +427,7 @@ document.addEventListener("keydown", (ev) => {
   if (ev.code === "Space" || ev.code === "Enter") {
     ev.preventDefault();
     endTurn();
-  } else if (ev.code === "KeyB" && !$("ability").hidden) {
+  } else if (ev.code === "KeyB" && !$("ability").hasAttribute("data-off")) {
     useAbility();
   }
 });

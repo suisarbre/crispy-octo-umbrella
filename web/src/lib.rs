@@ -36,8 +36,7 @@ const SMOKE_MS: u32 = 240;
 const OVERSHOOT: usize = 3;
 
 const CELLS: usize = (W * H) as usize;
-const LOG_LINES: usize = 6;
-/// 문구 구역 구분자. 순서: 상황, 중계 링크, 선택 유닛, 장부 내역, 장부 결과, 기록, 쓸 수 있는 능력.
+/// 문구 구역 구분자. 순서: 상황, 중계 링크, 장부 내역, 장부 결과, 쓸 수 있는 능력.
 const SEP: &str = "\u{1f}";
 
 #[derive(Clone, Copy)]
@@ -52,7 +51,7 @@ enum Fx {
     /// 날아가는 탄. `color`는 쏜 쪽 색.
     Tracer { cells: Vec<Pos>, color: u32 },
     /// 맞은 순간. 표적 칸이 번쩍인다.
-    Hit { target: usize },
+    Hit { target: usize, dmg: i32 },
     /// 빗나간 탄의 자국.
     Miss { cells: Vec<Pos> },
     Death { pos: Pos },
@@ -63,6 +62,8 @@ struct State {
     hover: Option<Pos>,
     frame: [u32; CELLS],
     text: String,
+    /// 길게 누른 유닛의 정보.
+    popup: String,
     view: Vec<ViewUnit>,
     /// 보여주는 중인 연막.
     view_smoke: Vec<bool>,
@@ -81,6 +82,7 @@ impl State {
             hover: None,
             frame: [0; CELLS],
             text: String::new(),
+            popup: String::new(),
             view: Vec::new(),
             view_smoke: Vec::new(),
             queue: VecDeque::new(),
@@ -166,7 +168,7 @@ impl State {
                             self.log_shown += log_lines;
                             self.shot_stage = 2;
                             if hit {
-                                self.fx = Fx::Hit { target };
+                                self.fx = Fx::Hit { target, dmg };
                                 return BEAT_HIT << 16 | IMPACT_MS;
                             }
                             self.fx = Fx::Miss { cells: self.overshoot(a, b) };
@@ -295,7 +297,7 @@ fn render(s: &mut State) {
         }
         // 땅에 숨은 아군은 흙더미로 보인다.
         let glyph = if v.burrowed { '∩' } else { u.glyph() };
-        let struck = matches!(s.fx, Fx::Hit { target } if target == i);
+        let struck = matches!(s.fx, Fx::Hit { target, .. } if target == i);
         let shown = match u.side {
             Side::Brood => Some(if struck {
                 cell(glyph, BG, FG)
@@ -322,8 +324,6 @@ fn render(s: &mut State) {
     }
 
     let (ledger, result) = if can_act { ledger(s, &lanes) } else { ("—".to_string(), String::new()) };
-    let shown = s.log_shown.min(g.log.len());
-    let from = shown.saturating_sub(LOG_LINES);
     let sections = [
         match (playing, g.outcome) {
             (true, _) if s.empire_phase => "제국 행동".to_string(),
@@ -332,13 +332,8 @@ fn render(s: &mut State) {
             _ => format!("라운드 {}", g.round),
         },
         link_line(s),
-        match g.selected {
-            Some(sel) => format!("{}  행동 {}", unit_line(s, sel), g.units[sel].ap),
-            None => "—".to_string(),
-        },
         ledger,
         result,
-        g.log[from..shown].join("\n"),
         if can_act && g.can_burrow() { "잠복".to_string() } else { String::new() },
     ];
     s.text = sections.join(SEP);
@@ -357,10 +352,23 @@ fn link_line(s: &State) -> String {
     line
 }
 
-fn unit_line(s: &State, i: usize) -> String {
+/// 길게 눌렀을 때 뜨는 창의 내용. 보이는 유닛이 없는 칸이면 빈 문자열.
+fn inspect_text(s: &State, p: Pos) -> String {
+    let Some(i) = s.view_unit_at(p) else { return String::new() };
     let u = &s.game.units[i];
-    let hidden = if s.view[i].burrowed { "  숨음" } else { "" };
-    format!("{} {}  체력 {}/{}{hidden}", u.glyph(), u.name(), s.view[i].hp.max(0), u.class.def().hp)
+    if u.side == Side::Empire && !s.seen(p) {
+        return String::new();
+    }
+    let (hp, max) = (s.view[i].hp.max(0), u.class.def().hp);
+    let pips: String = (0..max).map(|k| if k < hp { '●' } else { '○' }).collect();
+    let mut out = format!("{} {}\n체력 {pips} {hp}/{max}", u.glyph(), u.name());
+    if u.side == Side::Brood {
+        out.push_str(&format!("\n행동 {}", if s.playing() { 0 } else { u.ap }));
+    }
+    if s.view[i].burrowed {
+        out.push_str("\n숨음");
+    }
+    out
 }
 
 fn minus(v: i32) -> String {
@@ -433,13 +441,10 @@ fn ledger(s: &State, lanes: &Lanes) -> (String, String) {
     let none = || (if has_lanes { lanes_text(s, lanes) } else { "—".to_string() }, String::new());
     let Some(p) = s.hover else { return none() };
     let Some(t) = g.unit_at(p) else { return none() };
-    if g.units[t].side == Side::Brood {
-        return (unit_line(s, t), String::new());
-    }
-    if !g.seen_by(Side::Brood, p) {
+    if g.units[t].side == Side::Brood || !g.seen_by(Side::Brood, p) {
         return none();
     }
-    let head = unit_line(s, t);
+    let head = format!("{} {}", g.units[t].glyph(), g.units[t].name());
     let Some(sel) = g.selected else { return (head, String::new()) };
     match g.shot(sel, t) {
         Some(shot) => (
@@ -529,6 +534,32 @@ pub extern "C" fn text_ptr() -> *const u8 {
     state().text.as_ptr()
 }
 
+/// 칸 하나를 들여다본다. 보이는 유닛이 있으면 `popup_ptr`에 내용을 쓰고 길이를 돌려준다. 없으면 0.
+#[no_mangle]
+pub extern "C" fn inspect(x: i32, y: i32) -> usize {
+    let s = state();
+    s.popup = inspect_text(s, (x, y));
+    s.popup.len()
+}
+
+#[no_mangle]
+pub extern "C" fn popup_ptr() -> *const u8 {
+    state().popup.as_ptr()
+}
+
+/// 지금 박자에 띄울 피해 숫자. 없으면 0. 있으면 피해 | x<<8 | y<<16.
+#[no_mangle]
+pub extern "C" fn damage_float() -> u32 {
+    let s = state();
+    match s.fx {
+        Fx::Hit { target, dmg } => {
+            let p = s.view[target].pos;
+            dmg as u32 | (p.0 as u32) << 8 | (p.1 as u32) << 16
+        }
+        _ => 0,
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn text_len() -> usize {
     state().text.len()
@@ -554,13 +585,17 @@ mod tests {
         init(3);
         assert!(state().frame.iter().all(|&c| c != 0));
         let parts: Vec<String> = state().text.split(SEP).map(String::from).collect();
-        assert_eq!(parts.len(), 7);
+        assert_eq!(parts.len(), 5);
         assert_eq!(parts[0], "라운드 1");
         assert_eq!(parts[1], "& ── h h h s h  연결");
 
-        // 선택은 보여줄 일이 없다.
+        // 선택은 보여줄 일이 없다. 길게 누르면 체력과 행동이 나온다.
         assert_eq!(click(1, 3), 1);
         assert_eq!(advance(), 0);
+        assert!(inspect(1, 3) > 0);
+        assert_eq!(state().popup, "ψ 저격\n체력 ●●●●● 5/5\n행동 2");
+        assert_eq!(inspect(2, 3), 0);
+        assert_eq!(inspect(W - 2, 5), 0, "안 보이는 적은 안 나온다");
         assert!(state().frame.iter().any(|&c| c == cell('·', BROOD, BG)));
 
         // 가리킨 칸까지의 길이 굵은 점으로 뜬다.
@@ -599,6 +634,13 @@ mod tests {
         assert!(state().game.units[2].burrowed);
         assert!(!state().text.ends_with("잠복"));
         assert_eq!(ability(), 0);
+        inspect(1, 9);
+        assert!(state().popup.ends_with("행동 1\n숨음"));
+
+        // 갈 수 없는 빈 칸을 누르면 선택이 풀린다.
+        assert!(state().game.selected.is_some());
+        assert_eq!(click(W - 1, 0), 1);
+        assert!(state().game.selected.is_none());
     }
 
     #[test]
