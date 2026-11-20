@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>crispy-octo-umbrella · 월드</title>
+<style>
+  :root { --bg:#0c0f11; --dim:#38454a; --fg:#cfcabb; --brood:#63d6ac; --empire:#e8823f; }
+  html, body { margin:0; background:var(--bg); color:var(--fg); }
+  body { font:15px/1.5 ui-monospace, "Cascadia Mono", Menlo, Consolas, "D2Coding", monospace; padding:20px; }
+  main { margin:0 auto; }
+  canvas { display:block; cursor:crosshair; touch-action:manipulation; -webkit-touch-callout:none; user-select:none; -webkit-user-select:none; -webkit-tap-highlight-color:transparent; }
+  #panel { margin:16px 0; font-variant-numeric:tabular-nums; }
+  #panel > * { margin:0; min-height:1.5em; white-space:pre; }
+  #notice { color:var(--empire); }
+  nav { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+  button, nav a { font:inherit; color:var(--fg); background:none; border:1px solid var(--dim); padding:4px 12px; cursor:pointer; text-decoration:none; }
+  button:hover, button:focus-visible, nav a:hover, nav a:focus-visible { border-color:var(--fg); outline:none; }
+  button[aria-pressed="true"] { border-color:var(--brood); color:var(--brood); }
+  kbd { font:inherit; font-size:12px; border:1px solid var(--dim); border-bottom-width:2px; padding:0 4px; margin-left:8px; }
+  #seed { margin-left:auto; }
+  #err { color:var(--empire); }
+  #pop { position:absolute; z-index:2; margin:0; padding:4px 8px; white-space:pre; pointer-events:none; background:var(--bg); border:1px solid var(--fg); font-variant-numeric:tabular-nums; }
+  @media (max-width:699px) {
+    body { padding:8px; }
+    canvas { margin:0 auto; }
+    kbd { display:none; }
+    button, nav a { min-height:44px; box-sizing:border-box; display:inline-flex; align-items:center; }
+  }
+</style>
+</head>
+<body>
+<main>
+  <canvas id="screen" aria-label="지도"></canvas>
+  <section id="panel">
+    <p id="clock"></p>
+    <p id="force"></p>
+    <p id="notice" role="status"></p>
+  </section>
+  <nav>
+    <button data-speed="0">정지<kbd>Space</kbd></button>
+    <button data-speed="1">1배<kbd>1</kbd></button>
+    <button data-speed="3">3배<kbd>2</kbd></button>
+    <button data-speed="5">5배<kbd>3</kbd></button>
+    <button id="new">새 판</button>
+    <a href="./">전투</a>
+    <span id="seed"></span>
+  </nav>
+  <p id="err" role="alert"></p>
+  <pre id="pop" role="status" hidden></pre>
+</main>
+<script type="module" src="world.js"></script>
+</body>
+</html>

@@ -1,0 +1,235 @@
+//! 월드 화면의 경계. 전투 쪽과 같은 방식이다: 칸 배열과 문구를 만들어 넘기고, JS는 그리기만 한다.
+
+use sim::world::{in_world, Ground, Order, SiteKind, World, WH, WW};
+use sim::{Pos, Side};
+
+use crate::{cell, BG, BROOD, DIM, EMPIRE, FG};
+
+const CELLS: usize = (WW * WH) as usize;
+/// 문구 구역 구분자. 순서: 날짜와 시각, 고른 부대, 알림.
+const SEP: &str = "\u{1f}";
+const TICKS_PER_DAY: u64 = 24;
+
+struct State {
+    world: World,
+    frame: [u32; CELLS],
+    text: String,
+    popup: String,
+}
+
+static mut STATE: Option<State> = None;
+
+fn state() -> &'static mut State {
+    // wasm은 단일 스레드고, 모든 export는 JS에서 순서대로 호출된다.
+    unsafe {
+        let slot = &mut *core::ptr::addr_of_mut!(STATE);
+        slot.get_or_insert_with(|| State { world: World::new(0), frame: [0; CELLS], text: String::new(), popup: String::new() })
+    }
+}
+
+fn idx(p: Pos) -> usize {
+    (p.1 * WW + p.0) as usize
+}
+
+fn side_color(side: Side) -> u32 {
+    if side == Side::Brood {
+        BROOD
+    } else {
+        EMPIRE
+    }
+}
+
+fn side_name(side: Side) -> &'static str {
+    if side == Side::Brood {
+        "아군"
+    } else {
+        "인류"
+    }
+}
+
+fn render(s: &mut State) {
+    let w = &s.world;
+    for y in 0..WH {
+        for x in 0..WW {
+            s.frame[idx((x, y))] = match w.ground((x, y)) {
+                Ground::Wild => cell(' ', DIM, BG),
+                Ground::Road => cell('·', DIM, BG),
+                Ground::Site(i) => match w.sites[i].kind {
+                    SiteKind::Plain => cell('○', FG, BG),
+                    SiteKind::Hq(side) => cell('◉', side_color(side), BG),
+                },
+            };
+        }
+    }
+    if let Some(sel) = w.selected {
+        if let Order::Move(path) = &w.forces[sel].order {
+            for &p in path {
+                if w.ground(p) == Ground::Road {
+                    s.frame[idx(p)] = cell('•', BROOD, BG);
+                }
+            }
+        }
+    }
+    for (i, f) in w.forces.iter().enumerate() {
+        let color = side_color(f.side);
+        // 고른 부대가 같은 칸의 다른 부대에 가려지지 않게 한다.
+        if w.selected.is_some_and(|sel| sel != i && w.forces[sel].pos == f.pos) {
+            continue;
+        }
+        s.frame[idx(f.pos)] = if w.selected == Some(i) { cell('◆', BG, color) } else { cell('◆', color, BG) };
+    }
+
+    let day = w.tick / TICKS_PER_DAY + 1;
+    let hour = w.tick % TICKS_PER_DAY;
+    let sections = [
+        format!("{day}일 {hour:02}시"),
+        match w.selected {
+            Some(sel) => {
+                let f = &w.forces[sel];
+                match &f.order {
+                    Order::Hold => format!("◆ {}명  대기", f.size),
+                    Order::Move(path) => format!("◆ {}명  이동 {}칸", f.size, path.len()),
+                }
+            }
+            None => "—".to_string(),
+        },
+        match w.clash {
+            Some((a, b)) => format!("충돌  {}명 대 {}명", w.forces[a].size, w.forces[b].size),
+            None => String::new(),
+        },
+    ];
+    s.text = sections.join(SEP);
+}
+
+/// 칸 하나에 무엇이 있는지. 길게 누르거나 마우스를 올렸을 때 뜬다. 아무것도 없으면 빈 문자열.
+fn inspect_text(w: &World, p: Pos) -> String {
+    let mut lines = Vec::new();
+    if let Ground::Site(i) = w.ground(p) {
+        lines.push(match w.sites[i].kind {
+            SiteKind::Plain => "○ 거점".to_string(),
+            SiteKind::Hq(side) => format!("◉ {} 본진", side_name(side)),
+        });
+    }
+    for i in w.forces_at(p) {
+        let f = &w.forces[i];
+        lines.push(format!("◆ {} {}명", side_name(f.side), f.size));
+    }
+    lines.join("\n")
+}
+
+#[no_mangle]
+pub extern "C" fn w_init(seed: u32) {
+    let s = state();
+    s.world = World::new(seed as u64);
+    render(s);
+}
+
+#[no_mangle]
+pub extern "C" fn w_click(x: i32, y: i32) -> u32 {
+    let s = state();
+    let changed = s.world.click((x, y));
+    render(s);
+    changed as u32
+}
+
+/// 시간을 `n`틱 넘긴다. 실제로 넘어간 틱 수를 돌려준다. 충돌이 나면 거기서 멈춘다.
+#[no_mangle]
+pub extern "C" fn w_tick(n: u32) -> u32 {
+    let s = state();
+    let before = s.world.tick;
+    for _ in 0..n {
+        s.world.tick();
+    }
+    render(s);
+    (s.world.tick - before) as u32
+}
+
+/// 충돌로 시간이 멈춰 있는가.
+#[no_mangle]
+pub extern "C" fn w_halted() -> u32 {
+    state().world.clash.is_some() as u32
+}
+
+#[no_mangle]
+pub extern "C" fn w_cols() -> i32 {
+    WW
+}
+
+#[no_mangle]
+pub extern "C" fn w_rows() -> i32 {
+    WH
+}
+
+#[no_mangle]
+pub extern "C" fn w_frame_ptr() -> *const u32 {
+    state().frame.as_ptr()
+}
+
+#[no_mangle]
+pub extern "C" fn w_text_ptr() -> *const u8 {
+    state().text.as_ptr()
+}
+
+#[no_mangle]
+pub extern "C" fn w_text_len() -> usize {
+    state().text.len()
+}
+
+#[no_mangle]
+pub extern "C" fn w_inspect(x: i32, y: i32) -> usize {
+    let s = state();
+    s.popup = if in_world((x, y)) { inspect_text(&s.world, (x, y)) } else { String::new() };
+    s.popup.len()
+}
+
+#[no_mangle]
+pub extern "C" fn w_popup_ptr() -> *const u8 {
+    state().popup.as_ptr()
+}
+
+#[no_mangle]
+pub extern "C" fn w_fingerprint_lo() -> u32 {
+    state().world.fingerprint() as u32
+}
+
+/// 화면 확인용 (examples/wdump.rs). 칸 배열과 문구를 JSON으로 찍는다.
+#[doc(hidden)]
+pub fn dump(seed: u32, clicks: &[Pos], ticks: u32) -> String {
+    w_init(seed);
+    for &(x, y) in clicks {
+        w_click(x, y);
+    }
+    w_tick(ticks);
+    let s = state();
+    format!("{{\"frame\":{:?},\"text\":{:?}}}", s.frame.to_vec(), s.text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn world_screen() {
+        w_init(3);
+        let s = state();
+        let home = s.world.sites.iter().find(|x| x.kind == SiteKind::Hq(Side::Brood)).unwrap().pos;
+        assert!(s.text.starts_with("1일 00시"));
+        assert_eq!(s.frame[idx(home)], cell('◆', BROOD, BG));
+
+        // 본진 칸에는 본진과 부대 셋이 있다.
+        assert!(w_inspect(home.0, home.1) > 0);
+        assert_eq!(state().popup.lines().count(), 4);
+        assert!(state().popup.starts_with("◉ 아군 본진"));
+
+        // 부대를 골라 다른 거점으로 보내면 길이 그려지고, 시간이 가면 움직인다.
+        assert_eq!(w_click(home.0, home.1), 1);
+        let dest = state().world.sites.iter().map(|x| x.pos).find(|&p| p != home).unwrap();
+        assert_eq!(w_click(dest.0, dest.1), 1);
+        assert!(state().frame.iter().any(|&c| c == cell('•', BROOD, BG)));
+        assert_eq!(w_tick(30), 30);
+        let sel = state().world.selected.unwrap();
+        assert_ne!(state().world.forces[sel].pos, home);
+        assert!(state().text.starts_with("2일 06시"));
+        assert_eq!(w_halted(), 0);
+    }
+}

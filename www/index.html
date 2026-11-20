@@ -19,7 +19,8 @@
   #pop { position:absolute; z-index:2; margin:0; padding:4px 8px; white-space:pre; pointer-events:none; background:var(--bg); border:1px solid var(--fg); font-variant-numeric:tabular-nums; }
   nav { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
   button { font:inherit; color:var(--fg); background:none; border:1px solid var(--dim); padding:4px 12px; cursor:pointer; }
-  button:hover, button:focus-visible { border-color:var(--fg); outline:none; }
+  nav a { color:var(--fg); border:1px solid var(--dim); padding:4px 12px; text-decoration:none; }
+  button:hover, button:focus-visible, nav a:hover, nav a:focus-visible { border-color:var(--fg); outline:none; }
   #ability[data-off] { visibility:hidden; }
   kbd { font:inherit; font-size:12px; border:1px solid var(--dim); border-bottom-width:2px; padding:0 4px; margin-left:8px; }
   #seed { margin-left:auto; }
@@ -56,6 +57,7 @@
     <button id="new">새 판</button>
     <button id="export">세이브 내보내기</button>
     <button id="import">불러오기</button>
+    <a href="world.html">월드</a>
     <input id="file" type="file" accept="application/json,.json" hidden>
     <span id="seed"></span>
   </nav>

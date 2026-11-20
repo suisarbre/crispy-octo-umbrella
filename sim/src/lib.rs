@@ -5,6 +5,7 @@
 
 pub mod ai;
 pub mod rng;
+pub mod world;
 
 use rng::Rng;
 

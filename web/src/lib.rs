@@ -5,6 +5,8 @@
 //! 한 박자씩 풀어서 보여준다. 화면은 `view`(보여주는 중인 위치와 체력)를 그리고,
 //! 재생이 끝나면 `view`는 코어의 실제 상태와 같아진다.
 
+pub mod world;
+
 use std::collections::VecDeque;
 
 use sim::{dist, Class, Event, Game, Pos, Side, Tile, H, SIGHT, W};
@@ -229,7 +231,7 @@ fn state() -> &'static mut State {
     }
 }
 
-fn cell(glyph: char, fg: u32, bg: u32) -> u32 {
+pub(crate) fn cell(glyph: char, fg: u32, bg: u32) -> u32 {
     glyph as u32 | fg << 24 | bg << 28
 }
 
