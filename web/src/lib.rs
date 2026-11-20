@@ -17,6 +17,8 @@ pub const DIM: u32 = 1;
 pub const FG: u32 = 2;
 pub const BROOD: u32 = 3;
 pub const EMPIRE: u32 = 4;
+/// 아군 색을 흐리게 한 것. 월드에서 고르지 않은 부대의 길에만 쓴다.
+pub const BROOD_DIM: u32 = 5;
 
 /// `advance`가 돌려주는 박자 종류. 상위 16비트에 종류, 하위 16비트에 길이(ms).
 pub const BEAT_STEP: u32 = 1;

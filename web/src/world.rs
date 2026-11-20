@@ -1,9 +1,9 @@
 //! 월드 화면의 경계. 전투 쪽과 같은 방식이다: 칸 배열과 문구를 만들어 넘기고, JS는 그리기만 한다.
 
-use sim::world::{in_world, Ground, Order, SiteKind, World, TICKS_PER_DAY, WH, WW};
+use sim::world::{in_world, Command, Duty, Ground, Order, SiteKind, World, TICKS_PER_DAY, WH, WW};
 use sim::{Pos, Side};
 
-use crate::{cell, BG, BROOD, DIM, EMPIRE, FG};
+use crate::{cell, BG, BROOD, BROOD_DIM, DIM, EMPIRE, FG};
 
 const CELLS: usize = (WW * WH) as usize;
 /// 문구 구역 구분자. 순서: 날짜, 고른 부대, 알림.
@@ -79,7 +79,7 @@ fn render(s: &mut State) {
     moving.sort_by_key(|&i| w.selected == Some(i));
     for &i in &moving {
         let Order::Move(path) = &w.forces[i].order else { continue };
-        let color = if w.selected == Some(i) { BROOD } else { DIM };
+        let color = if w.selected == Some(i) { BROOD } else { BROOD_DIM };
         for &p in path.iter().filter(|&&p| w.ground(p) == Ground::Road) {
             s.frame[idx(p)] = cell('•', color, BG);
         }
@@ -98,6 +98,19 @@ fn render(s: &mut State) {
         }
         s.routes.push(path.len() as u32 | if selected { ROUTE_SELECTED } else { 0 } | w.forces[i].step_ticks() << 20);
         s.routes.extend(path.iter().map(|p| p.0 as u32 | (p.1 as u32) << 8));
+    }
+    // 찍어 둔 칸까지의 길. 아직 명령은 안 들어갔다.
+    if let (Some(sel), Some(target)) = (w.selected, w.target) {
+        if let Some(path) = w.route(w.forces[sel].pos, target) {
+            for &p in path.iter().filter(|&&p| w.ground(p) == Ground::Road) {
+                s.frame[idx(p)] = cell(if p == target { '◇' } else { '•' }, BROOD, BG);
+            }
+            if let Ground::Site(site) = w.ground(target) {
+                if w.sites[site].kind == SiteKind::Plain {
+                    s.frame[idx(target)] = cell('○', BG, BROOD);
+                }
+            }
+        }
     }
     for (i, f) in w.forces.iter().enumerate() {
         let color = side_color(f.side);
@@ -126,10 +139,7 @@ fn render(s: &mut State) {
         match w.selected {
             Some(sel) => {
                 let f = &w.forces[sel];
-                match &f.order {
-                    Order::Hold => format!("◆ {}명  대기", f.size),
-                    Order::Move(path) => format!("◆ {}명  이동 {}칸", f.size, path.len()),
-                }
+                format!("◆ {}명  {}", f.size, doing(f))
             }
             None => "—".to_string(),
         },
@@ -139,6 +149,19 @@ fn render(s: &mut State) {
         },
     ];
     s.text = sections.join(SEP);
+}
+
+/// 부대가 지금 하는 일을 한마디로.
+fn doing(f: &sim::world::Force) -> String {
+    match (&f.order, f.duty) {
+        (_, Duty::Scout(..)) => "정찰".to_string(),
+        (Order::Hold, Duty::Ambush) => "매복".to_string(),
+        (Order::Hold, Duty::Garrison) => "주둔".to_string(),
+        (Order::Hold, Duty::None) => "대기".to_string(),
+        (Order::Move(path), Duty::Ambush) => format!("매복하러 이동 {}칸", path.len()),
+        (Order::Move(path), Duty::Garrison) => format!("주둔하러 이동 {}칸", path.len()),
+        (Order::Move(path), Duty::None) => format!("이동 {}칸", path.len()),
+    }
 }
 
 /// 칸 하나에 무엇이 있는지. 길게 누르거나 마우스를 올렸을 때 뜬다. 아무것도 없으면 빈 문자열.
@@ -152,7 +175,12 @@ fn inspect_text(w: &World, p: Pos) -> String {
     }
     for i in w.forces_at(p) {
         let f = &w.forces[i];
-        lines.push(format!("◆ {} {}명", side_name(f.side), f.size));
+        // 인류 부대가 무엇을 하는 중인지는 보여주지 않는다.
+        if f.side == Side::Brood {
+            lines.push(format!("◆ 아군 {}명  {}", f.size, doing(f)));
+        } else {
+            lines.push(format!("◆ {} {}명", side_name(f.side), f.size));
+        }
     }
     lines.join("\n")
 }
@@ -170,6 +198,32 @@ pub extern "C" fn w_click(x: i32, y: i32) -> u32 {
     let changed = s.world.click((x, y));
     render(s);
     changed as u32
+}
+
+/// 고른 부대에 명령을 내린다. 0 이동, 1 매복, 2 주둔, 3 정찰. 들어갔으면 1.
+#[no_mangle]
+pub extern "C" fn w_command(kind: u32) -> u32 {
+    let s = state();
+    let command = match kind {
+        0 => Command::Move,
+        1 => Command::Ambush,
+        2 => Command::Garrison,
+        3 => Command::Scout,
+        _ => return 0,
+    };
+    let done = s.world.command(command);
+    render(s);
+    done as u32
+}
+
+/// 명령을 고를 차례인가. 아니면 0. 맞으면 1 | 주둔할 수 있으면 2 | 찍은 칸 x<<8 | y<<16.
+#[no_mangle]
+pub extern "C" fn w_menu() -> u32 {
+    let w = &state().world;
+    match (w.selected, w.target) {
+        (Some(_), Some(t)) => 1 | (w.can_garrison() as u32) << 1 | (t.0 as u32) << 8 | (t.1 as u32) << 16,
+        _ => 0,
+    }
 }
 
 /// 시간을 `n`틱 넘긴다. 실제로 넘어간 틱 수를 돌려준다. 충돌이 나면 거기서 멈춘다.
@@ -264,12 +318,17 @@ pub extern "C" fn w_fingerprint_lo() -> u32 {
 #[doc(hidden)]
 pub fn dump(seed: u32, clicks: &[Pos], ticks: u32) -> String {
     w_init(seed);
+    // x가 음수면 명령이다: (-1, 종류).
     for &(x, y) in clicks {
-        w_click(x, y);
+        if x < 0 {
+            w_command(y as u32);
+        } else {
+            w_click(x, y);
+        }
     }
     w_tick(ticks);
     let s = state();
-    format!("{{\"frame\":{:?},\"labels\":{:?},\"routes\":{:?},\"text\":{:?}}}", s.frame.to_vec(), s.labels, s.routes, s.text)
+    format!("{{\"frame\":{:?},\"labels\":{:?},\"routes\":{:?},\"menu\":{},\"text\":{:?}}}", s.frame.to_vec(), s.labels, s.routes, w_menu(), s.text)
 }
 
 #[cfg(test)]
@@ -297,15 +356,30 @@ mod tests {
         assert_eq!(state().popup.lines().count(), 4);
         assert!(state().popup.starts_with("◉ 아군 본진"));
 
-        // 부대를 골라 다른 거점으로 보내면 선택이 풀리고, 길은 흐리게 남는다.
+        // 부대를 골라 거점을 찍으면 명령을 고를 차례가 된다. 아직 움직이지 않는다.
         assert_eq!(w_click(home.0, home.1), 1);
         assert_eq!(state().labels.iter().filter(|&&l| l & LABEL_SELECTED != 0).count(), 1);
+        assert_eq!(w_menu(), 0);
         let sel = state().world.selected.unwrap();
         let dest = state().world.sites.iter().find(|x| x.kind == SiteKind::Plain).unwrap().pos;
         assert_eq!(w_click(dest.0, dest.1), 1);
+        assert_eq!(w_menu(), 1 | 2 | (dest.0 as u32) << 8 | (dest.1 as u32) << 16);
+        assert!(state().frame.iter().any(|&c| c == cell('•', BROOD, BG)));
+        assert!(state().routes.is_empty());
+
+        // 길 위의 칸을 찍으면 주둔은 못 고른다.
+        let road = state().world.route(home, dest).unwrap()[0];
+        w_click(road.0, road.1);
+        assert_eq!(w_menu() & 2, 0);
+        assert_eq!(w_command(2), 0);
+        w_click(dest.0, dest.1);
+
+        // 명령을 고르면 선택이 풀리고, 길은 흐린 아군 색으로 남는다.
+        assert_eq!(w_command(2), 1);
+        assert_eq!(w_menu(), 0);
         let s = state();
         assert!(s.world.selected.is_none());
-        assert!(s.frame.iter().any(|&c| c == cell('•', DIM, BG)));
+        assert!(s.frame.iter().any(|&c| c == cell('•', BROOD_DIM, BG)));
         assert!(!s.frame.iter().any(|&c| c == cell('•', BROOD, BG)));
         assert_eq!(s.frame[idx(dest)], cell('○', BROOD, BG), "목적지 거점은 아군 색");
         let Order::Move(path) = &s.world.forces[sel].order else { panic!("이동 중이어야 한다") };
@@ -313,6 +387,8 @@ mod tests {
         assert_eq!(s.routes[0] & 0xffff, path.len() as u32);
         assert_eq!(s.routes[0] & ROUTE_SELECTED, 0);
         assert_eq!(s.routes[1], path[0].0 as u32 | (path[0].1 as u32) << 8);
+        w_inspect(home.0, home.1);
+        assert!(state().popup.contains("주둔하러 이동"));
 
         // 다시 고르면 그 길이 아군 색으로 바뀐다.
         let at = s.world.forces[sel].pos;

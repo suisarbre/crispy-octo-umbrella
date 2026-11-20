@@ -1,5 +1,5 @@
 //! 월드. 거점과 길로 된 지도 위에서 시간이 흐르고 부대가 움직인다.
-//! 전투와 마찬가지로 결정론적이다. 상태를 바꾸는 입구는 `click`과 `tick` 둘뿐이라서
+//! 전투와 마찬가지로 결정론적이다. 상태를 바꾸는 입구는 `click`, `command`, `tick` 셋뿐이라서
 //! (시드, 입력과 틱의 순서)만 있으면 그대로 재현된다.
 //!
 //! 월드는 동시 턴이다. 한 턴은 하루이고, 하루는 고정 틱 `TICKS_PER_DAY`개로 굴린다.
@@ -49,6 +49,29 @@ pub enum Order {
     Move(Vec<Pos>),
 }
 
+/// 부대가 맡은 일. 도착한 뒤에 무엇을 하는가.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Duty {
+    None,
+    /// 도착하면 숨어서 기다린다.
+    Ambush,
+    /// 도착하면 거점을 지킨다.
+    Garrison,
+    /// 두 자리 사이를 오간다.
+    Scout(Pos, Pos),
+}
+
+/// 플레이어가 고르는 명령. 찍은 칸으로 가서 무엇을 할지.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Command {
+    Move,
+    Ambush,
+    /// 거점에만 내릴 수 있다.
+    Garrison,
+    /// 지금 자리와 찍은 자리를 오간다.
+    Scout,
+}
+
 #[derive(Clone, Debug)]
 pub struct Force {
     pub side: Side,
@@ -56,6 +79,7 @@ pub struct Force {
     /// 인원. 많을수록 느리다.
     pub size: u32,
     pub order: Order,
+    pub duty: Duty,
     /// 다음 칸까지 쌓인 틱.
     pub progress: u32,
 }
@@ -75,6 +99,8 @@ pub struct World {
     pub forces: Vec<Force>,
     pub tick: u64,
     pub selected: Option<usize>,
+    /// 고른 부대를 보내려고 찍어 둔 칸. 명령을 고르면 들어가고, 그 전까지는 아무 일도 없다.
+    pub target: Option<Pos>,
     /// 마주친 두 부대. 생기면 시간이 멈춘다. 전투는 아직 붙이지 않았다.
     pub clash: Option<(usize, usize)>,
 }
@@ -163,7 +189,7 @@ impl World {
         sites[home].kind = SiteKind::Hq(Side::Brood);
         sites[enemy].kind = SiteKind::Hq(Side::Empire);
 
-        let force = |side, pos, size| Force { side, pos, size, order: Order::Hold, progress: 0 };
+        let force = |side, pos, size| Force { side, pos, size, order: Order::Hold, duty: Duty::None, progress: 0 };
         let mut forces = vec![
             force(Side::Brood, sites[home].pos, 6),
             force(Side::Brood, sites[home].pos, 6),
@@ -177,7 +203,7 @@ impl World {
             forces.push(force(Side::Empire, sites[site_at(COLS - 2, row)].pos, 6));
         }
 
-        World { seed, ground, sites, forces, tick: 0, selected: None, clash: None }
+        World { seed, ground, sites, forces, tick: 0, selected: None, target: None, clash: None }
     }
 
     pub fn ground(&self, p: Pos) -> Ground {
@@ -231,7 +257,8 @@ impl World {
 
     /// 플레이어 입력: 칸 하나를 누른다. 상태가 바뀌었으면 true.
     /// 아군 부대가 있는 칸이면 고른다. 겹쳐 있으면 대기 중인 부대부터 잡고, 누를 때마다 다음 부대로 넘어간다.
-    /// 부대를 고른 채 길 위의 칸을 누르면 거기로 보내고 선택을 푼다. 그 밖의 칸이어도 선택을 푼다.
+    /// 부대를 고른 채 길 위의 칸을 누르면 그 칸을 찍어 둔다. 무엇을 할지는 `command`로 고른다.
+    /// 길 밖을 누르면 선택도 찍은 칸도 푼다.
     pub fn click(&mut self, p: Pos) -> bool {
         if !in_world(p) {
             return false;
@@ -242,24 +269,61 @@ impl World {
             let next = match self.selected.and_then(|s| mine.iter().position(|&i| i == s)) {
                 Some(k) => mine[(k + 1) % mine.len()],
                 // 처음 누를 때는 아직 명령을 안 받은 부대부터 잡는다. 겹친 부대에 차례로 명령을 내리기 쉽게.
-                None => *mine.iter().find(|&&i| self.forces[i].order == Order::Hold).unwrap_or(&mine[0]),
+                None => *mine.iter().find(|&&i| self.forces[i].order == Order::Hold && self.forces[i].duty == Duty::None).unwrap_or(&mine[0]),
             };
-            let changed = self.selected != Some(next);
+            let changed = self.selected != Some(next) || self.target.is_some();
             self.selected = Some(next);
+            self.target = None;
             return changed;
         }
         let Some(s) = self.selected else { return false };
-        match self.route(self.forces[s].pos, p) {
-            Some(path) if !path.is_empty() => {
-                self.forces[s].order = Order::Move(path);
-                self.forces[s].progress = 0;
-                self.clash = None;
-            }
-            _ => {}
+        if self.route(self.forces[s].pos, p).is_some_and(|path| !path.is_empty()) {
+            let changed = self.target != Some(p);
+            self.target = Some(p);
+            return changed;
         }
-        // 명령은 내리는 즉시 들어간다. 다음 부대를 바로 고를 수 있게 선택은 푼다.
         self.selected = None;
+        self.target = None;
         true
+    }
+
+    /// 찍어 둔 칸이 거점인가. 주둔은 거점에만 내릴 수 있다.
+    pub fn can_garrison(&self) -> bool {
+        self.target.is_some_and(|t| matches!(self.ground(t), Ground::Site(_)))
+    }
+
+    /// 플레이어 입력: 고른 부대를 찍어 둔 칸으로 보내면서 할 일을 정한다. 들어갔으면 true.
+    /// 명령은 내리는 즉시 들어간다. 다음 부대를 바로 고를 수 있게 선택은 푼다.
+    pub fn command(&mut self, command: Command) -> bool {
+        let (Some(s), Some(target)) = (self.selected, self.target) else { return false };
+        if command == Command::Garrison && !self.can_garrison() {
+            return false;
+        }
+        let from = self.forces[s].pos;
+        let Some(path) = self.route(from, target) else { return false };
+        self.forces[s].order = Order::Move(path);
+        self.forces[s].progress = 0;
+        self.forces[s].duty = match command {
+            Command::Move => Duty::None,
+            Command::Ambush => Duty::Ambush,
+            Command::Garrison => Duty::Garrison,
+            Command::Scout => Duty::Scout(from, target),
+        };
+        self.clash = None;
+        self.selected = None;
+        self.target = None;
+        true
+    }
+
+    /// 길의 끝에 닿았다. 정찰이면 반대쪽 끝으로 돌아선다.
+    fn arrive(&mut self, i: usize) {
+        self.forces[i].order = Order::Hold;
+        if let Duty::Scout(a, b) = self.forces[i].duty {
+            let next = if self.forces[i].pos == b { a } else { b };
+            if let Some(path) = self.route(self.forces[i].pos, next).filter(|p| !p.is_empty()) {
+                self.forces[i].order = Order::Move(path);
+            }
+        }
     }
 
     /// 오늘이 며칠째인가. 첫날이 0.
@@ -276,7 +340,7 @@ impl World {
         for i in 0..self.forces.len() {
             let Order::Move(path) = &self.forces[i].order else { continue };
             let Some(&next) = path.first() else {
-                self.forces[i].order = Order::Hold;
+                self.arrive(i);
                 continue;
             };
             self.forces[i].progress += 1;
@@ -293,11 +357,13 @@ impl World {
                 return;
             }
             self.forces[i].pos = next;
+            let mut arrived = false;
             if let Order::Move(path) = &mut self.forces[i].order {
                 path.remove(0);
-                if path.is_empty() {
-                    self.forces[i].order = Order::Hold;
-                }
+                arrived = path.is_empty();
+            }
+            if arrived {
+                self.arrive(i);
             }
         }
     }
@@ -316,6 +382,12 @@ impl World {
             mix(match &f.order {
                 Order::Hold => 0,
                 Order::Move(path) => 1 + path.len() as u64,
+            });
+            mix(match f.duty {
+                Duty::None => 0,
+                Duty::Ambush => 1,
+                Duty::Garrison => 2,
+                Duty::Scout(a, b) => 3 + (idx(a) as u64) * 4096 + idx(b) as u64 * 16_777_216,
             });
         }
         h
@@ -360,6 +432,8 @@ mod tests {
         assert!(w.click(start));
         let s = w.selected.unwrap();
         assert!(w.click(dest));
+        assert_eq!(w.forces[s].order, Order::Hold, "칸을 찍기만 해서는 움직이지 않는다");
+        assert!(w.command(Command::Move));
         assert!(w.selected.is_none(), "명령을 내리면 선택이 풀린다");
         let per_tile = w.forces[s].step_ticks() as usize;
         for (n, p) in path.iter().enumerate() {
@@ -397,9 +471,73 @@ mod tests {
             w.click(start);
             ordered.push(w.selected.unwrap());
             w.click(dest);
+            assert!(w.command(Command::Move));
         }
         ordered.sort();
         assert_eq!(ordered, vec![0, 1, 2], "세 번 누르고 보내면 세 부대가 다 명령을 받는다");
+    }
+
+    #[test]
+    fn a_scout_goes_back_and_forth() {
+        let mut w = World::new(3);
+        let start = home(&w);
+        let path = w.route(start, w.sites[7].pos).unwrap();
+        let far = path[5];
+        w.click(start);
+        let s = w.selected.unwrap();
+        w.click(far);
+        assert!(w.command(Command::Scout));
+        let per_leg = 6 * w.forces[s].step_ticks();
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            for _ in 0..per_leg {
+                w.tick();
+            }
+            seen.push(w.forces[s].pos);
+        }
+        assert_eq!(seen, vec![far, start, far, start]);
+        assert_eq!(w.forces[s].duty, Duty::Scout(start, far));
+    }
+
+    #[test]
+    fn garrison_only_at_a_site_and_duties_stick_on_arrival() {
+        let mut w = World::new(3);
+        let start = home(&w);
+        let site = w.sites.iter().map(|x| x.pos).find(|&p| p != start).unwrap();
+        let road = w.route(start, site).unwrap()[0];
+        assert!(w.ground(road) == Ground::Road);
+
+        // 찍은 칸이 없으면 명령은 안 들어간다.
+        w.click(start);
+        assert!(!w.command(Command::Move));
+
+        // 길 위에는 주둔을 못 건다. 매복은 건다.
+        let a = w.selected.unwrap();
+        w.click(road);
+        assert!(!w.can_garrison());
+        assert!(!w.command(Command::Garrison));
+        assert!(w.command(Command::Ambush));
+
+        // 거점에는 주둔을 건다.
+        w.click(start);
+        let b = w.selected.unwrap();
+        assert_ne!(a, b);
+        w.click(site);
+        assert!(w.can_garrison());
+        assert!(w.command(Command::Garrison));
+
+        for _ in 0..2000 {
+            w.tick();
+        }
+        assert_eq!((w.forces[a].pos, &w.forces[a].order, w.forces[a].duty), (road, &Order::Hold, Duty::Ambush));
+        assert_eq!((w.forces[b].pos, &w.forces[b].order, w.forces[b].duty), (site, &Order::Hold, Duty::Garrison));
+
+        // 새 명령은 맡은 일을 바꾼다.
+        w.click(road);
+        assert_eq!(w.selected, Some(a));
+        w.click(start);
+        assert!(w.command(Command::Move));
+        assert_eq!(w.forces[a].duty, Duty::None);
     }
 
     #[test]
@@ -420,6 +558,7 @@ mod tests {
         w.click(start);
         let s = w.selected.unwrap();
         w.click(target);
+        w.command(Command::Move);
         for _ in 0..5000 {
             w.tick();
         }
@@ -441,6 +580,7 @@ mod tests {
             let start = home(&w);
             w.click(start);
             w.click(w.sites[7].pos);
+            w.command(Command::Scout);
             for _ in 0..300 {
                 w.tick();
             }

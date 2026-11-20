@@ -1,7 +1,8 @@
 // 월드 화면. 그리기, 입력, 시간 넘기기, 세이브만 한다. 규칙은 전부 game.wasm 안에 있다.
 // 전투 화면(main.js)과 겹치는 그리기 코드가 있다. 두 화면을 한 페이지로 합칠 때 같이 정리한다.
 
-const PALETTE = ["#0c0f11", "#38454a", "#cfcabb", "#63d6ac", "#e8823f"];
+// 여섯 번째는 아군 색을 바탕에 반쯤 섞은 것이다. 고르지 않은 부대의 길에만 쓴다.
+const PALETTE = ["#0c0f11", "#38454a", "#cfcabb", "#63d6ac", "#e8823f", "#37725e"];
 const SAVE_KEY = "crispy-octo-umbrella/world";
 const SAVE_VERSION = 1;
 const FONT_PX = 18;
@@ -20,7 +21,8 @@ const wasm = instance.exports;
 const COLS = wasm.w_cols();
 const ROWS = wasm.w_rows();
 
-// 세이브는 (시드, 입력과 틱의 순서)다. 하루는 24틱이다. ["t", n]은 n틱이 흘렀다는 뜻, [x, y]는 그 칸을 눌렀다는 뜻.
+// 세이브는 (시드, 입력과 틱의 순서)다. 하루는 24틱이다.
+// ["t", n]은 n틱이 흘렀다는 뜻, [x, y]는 그 칸을 눌렀다는 뜻, ["o", k]는 k번 명령을 골랐다는 뜻.
 let save = { v: SAVE_VERSION, seed: 0, events: [] };
 let view = { rot: false, cols: COLS, rows: ROWS, cw: 16, ch: 20, font: FONT_PX };
 // 하루가 재생되는 중인가. 그동안은 명령을 받지 않는다.
@@ -81,6 +83,44 @@ function draw() {
   });
   $("seed").textContent = `시드 ${save.seed}`;
   $("day").disabled = playing || !!wasm.w_halted();
+  placeMenu();
+}
+
+// 명령 고르기. 부대를 고르고 칸을 찍으면 그 칸 옆에 뜬다. 고르기 전까지는 아무 일도 일어나지 않는다.
+const menu = $("menu");
+
+function placeMenu() {
+  const m = playing ? 0 : wasm.w_menu();
+  if (!m) {
+    menu.hidden = true;
+    return;
+  }
+  menu.querySelector('[data-cmd="2"]').disabled = !(m & 2);
+  menu.hidden = false;
+  const r = canvas.getBoundingClientRect();
+  const [dx, dy] = toDisplay((m >>> 8) & 0xff, (m >>> 16) & 0xff);
+  const cellW = r.width / view.cols;
+  const cellH = r.height / view.rows;
+  const pageRight = window.scrollX + document.documentElement.clientWidth;
+  // 찍은 칸의 오른쪽에. 자리가 없으면 왼쪽에. 화면 밖으로 나가지 않게 당긴다.
+  let left = r.left + window.scrollX + (dx + 1) * cellW + 6;
+  if (left + menu.offsetWidth > pageRight - 4) left = r.left + window.scrollX + dx * cellW - menu.offsetWidth - 6;
+  let top = r.top + window.scrollY + dy * cellH;
+  const pageBottom = window.scrollY + window.innerHeight;
+  if (top + menu.offsetHeight > pageBottom - 4) top = pageBottom - menu.offsetHeight - 4;
+  menu.style.left = `${Math.max(left, window.scrollX + 4)}px`;
+  menu.style.top = `${Math.max(top, window.scrollY + 4)}px`;
+}
+
+function giveCommand(kind) {
+  if (playing || !wasm.w_command(kind)) return;
+  save.events.push(["o", kind]);
+  persist();
+  draw();
+}
+
+for (const b of menu.querySelectorAll("[data-cmd]")) {
+  b.addEventListener("click", () => giveCommand(Number(b.dataset.cmd)));
 }
 
 // 가는 방향을 보여주는 빛. 부대에서 출발해 길을 따라 한 칸씩 흘러간다. 빠른 부대의 빛이 더 빨리 흐른다.
@@ -215,6 +255,7 @@ function load(data) {
   for (const e of data.events) {
     if (!Array.isArray(e) || e.length !== 2) throw new Error("세이브 형식이 맞지 않음");
     if (e[0] === "t") wasm.w_tick(e[1] | 0);
+    else if (e[0] === "o") wasm.w_command(e[1] | 0);
     else wasm.w_click(e[0] | 0, e[1] | 0);
   }
   if (data.fp !== undefined && data.fp !== wasm.w_fingerprint_lo()) {
@@ -311,7 +352,11 @@ $("new").addEventListener("click", () => {
 
 document.addEventListener("keydown", (ev) => {
   if (ev.target instanceof HTMLButtonElement && ev.code === "Space") return;
-  if (ev.code === "Space" || ev.code === "Enter") {
+  const pick = ["Digit1", "Digit2", "Digit3", "Digit4"].indexOf(ev.code);
+  if (pick >= 0 && !menu.hidden) {
+    ev.preventDefault();
+    giveCommand(pick);
+  } else if (ev.code === "Space" || ev.code === "Enter") {
     ev.preventDefault();
     passDay();
   }

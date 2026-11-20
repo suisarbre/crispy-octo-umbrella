@@ -22,6 +22,12 @@
   #seed { margin-left:auto; }
   #err { color:var(--empire); }
   #pop { position:absolute; z-index:2; margin:0; padding:4px 8px; white-space:pre; pointer-events:none; background:var(--bg); border:1px solid var(--fg); font-variant-numeric:tabular-nums; }
+  #menu { position:absolute; z-index:3; display:flex; flex-direction:column; background:var(--bg); border:1px solid var(--fg); }
+  #menu[hidden] { display:none; }
+  #menu button { border:0; text-align:left; display:flex; justify-content:space-between; gap:16px; }
+  #menu button + button { border-top:1px solid var(--dim); }
+  #menu button:hover, #menu button:focus-visible { background:var(--dim); }
+  #menu button:disabled { color:var(--dim); cursor:default; background:none; }
   @media (max-width:699px) {
     body { padding:8px; }
     canvas { margin:0 auto; }
@@ -46,6 +52,12 @@
   </nav>
   <p id="err" role="alert"></p>
   <pre id="pop" role="status" hidden></pre>
+  <div id="menu" role="menu" aria-label="명령" hidden>
+    <button role="menuitem" data-cmd="0">이동<kbd>1</kbd></button>
+    <button role="menuitem" data-cmd="1">매복<kbd>2</kbd></button>
+    <button role="menuitem" data-cmd="2">주둔<kbd>3</kbd></button>
+    <button role="menuitem" data-cmd="3">정찰<kbd>4</kbd></button>
+  </div>
 </main>
 <script type="module" src="world.js"></script>
 </body>
