@@ -115,6 +115,8 @@ pub struct Game {
     pub memory: Vec<Option<Pos>>,
     /// 제국이 수를 고를 때 쓰는 가중치.
     pub doctrine: ai::Doctrine,
+    /// 아군 쪽을 기계가 대신 둘 때의 가중치. 시험과 모의전에서만 쓴다.
+    pub stand_in: ai::Doctrine,
     rng: Rng,
 }
 
@@ -153,7 +155,7 @@ impl Game {
             units.push(Unit { side: Side::Empire, class: *c, hp: c.def().hp, pos: (x, 2 + 3 * i as i32), ap: AP_PER_TURN });
         }
         let memory = vec![None; units.len()];
-        let mut g = Game { seed, tiles, units, round: 1, selected: None, outcome: None, log: Vec::new(), events: Vec::new(), memory, doctrine: ai::Doctrine::default(), rng };
+        let mut g = Game { seed, tiles, units, round: 1, selected: None, outcome: None, log: Vec::new(), events: Vec::new(), memory, doctrine: ai::Doctrine::default(), stand_in: ai::Doctrine::CAUTIOUS, rng };
         g.observe();
         g
     }

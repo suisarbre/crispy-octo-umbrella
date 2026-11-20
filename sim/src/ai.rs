@@ -114,12 +114,11 @@ impl<'a> Plan<'a> {
         plan
     }
 
-    /// 제국은 판에 실린 가중치로, 아군 쪽(시험용 상대)은 기본값으로 둔다.
     fn doctrine(&self) -> &'a Doctrine {
         if self.side == Side::Empire {
             &self.g.doctrine
         } else {
-            &Doctrine::CAUTIOUS
+            &self.g.stand_in
         }
     }
 
@@ -528,6 +527,110 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// 한 판을 끝까지. 양쪽 다 탐색기가 둔다.
+    fn duel(seed: u64, empire: &Doctrine, brood: &Doctrine) -> Option<Side> {
+        let mut g = Game::new(seed);
+        g.doctrine = empire.clone();
+        g.stand_in = brood.clone();
+        while g.outcome.is_none() && g.round < 40 {
+            run(&mut g, Side::Brood);
+            if g.outcome.is_none() {
+                run(&mut g, Side::Empire);
+            }
+            for u in &mut g.units {
+                u.ap = AP_PER_TURN;
+            }
+            g.round += 1;
+        }
+        g.outcome
+    }
+
+    /// 여러 판의 (제국 승, 제국 패). 코어를 나눠 쓴다.
+    fn series(seeds: std::ops::Range<u64>, empire: &Doctrine, brood: &Doctrine) -> (i32, i32) {
+        let threads = std::thread::available_parallelism().map_or(1, |n| n.get()) as u64;
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..threads)
+                .map(|k| {
+                    let seeds = seeds.clone();
+                    scope.spawn(move || {
+                        let (mut won, mut lost) = (0, 0);
+                        for seed in seeds.filter(|s| s % threads == k) {
+                            match duel(seed, empire, brood) {
+                                Some(Side::Empire) => won += 1,
+                                Some(Side::Brood) => lost += 1,
+                                None => {}
+                            }
+                        }
+                        (won, lost)
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1))
+        })
+    }
+
+    fn show(d: &Doctrine) -> String {
+        format!("위협 {:>2} 접근 {:>3} 예견 {:>3} 사살 {:>2} 중계조심 {}", d.threat, d.approach, d.foresight, d.kill, d.relay_caution)
+    }
+
+    /// 적응 실험. 아군 쪽 성향을 셋으로 바꿔 놓고, 제국 가중치를 모의전 결과만 보고 조금씩 고친다.
+    /// 끝에 남은 가중치가 상대마다 다르고, 자기 상대에게 제일 잘 통하면 적응이 된다는 뜻이다.
+    /// `cargo test -p sim --release adaptation -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn adaptation() {
+        const TRAIN: std::ops::Range<u64> = 0..160;
+        const HELD_OUT: std::ops::Range<u64> = 10_000..10_400;
+        let players = [
+            ("소심", Doctrine::CAUTIOUS),
+            ("돌격", Doctrine { threat: 0, approach: 60, ..Doctrine::CAUTIOUS }),
+            ("사살욕심", Doctrine { threat: 3, approach: 40, kill: 60, ..Doctrine::CAUTIOUS }),
+        ];
+        let score = |d: &Doctrine, p: &Doctrine, seeds: std::ops::Range<u64>| {
+            let (won, lost) = series(seeds, d, p);
+            won - lost
+        };
+        let mut adapted = Vec::new();
+        for (name, player) in &players {
+            let mut d = Doctrine::STANDARD;
+            let mut best = score(&d, player, TRAIN);
+            println!("\n[{name}] 시작  {}  점수 {best:+}", show(&d));
+            for _pass in 0..2 {
+                for knob in 0..5 {
+                    for dir in [-1, 1] {
+                        let mut c = d.clone();
+                        match knob {
+                            0 => c.threat = (c.threat + dir).max(0),
+                            1 => c.approach = (c.approach + 20 * dir).max(0),
+                            2 => c.foresight = (c.foresight + 30 * dir).clamp(0, 130),
+                            3 => c.kill = (c.kill + 15 * dir).max(0),
+                            _ => c.relay_caution = (c.relay_caution + dir).max(1),
+                        }
+                        if c == d {
+                            continue;
+                        }
+                        let s = score(&c, player, TRAIN);
+                        // 잡음에 끌려가지 않게, 뚜렷이 나아질 때만 옮긴다.
+                        if s >= best + 8 {
+                            best = s;
+                            d = c;
+                            println!("[{name}] 고침  {}  점수 {best:+}", show(&d));
+                        }
+                    }
+                }
+            }
+            adapted.push(d);
+        }
+        println!("\n처음 보는 판 {}개에서 (제국 승 − 제국 패)", HELD_OUT.end - HELD_OUT.start);
+        println!("{:<12} | {:>6} {:>6} {:>8}", "제국 \\ 상대", "소심", "돌격", "사살욕심");
+        let mut rows = vec![("기본".to_string(), Doctrine::STANDARD)];
+        rows.extend(players.iter().zip(&adapted).map(|((n, _), d)| (format!("{n}에 적응"), d.clone())));
+        for (name, d) in &rows {
+            let cells: Vec<String> = players.iter().map(|(_, p)| format!("{:>+6}", score(d, p, HELD_OUT))).collect();
+            println!("{name:<12} | {}", cells.join(" "));
         }
     }
 
