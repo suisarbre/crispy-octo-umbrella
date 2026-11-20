@@ -130,6 +130,14 @@ fn in_bounds(p: Pos) -> bool {
 
 impl Game {
     pub fn new(seed: u64) -> Game {
+        let brood = [Class::Lancer, Class::Shell, Class::Stalker, Class::Stalker];
+        let empire = [Class::Trooper, Class::Trooper, Class::Relay, Class::Trooper, Class::Trooper];
+        Game::with_units(seed, &brood, &empire)
+    }
+
+    /// 양쪽 인원을 정해서 시작한다. 한쪽에 최대 `H`명.
+    pub fn with_units(seed: u64, brood: &[Class], empire: &[Class]) -> Game {
+        assert!(brood.len() <= H as usize && empire.len() <= H as usize);
         let mut rng = Rng::new(seed);
         let mut tiles = vec![Tile::Floor; (W * H) as usize];
         for y in 0..H {
@@ -144,15 +152,21 @@ impl Game {
                 };
             }
         }
+        // 다섯 명까지는 세 칸씩 띄우고, 그보다 많으면 한 줄로 붙여 세운다.
+        let row = |i: usize, n: usize, first: i32| {
+            if n <= 5 {
+                first + 3 * i as i32
+            } else {
+                (H - n as i32) / 2 + i as i32
+            }
+        };
         let mut units = Vec::new();
-        let brood = [Class::Lancer, Class::Shell, Class::Stalker, Class::Stalker];
         for (i, c) in brood.iter().enumerate() {
-            units.push(Unit { side: Side::Brood, class: *c, hp: c.def().hp, pos: (1, 3 + 3 * i as i32), ap: AP_PER_TURN });
+            units.push(Unit { side: Side::Brood, class: *c, hp: c.def().hp, pos: (1, row(i, brood.len(), 3)), ap: AP_PER_TURN });
         }
-        let empire = [Class::Trooper, Class::Trooper, Class::Relay, Class::Trooper, Class::Trooper];
         for (i, c) in empire.iter().enumerate() {
             let x = if *c == Class::Relay { W - 1 } else { W - 2 };
-            units.push(Unit { side: Side::Empire, class: *c, hp: c.def().hp, pos: (x, 2 + 3 * i as i32), ap: AP_PER_TURN });
+            units.push(Unit { side: Side::Empire, class: *c, hp: c.def().hp, pos: (x, row(i, empire.len(), 2)), ap: AP_PER_TURN });
         }
         let memory = vec![None; units.len()];
         let mut g = Game { seed, tiles, units, round: 1, selected: None, outcome: None, log: Vec::new(), events: Vec::new(), memory, doctrine: ai::Doctrine::default(), stand_in: ai::Doctrine::CAUTIOUS, rng };

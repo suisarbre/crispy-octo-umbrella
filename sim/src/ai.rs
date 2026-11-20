@@ -634,6 +634,54 @@ mod tests {
         }
     }
 
+    /// 12 대 12가 얼마나 걸리는지 잰다. `cargo test -p sim --release big_battle -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn big_battle() {
+        use Class::*;
+        let brood = [Lancer, Lancer, Lancer, Shell, Shell, Shell, Shell, Stalker, Stalker, Stalker, Stalker, Stalker];
+        let mut empire = [Trooper; 12];
+        empire[6] = Relay;
+        for (label, b, e) in [("4 대 5", &brood[..0], &empire[..0]), ("8 대 8", &brood[2..10], &empire[2..10]), ("12 대 12", &brood[..], &empire[..])] {
+            let (mut won, mut lost, mut rounds, mut turns) = (0, 0, 0, 0);
+            let (mut think, mut slowest, mut actions) = (Duration::ZERO, Duration::ZERO, 0usize);
+            let games = 30;
+            for seed in 0..games {
+                let mut g = if b.is_empty() { Game::new(seed) } else { Game::with_units(seed, b, e) };
+                while g.outcome.is_none() && g.round < 60 {
+                    run(&mut g, Side::Brood);
+                    if g.outcome.is_none() {
+                        let before = g.events.len();
+                        let start = Instant::now();
+                        run(&mut g, Side::Empire);
+                        let took = start.elapsed();
+                        think += took;
+                        slowest = slowest.max(took);
+                        turns += 1;
+                        actions += g.events.len() - before;
+                    }
+                    for u in &mut g.units {
+                        u.ap = AP_PER_TURN;
+                    }
+                    g.round += 1;
+                }
+                rounds += g.round;
+                match g.outcome {
+                    Some(Side::Empire) => won += 1,
+                    Some(Side::Brood) => lost += 1,
+                    None => {}
+                }
+            }
+            println!(
+                "{label}: 제국 승 {won} / 패 {lost} / {games}판   판당 {} 라운드   제국 턴 평균 {:?}, 최장 {:?}   제국 턴당 화면 박자 {}",
+                rounds / games as u32,
+                think / turns.max(1),
+                slowest,
+                actions / turns.max(1) as usize
+            );
+        }
+    }
+
     #[test]
     fn a_cut_relay_makes_the_squad_worse() {
         let mut wins = [0u32; 2];
