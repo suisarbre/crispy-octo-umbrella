@@ -7,8 +7,8 @@ const SAVE_VERSION = 1;
 const FONT_PX = 18;
 const FONT_FAMILY = 'ui-monospace, "Cascadia Mono", Menlo, Consolas, monospace';
 const TEXT_REGIONS = ["clock", "force", "notice"];
-/// 1배속에서 1초에 넘어가는 틱 수.
-const TICKS_PER_SECOND = 4;
+/// 하루를 넘길 때 틱 하나를 보여주는 시간(ms). 하루가 1초쯤 걸린다.
+const TICK_MS = 40;
 const HOLD_MS = 350;
 
 const $ = (id) => document.getElementById(id);
@@ -20,12 +20,12 @@ const wasm = instance.exports;
 const COLS = wasm.w_cols();
 const ROWS = wasm.w_rows();
 
-// 세이브는 (시드, 입력과 틱의 순서)다. ["t", n]은 n틱이 흘렀다는 뜻, [x, y]는 그 칸을 눌렀다는 뜻.
+// 세이브는 (시드, 입력과 틱의 순서)다. 하루는 24틱이다. ["t", n]은 n틱이 흘렀다는 뜻, [x, y]는 그 칸을 눌렀다는 뜻.
 let save = { v: SAVE_VERSION, seed: 0, events: [] };
 let view = { rot: false, cols: COLS, rows: ROWS, cw: 16, ch: 20, font: FONT_PX };
-let speed = 0;
-let owed = 0;
-let last = performance.now();
+// 하루가 재생되는 중인가. 그동안은 명령을 받지 않는다.
+let playing = false;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function layout() {
   const narrow = window.innerWidth < 700;
@@ -78,9 +78,7 @@ function draw() {
     if (el.textContent !== next) el.textContent = next;
   });
   $("seed").textContent = `시드 ${save.seed}`;
-  for (const b of document.querySelectorAll("[data-speed]")) {
-    b.setAttribute("aria-pressed", String(Number(b.dataset.speed) === speed));
-  }
+  $("day").disabled = playing || !!wasm.w_halted();
 }
 
 function persist() {
@@ -92,29 +90,33 @@ function persist() {
   }
 }
 
-function setSpeed(next) {
-  speed = wasm.w_halted() ? 0 : next;
-  owed = 0;
-  last = performance.now();
-  draw();
+function noteTicks(done) {
+  if (!done) return;
+  const tail = save.events[save.events.length - 1];
+  if (Array.isArray(tail) && tail[0] === "t") tail[1] += done;
+  else save.events.push(["t", done]);
 }
 
-function passTicks(n) {
-  const done = wasm.w_tick(n);
-  if (done) {
-    const tail = save.events[save.events.length - 1];
-    if (Array.isArray(tail) && tail[0] === "t") tail[1] += done;
-    else save.events.push(["t", done]);
+// 하루를 넘긴다. 양쪽이 동시에 움직이는 것을 틱 하나씩 보여준다. 충돌이 나면 거기서 멈춘다.
+async function passDay() {
+  if (playing || wasm.w_halted()) return;
+  playing = true;
+  const quick = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  for (let left = wasm.w_ticks_left_today(); left > 0; left--) {
+    const done = wasm.w_tick(1);
+    noteTicks(done);
+    if (!done) break;
+    draw();
+    if (!quick) await sleep(TICK_MS);
   }
-  // 충돌이 나면 시간이 멈춘다.
-  if (wasm.w_halted()) speed = 0;
-  return done;
+  playing = false;
+  persist();
+  draw();
 }
 
 function newGame(seed) {
   save = { v: SAVE_VERSION, seed, events: [] };
   wasm.w_init(seed);
-  speed = 0;
   persist();
   draw();
 }
@@ -207,6 +209,7 @@ canvas.addEventListener("click", (ev) => {
     swallowClick = false;
     return;
   }
+  if (playing) return;
   const [x, y] = cellAt(ev);
   if (wasm.w_click(x, y)) {
     save.events.push([x, y]);
@@ -215,17 +218,16 @@ canvas.addEventListener("click", (ev) => {
   draw();
 });
 
-for (const b of document.querySelectorAll("[data-speed]")) {
-  b.addEventListener("click", () => setSpeed(Number(b.dataset.speed)));
-}
-$("new").addEventListener("click", () => newGame(crypto.getRandomValues(new Uint32Array(1))[0]));
+$("day").addEventListener("click", passDay);
+$("new").addEventListener("click", () => {
+  if (!playing) newGame(crypto.getRandomValues(new Uint32Array(1))[0]);
+});
 
 document.addEventListener("keydown", (ev) => {
   if (ev.target instanceof HTMLButtonElement && ev.code === "Space") return;
-  const keys = { Space: speed ? 0 : 1, Digit1: 1, Digit2: 3, Digit3: 5 };
-  if (ev.code in keys) {
+  if (ev.code === "Space" || ev.code === "Enter") {
     ev.preventDefault();
-    setSpeed(keys[ev.code]);
+    passDay();
   }
 });
 
@@ -238,27 +240,6 @@ window.addEventListener("resize", () => {
   }, 100);
 });
 
-let sinceSave = 0;
-function frame(now) {
-  const dt = Math.min(now - last, 250);
-  last = now;
-  if (speed) {
-    owed += (dt / 1000) * TICKS_PER_SECOND * speed;
-    const whole = Math.floor(owed);
-    if (whole) {
-      owed -= whole;
-      passTicks(whole);
-      draw();
-      sinceSave += dt;
-      if (sinceSave > 1000 || !speed) {
-        sinceSave = 0;
-        persist();
-      }
-    }
-  }
-  requestAnimationFrame(frame);
-}
-
 layout();
 try {
   load(JSON.parse(localStorage.getItem(SAVE_KEY)));
@@ -266,4 +247,3 @@ try {
 } catch {
   newGame(crypto.getRandomValues(new Uint32Array(1))[0]);
 }
-requestAnimationFrame(frame);

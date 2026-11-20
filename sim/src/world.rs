@@ -1,12 +1,17 @@
 //! 월드. 거점과 길로 된 지도 위에서 시간이 흐르고 부대가 움직인다.
 //! 전투와 마찬가지로 결정론적이다. 상태를 바꾸는 입구는 `click`과 `tick` 둘뿐이라서
-//! (시드, 입력과 틱의 순서)만 있으면 그대로 재현된다. 시간은 고정 틱으로만 센다.
+//! (시드, 입력과 틱의 순서)만 있으면 그대로 재현된다.
+//!
+//! 월드는 동시 턴이다. 한 턴은 하루이고, 하루는 고정 틱 `TICKS_PER_DAY`개로 굴린다.
+//! 양쪽이 같은 틱에 같이 움직여서 길 중간에서 마주칠 수 있다.
 
 use crate::rng::Rng;
 use crate::{Pos, Side};
 
 pub const WW: i32 = 40;
 pub const WH: i32 = 24;
+/// 하루는 이만큼의 틱이다. 한 턴이 하루다.
+pub const TICKS_PER_DAY: u64 = 24;
 /// 거점은 이 크기의 칸마다 하나씩 놓인다.
 const CELL: i32 = 8;
 const COLS: i32 = WW / CELL;
@@ -252,6 +257,11 @@ impl World {
             _ => self.selected = None,
         }
         true
+    }
+
+    /// 오늘이 며칠째인가. 첫날이 0.
+    pub fn day(&self) -> u64 {
+        self.tick / TICKS_PER_DAY
     }
 
     /// 시간을 한 틱 넘긴다. 부대가 마주치면 `clash`가 서고 그 뒤로는 넘어가지 않는다.

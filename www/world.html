@@ -16,7 +16,8 @@
   nav { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
   button, nav a { font:inherit; color:var(--fg); background:none; border:1px solid var(--dim); padding:4px 12px; cursor:pointer; text-decoration:none; }
   button:hover, button:focus-visible, nav a:hover, nav a:focus-visible { border-color:var(--fg); outline:none; }
-  button[aria-pressed="true"] { border-color:var(--brood); color:var(--brood); }
+  #day { border-color:var(--brood); color:var(--brood); }
+  #day:disabled { border-color:var(--dim); color:var(--dim); cursor:default; }
   kbd { font:inherit; font-size:12px; border:1px solid var(--dim); border-bottom-width:2px; padding:0 4px; margin-left:8px; }
   #seed { margin-left:auto; }
   #err { color:var(--empire); }
@@ -38,10 +39,7 @@
     <p id="notice" role="status"></p>
   </section>
   <nav>
-    <button data-speed="0">정지<kbd>Space</kbd></button>
-    <button data-speed="1">1배<kbd>1</kbd></button>
-    <button data-speed="3">3배<kbd>2</kbd></button>
-    <button data-speed="5">5배<kbd>3</kbd></button>
+    <button id="day">하루 넘기기<kbd>Space</kbd></button>
     <button id="new">새 판</button>
     <a href="./">전투</a>
     <span id="seed"></span>

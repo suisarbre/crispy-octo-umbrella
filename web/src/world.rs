@@ -1,14 +1,13 @@
 //! 월드 화면의 경계. 전투 쪽과 같은 방식이다: 칸 배열과 문구를 만들어 넘기고, JS는 그리기만 한다.
 
-use sim::world::{in_world, Ground, Order, SiteKind, World, WH, WW};
+use sim::world::{in_world, Ground, Order, SiteKind, World, TICKS_PER_DAY, WH, WW};
 use sim::{Pos, Side};
 
 use crate::{cell, BG, BROOD, DIM, EMPIRE, FG};
 
 const CELLS: usize = (WW * WH) as usize;
-/// 문구 구역 구분자. 순서: 날짜와 시각, 고른 부대, 알림.
+/// 문구 구역 구분자. 순서: 날짜, 고른 부대, 알림.
 const SEP: &str = "\u{1f}";
-const TICKS_PER_DAY: u64 = 24;
 
 struct State {
     world: World,
@@ -79,10 +78,8 @@ fn render(s: &mut State) {
         s.frame[idx(f.pos)] = if w.selected == Some(i) { cell('◆', BG, color) } else { cell('◆', color, BG) };
     }
 
-    let day = w.tick / TICKS_PER_DAY + 1;
-    let hour = w.tick % TICKS_PER_DAY;
     let sections = [
-        format!("{day}일 {hour:02}시"),
+        format!("D+{}", w.day()),
         match w.selected {
             Some(sel) => {
                 let f = &w.forces[sel];
@@ -142,6 +139,13 @@ pub extern "C" fn w_tick(n: u32) -> u32 {
     }
     render(s);
     (s.world.tick - before) as u32
+}
+
+/// 오늘 남은 틱 수. 하루를 넘길 때 이만큼 굴린다.
+#[no_mangle]
+pub extern "C" fn w_ticks_left_today() -> u32 {
+    let t = state().world.tick;
+    (TICKS_PER_DAY - t % TICKS_PER_DAY) as u32
 }
 
 /// 충돌로 시간이 멈춰 있는가.
@@ -213,7 +217,8 @@ mod tests {
         w_init(3);
         let s = state();
         let home = s.world.sites.iter().find(|x| x.kind == SiteKind::Hq(Side::Brood)).unwrap().pos;
-        assert!(s.text.starts_with("1일 00시"));
+        assert!(s.text.starts_with("D+0"));
+        assert_eq!(w_ticks_left_today(), 24);
         assert_eq!(s.frame[idx(home)], cell('◆', BROOD, BG));
 
         // 본진 칸에는 본진과 부대 셋이 있다.
@@ -229,7 +234,8 @@ mod tests {
         assert_eq!(w_tick(30), 30);
         let sel = state().world.selected.unwrap();
         assert_ne!(state().world.forces[sel].pos, home);
-        assert!(state().text.starts_with("2일 06시"));
+        assert!(state().text.starts_with("D+1"));
+        assert_eq!(w_ticks_left_today(), 18);
         assert_eq!(w_halted(), 0);
     }
 }
