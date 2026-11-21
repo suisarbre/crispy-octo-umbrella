@@ -2,63 +2,217 @@
 <html lang="ko">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
 <title>crispy-octo-umbrella · 월드</title>
 <style>
-  :root { --bg:#0c0f11; --dim:#38454a; --fg:#cfcabb; --brood:#63d6ac; --empire:#e8823f; }
-  html, body { margin:0; background:var(--bg); color:var(--fg); }
-  body { font:15px/1.5 ui-monospace, "Cascadia Mono", Menlo, Consolas, "D2Coding", monospace; padding:20px; }
-  main { margin:0 auto; }
-  canvas { display:block; cursor:crosshair; touch-action:manipulation; -webkit-touch-callout:none; user-select:none; -webkit-user-select:none; -webkit-tap-highlight-color:transparent; }
-  #panel { margin:16px 0; font-variant-numeric:tabular-nums; }
-  #panel > * { margin:0; min-height:1.5em; white-space:pre; }
-  #notice { color:var(--empire); }
-  nav { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
-  button, nav a { font:inherit; color:var(--fg); background:none; border:1px solid var(--dim); padding:4px 12px; cursor:pointer; text-decoration:none; }
-  button:hover, button:focus-visible, nav a:hover, nav a:focus-visible { border-color:var(--fg); outline:none; }
+  :root {
+    --bg:#0c0f11; --dim:#38454a; --fg:#cfcabb;
+    --brood:#63d6ac; --brood-dim:#37725e; --empire:#e8823f;
+  }
+  * { box-sizing:border-box; }
+  html, body { margin:0; height:100%; background:var(--bg); color:var(--fg); }
+  body { font:14px/1.45 ui-monospace, "Cascadia Mono", Menlo, Consolas, "D2Coding", monospace; font-variant-numeric:tabular-nums; }
+  button, a { font:inherit; color:var(--fg); background:none; border:1px solid var(--dim); padding:4px 10px; cursor:pointer; text-decoration:none; }
+  button:hover, button:focus-visible, a:hover, a:focus-visible { border-color:var(--fg); outline:none; }
+  button:disabled { border-color:var(--dim); color:var(--dim); cursor:default; }
+  kbd { font:inherit; font-size:11px; border:1px solid var(--dim); border-bottom-width:2px; padding:0 4px; margin-left:6px; color:var(--fg); }
+
+  /* 데스크탑 2단 전술 단말 레이아웃 */
+  #app { display:flex; flex-direction:column; height:100vh; max-width:1360px; margin:0 auto; padding:12px; gap:10px; }
+  #topbar { display:flex; align-items:center; justify-content:space-between; gap:12px; border:1px solid var(--dim); padding:6px 10px; flex:none; }
+  #hdr-desktop { white-space:pre; overflow:hidden; text-overflow:ellipsis; }
+  #hdr-mobile { display:none; white-space:pre; overflow:hidden; text-overflow:ellipsis; }
+  #top-actions { display:flex; gap:6px; flex:none; }
+
+  #workspace { display:flex; flex:1; min-height:0; gap:10px; }
+  #map-wrap { position:relative; flex:1; min-width:0; min-height:0; border:1px solid var(--dim); display:flex; flex-direction:column; overflow:hidden; }
+  #canvas-box { position:relative; flex:1; min-height:0; overflow:hidden; }
+  canvas { display:block; width:100%; height:100%; cursor:crosshair; touch-action:none; -webkit-touch-callout:none; user-select:none; -webkit-user-select:none; -webkit-tap-highlight-color:transparent; }
+  #map-hint { border-top:1px solid var(--dim); padding:4px 10px; font-size:12px; color:var(--dim); display:flex; justify-content:space-between; gap:8px; flex:none; }
+  #map-hint strong { color:var(--fg); font-weight:normal; }
+
+  #fab-wrap { display:none; position:absolute; right:8px; bottom:8px; flex-direction:column; gap:6px; z-index:4; }
+  #fab-wrap button { background:var(--bg); border-color:var(--fg); min-height:38px; padding:4px 10px; font-size:13px; }
+  #fab-wrap button.active { border-color:var(--brood); color:var(--brood); }
+
+  /* 우측 고정폭 작전 단말 패널 */
+  #side { width:340px; flex:none; border:1px solid var(--dim); display:flex; flex-direction:column; min-height:0; overflow-y:auto; }
+  .sec { padding:10px; border-bottom:1px solid var(--dim); }
+  .sec:last-child { border-bottom:0; }
+  .sec-head { display:flex; justify-content:space-between; align-items:center; margin-bottom:6px; color:var(--fg); }
+  .sec-head button { padding:2px 8px; font-size:12px; }
+  #sp-summary { margin:0; white-space:pre-wrap; font:inherit; color:var(--fg); }
+  #sp-summary .hi { color:var(--brood); }
+
+  .prop { border:1px solid var(--dim); padding:7px 8px; margin-bottom:6px; transition:border-color .1s; }
+  .prop:last-child { margin-bottom:0; }
+  .prop:hover { border-color:var(--brood); }
+  .prop.primary { border-color:var(--brood-dim); }
+  .prop-title { display:flex; justify-content:space-between; gap:6px; color:var(--fg); }
+  .prop.primary .prop-title .tag { color:var(--brood); }
+  .prop .tag { color:var(--dim); margin-right:4px; }
+  .prop-reason { font-size:12px; color:var(--dim); margin:2px 0 6px; }
+  .prop-foot { display:flex; justify-content:space-between; align-items:center; font-size:12px; }
+  .prop-btns { display:flex; gap:6px; }
+  .prop-btns button { padding:2px 8px; font-size:12px; }
+  .prop-btns .accept { border-color:var(--brood); color:var(--brood); }
+
+  .ev-item { display:flex; gap:8px; width:100%; text-align:left; border:0; border-bottom:1px solid #1a2124; padding:4px 2px; font-size:12px; }
+  .ev-item:last-child { border-bottom:0; }
+  .ev-item:hover { background:#141b1e; }
+  .ev-day { color:var(--dim); flex:none; }
+  .ev-item.alert .ev-text { color:var(--empire); }
+
+  /* 하단 바 */
+  #bottom { display:flex; align-items:center; gap:8px; flex-wrap:wrap; flex:none; }
   #day { border-color:var(--brood); color:var(--brood); }
-  #day:disabled { border-color:var(--dim); color:var(--dim); cursor:default; }
-  kbd { font:inherit; font-size:12px; border:1px solid var(--dim); border-bottom-width:2px; padding:0 4px; margin-left:8px; }
-  #seed { margin-left:auto; }
-  #err { color:var(--empire); }
-  #pop { position:absolute; z-index:2; margin:0; padding:4px 8px; white-space:pre; pointer-events:none; background:var(--bg); border:1px solid var(--fg); font-variant-numeric:tabular-nums; }
-  #menu { position:absolute; z-index:3; display:flex; flex-direction:column; background:var(--bg); border:1px solid var(--fg); }
+  #until { border-color:var(--fg); }
+  #notice { color:var(--empire); margin-left:6px; }
+  #seed { margin-left:auto; color:var(--dim); }
+  #err { color:var(--empire); margin:0; font-size:12px; }
+
+  /* 팝업 및 컨텍스트 메뉴 */
+  #pop { position:fixed; z-index:20; margin:0; padding:5px 8px; white-space:pre; pointer-events:none; background:var(--bg); border:1px solid var(--fg); font:inherit; font-size:13px; }
+  #menu { position:fixed; z-index:25; display:flex; flex-direction:column; background:var(--bg); border:1px solid var(--fg); min-width:210px; }
   #menu[hidden] { display:none; }
-  #menu button { border:0; text-align:left; display:flex; justify-content:space-between; gap:16px; }
+  #menu-head { padding:5px 10px; font-size:12px; color:var(--brood); border-bottom:1px solid var(--dim); white-space:nowrap; }
+  #menu button { border:0; text-align:left; display:flex; justify-content:space-between; gap:16px; padding:6px 10px; }
   #menu button + button { border-top:1px solid var(--dim); }
   #menu button:hover, #menu button:focus-visible { background:var(--dim); }
-  #menu button:disabled { color:var(--dim); cursor:default; background:none; }
+  #menu button:disabled { color:var(--dim); background:none; }
+
+  /* 모바일 전용 서랍/명령 바 (데스크탑에서는 숨김) */
+  #sheet-bar, #mob-cmd, #mob-tabs { display:none; }
+
   @media (max-width:699px) {
-    body { padding:8px; }
-    canvas { margin:0 auto; }
-    kbd { display:none; }
-    button, nav a { min-height:44px; box-sizing:border-box; display:inline-flex; align-items:center; }
+    #app { padding:6px; gap:6px; height:100dvh; }
+    #hdr-desktop, #top-actions, #map-hint, kbd, #seed { display:none; }
+    #hdr-mobile { display:block; font-size:13px; }
+    #topbar { padding:5px 8px; }
+    #workspace { flex-direction:column; gap:0; position:relative; }
+    #fab-wrap { display:flex; }
+
+    /* 모바일 슬라이드 시트 */
+    #sheet-bar { display:flex; justify-content:space-between; align-items:center; width:100%; border:1px solid var(--dim); border-top:0; padding:8px 10px; background:var(--bg); min-height:42px; text-align:left; }
+    #sheet-bar .tag { color:var(--brood); margin-right:6px; }
+
+    #side { display:none; width:100%; max-height:48dvh; border-top:0; }
+    #side.open { display:flex; }
+    #mob-tabs { display:flex; border-bottom:1px solid var(--dim); flex:none; }
+    #mob-tabs button { flex:1; border:0; border-right:1px solid var(--dim); min-height:40px; font-size:13px; }
+    #mob-tabs button:last-child { border-right:0; }
+    #mob-tabs button.active { color:var(--brood); background:#131b1d; }
+    #side .sec { display:none; }
+    #side .sec.active { display:block; }
+
+    /* 모바일 하단 명령 바 */
+    #mob-cmd { display:none; flex-direction:column; gap:6px; border:1px solid var(--brood); padding:8px; background:var(--bg); }
+    #mob-cmd.open { display:flex; }
+    #mob-cmd-head { font-size:12px; color:var(--brood); display:flex; justify-content:space-between; }
+    #mob-cmd-btns { display:flex; gap:6px; }
+    #mob-cmd-btns button { flex:1; min-height:44px; padding:4px 4px; font-size:13px; }
+
+    #bottom { gap:6px; }
+    #bottom button, #bottom a { flex:1; min-height:44px; display:inline-flex; align-items:center; justify-content:center; padding:4px 8px; font-size:13px; }
+    #new, #notice { display:none; }
+    #menu { display:none !important; }
   }
 </style>
 </head>
 <body>
-<main>
-  <canvas id="screen" aria-label="지도"></canvas>
-  <section id="panel">
-    <p id="clock"></p>
-    <p id="force"></p>
-    <p id="notice" role="status"></p>
-  </section>
-  <nav>
-    <button id="day">하루 넘기기<kbd>Space</kbd></button>
-    <button id="new">새 판</button>
-    <a href="./">전투</a>
-    <span id="seed"></span>
-  </nav>
-  <p id="err" role="alert"></p>
-  <pre id="pop" role="status" hidden></pre>
-  <div id="menu" role="menu" aria-label="명령" hidden>
-    <button role="menuitem" data-cmd="0">이동<kbd>1</kbd></button>
-    <button role="menuitem" data-cmd="1">매복<kbd>2</kbd></button>
-    <button role="menuitem" data-cmd="2">주둔<kbd>3</kbd></button>
-    <button role="menuitem" data-cmd="3">정찰<kbd>4</kbd></button>
+<div id="app">
+  <header id="topbar">
+    <span id="hdr-desktop"></span>
+    <span id="hdr-mobile"></span>
+    <div id="top-actions">
+      <button id="btn-overview">전구 전체<kbd>M</kbd></button>
+      <button id="btn-squad">내 분대<kbd>F</kbd></button>
+      <a href="./">전투</a>
+    </div>
+  </header>
+
+  <div id="workspace">
+    <div id="map-wrap">
+      <div id="canvas-box">
+        <canvas id="screen" aria-label="전구 지도"></canvas>
+        <div id="fab-wrap">
+          <button id="fab-overview">전체</button>
+          <button id="fab-squad">분대</button>
+        </div>
+      </div>
+      <div id="map-hint">
+        <span id="view-mode"><strong>전술 뷰 1:1</strong> · 드래그/WASD 이동 · 휠 줌 · 특수부대 클릭 후 명령</span>
+        <span id="coords-hint"></span>
+      </div>
+    </div>
+
+    <button id="sheet-bar" type="button">
+      <span id="sheet-preview"><span class="tag">▸ 권고</span>지휘망 분석</span>
+      <span id="sheet-arrow">▲</span>
+    </button>
+
+    <aside id="side" aria-label="작전 단말 패널">
+      <div id="mob-tabs">
+        <button data-tab="prop" class="active">지휘망</button>
+        <button data-tab="squad">분대</button>
+        <button data-tab="events">사건</button>
+        <button id="mob-close">▼</button>
+      </div>
+      <section class="sec active" data-sec="squad">
+        <div class="sec-head">
+          <span>■ 특수부대</span>
+          <button id="btn-select-sp">선택<kbd>F</kbd></button>
+        </div>
+        <pre id="sp-summary"></pre>
+      </section>
+      <section class="sec active" data-sec="prop">
+        <div class="sec-head">
+          <span>■ 지휘망 작전 제안</span>
+        </div>
+        <div id="proposals"></div>
+      </section>
+      <section class="sec active" data-sec="events">
+        <div class="sec-head">
+          <span>■ 전선 사건 (클릭 이동)</span>
+        </div>
+        <div id="events"></div>
+      </section>
+    </aside>
+
+    <div id="mob-cmd">
+      <div id="mob-cmd-head">
+        <span id="mob-cmd-title"></span>
+        <button id="mob-cmd-cancel" style="padding:1px 6px;font-size:11px;">취소</button>
+      </div>
+      <div id="mob-cmd-btns">
+        <button data-cmd="0">이동</button>
+        <button data-cmd="1">매복</button>
+        <button data-cmd="2">주둔</button>
+        <button data-cmd="3">정찰</button>
+      </div>
+    </div>
   </div>
-</main>
+
+  <footer id="bottom">
+    <button id="day">하루 넘기기<kbd>Space</kbd></button>
+    <button id="until">사건까지 진행<kbd>Shift+Space</kbd></button>
+    <button id="new">새 판</button>
+    <a id="mob-battle" href="./" style="display:none;">전투</a>
+    <span id="notice" role="status"></span>
+    <span id="seed"></span>
+  </footer>
+  <p id="err" role="alert"></p>
+</div>
+
+<pre id="pop" role="status" hidden></pre>
+<div id="menu" role="menu" aria-label="명령" hidden>
+  <div id="menu-head"></div>
+  <button role="menuitem" data-cmd="0">이동<kbd>1</kbd></button>
+  <button role="menuitem" data-cmd="1">매복<kbd>2</kbd></button>
+  <button role="menuitem" data-cmd="2">주둔<kbd>3</kbd></button>
+  <button role="menuitem" data-cmd="3">정찰<kbd>4</kbd></button>
+</div>
+
 <script type="module" src="world.js"></script>
 </body>
 </html>

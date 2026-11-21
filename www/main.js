@@ -1,13 +1,13 @@
 // 그리기와 입력, 세이브만 한다. 규칙은 전부 game.wasm 안에 있다.
 
-const PALETTE = ["#0c0f11", "#38454a", "#cfcabb", "#63d6ac", "#e8823f"];
+const PALETTE = ["#0c0f11", "#38454a", "#cfcabb", "#63d6ac", "#e8823f", "#37725e"];
 const SAVE_KEY = "crispy-octo-umbrella/save";
 const SAVE_VERSION = 1;
 const FONT_PX = 20;
 const FONT_FAMILY = 'ui-monospace, "Cascadia Mono", Menlo, Consolas, monospace';
 
-// game.wasm이 넘기는 문구 구역 순서와 같다.
-const TEXT_REGIONS = ["status", "link", "ledger", "result"];
+// game.wasm이 넘기는 문구 구역 순서: status, ledger, result, ability, roster.
+const TEXT_REGIONS = ["status", "ledger", "result"];
 
 const $ = (id) => document.getElementById(id);
 const canvas = $("screen");
@@ -158,17 +158,42 @@ function draw() {
     const next = parts[i] ?? "";
     if (el.textContent !== next) el.textContent = next;
   });
-  // 일곱 번째 구역은 지금 쓸 수 있는 능력의 이름이다. 없으면 버튼을 감춘다.
-  const ability = parts[TEXT_REGIONS.length] ?? "";
+  // 네 번째 구역은 지금 쓸 수 있는 능력의 이름, 다섯 번째 구역은 분대원 목록이다.
+  const ability = parts[3] ?? "";
   $("ability-name").textContent = ability;
   // 자리는 그대로 두고 감춘다. 버튼이 생겼다 없어질 때 화면이 밀리지 않게.
   $("ability").toggleAttribute("data-off", !ability);
+  renderRoster(parts[4] ?? "");
   // 하단 바: 조준 중인 칸의 장부를 한 줄로.
   // 좁은 화면에서 잘려도 결과가 먼저 보이게 결과를 앞에 둔다.
-  const aim = pending ? [parts[3] ?? "", ...(parts[2] ?? "").split("\n").slice(1), (parts[2] ?? "").split("\n")[0]].filter((t) => t && t !== "—").join("  ").replace(/ {3,}/g, " ") : "";
+  const aim = pending ? [parts[2] ?? "", ...(parts[1] ?? "").split("\n").slice(1), (parts[1] ?? "").split("\n")[0]].filter((t) => t && t !== "—").join("  ").replace(/ {3,}/g, " ") : "";
   $("aim").textContent = pending ? aim || "이동" : "";
   $("confirm").hidden = !pending;
   $("seed").textContent = `시드 ${save.seed}`;
+}
+
+const rosterModal = $("roster-modal");
+let lastRosterRaw = "";
+function renderRoster(raw) {
+  if (raw === lastRosterRaw) return;
+  lastRosterRaw = raw;
+  const list = $("roster-list");
+  list.innerHTML = "";
+  for (const line of raw.split("\n").filter(Boolean)) {
+    const [x, y, sel, glyph, name, pips, ap, tag] = line.split("\t");
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = sel === "1" ? "roster-row selected" : "roster-row";
+    btn.innerHTML = `<span class="roster-glyph">${glyph}</span><span>${name}</span><span class="roster-pips">${pips}</span><span class="roster-ap">${ap}</span><span class="roster-tag">${tag || ""}</span>`;
+    btn.addEventListener("click", () => {
+      rosterModal.hidden = true;
+      if (skipIfPlaying()) return;
+      clearPending();
+      act(Number(x), Number(y));
+      draw();
+    });
+    list.appendChild(btn);
+  }
 }
 
 function persist() {
@@ -422,7 +447,27 @@ $("new").addEventListener("click", () => {
   newGame(crypto.getRandomValues(new Uint32Array(1))[0]);
 });
 
+$("btn-roster").addEventListener("click", () => {
+  rosterModal.hidden = !rosterModal.hidden;
+});
+$("roster-close").addEventListener("click", () => {
+  rosterModal.hidden = true;
+});
+rosterModal.addEventListener("click", (ev) => {
+  if (ev.target === rosterModal) rosterModal.hidden = true;
+});
+
 document.addEventListener("keydown", (ev) => {
+  if (ev.code === "Tab") {
+    ev.preventDefault();
+    rosterModal.hidden = !rosterModal.hidden;
+    return;
+  }
+  if (ev.code === "Escape" && !rosterModal.hidden) {
+    rosterModal.hidden = true;
+    return;
+  }
+  if (!rosterModal.hidden) return;
   if (ev.target instanceof HTMLButtonElement) return;
   if (ev.code === "Space" || ev.code === "Enter") {
     ev.preventDefault();

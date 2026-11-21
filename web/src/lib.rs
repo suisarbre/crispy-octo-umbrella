@@ -9,7 +9,7 @@ pub mod world;
 
 use std::collections::VecDeque;
 
-use sim::{dist, Class, Event, Game, Pos, Side, Tile, H, SIGHT, W};
+use sim::{dist, Event, Game, Pos, Side, Tile, H, SIGHT, W};
 
 /// 팔레트 번호. 실제 색은 www/main.js가 정한다.
 pub const BG: u32 = 0;
@@ -335,25 +335,40 @@ fn render(s: &mut State) {
             (false, Some(Side::Empire)) => "전원 사망".to_string(),
             _ => format!("라운드 {}", g.round),
         },
-        link_line(s),
         ledger,
         result,
         if can_act && g.can_burrow() { "잠복".to_string() } else { String::new() },
+        roster_text(s),
     ];
     s.text = sections.join(SEP);
 }
 
-/// 중계기에 누가 물려 있는지. 이 게임의 표식이다.
-fn link_line(s: &State) -> String {
-    let units = s.game.units.iter().zip(&s.view).filter(|(u, _)| u.side == Side::Empire);
-    let up = units.clone().any(|(u, v)| u.class == Class::Relay && v.hp > 0);
-    let mut line = String::from(if up { "& ──" } else { "×   " });
-    for (u, v) in units.filter(|(u, _)| u.class != Class::Relay) {
-        line.push(' ');
-        line.push(if v.hp > 0 { u.glyph() } else { '·' });
-    }
-    line.push_str(if up { "  연결" } else { "  두절" });
-    line
+/// 분대원 목록(토글 창용). 줄마다 x\ty\t선택\t글리프\t이름\t체력핍\t행동\t상태.
+fn roster_text(s: &State) -> String {
+    let g = &s.game;
+    let playing = s.playing();
+    g.units
+        .iter()
+        .enumerate()
+        .filter(|(i, u)| u.side == Side::Brood && s.view[*i].hp > 0)
+        .map(|(i, u)| {
+            let v = s.view[i];
+            let max = u.class.def().hp;
+            let hp = v.hp.max(0);
+            let pips: String = (0..max).map(|k| if k < hp { '●' } else { '○' }).collect();
+            let sel = if g.selected == Some(i) && !playing { 1 } else { 0 };
+            let ap = if playing { 0 } else { u.ap };
+            let tag = if v.burrowed {
+                "숨음"
+            } else if ap == 0 {
+                "완료"
+            } else {
+                ""
+            };
+            format!("{}\t{}\t{sel}\t{}\t{}\t{pips}\t행동 {ap}\t{tag}", v.pos.0, v.pos.1, u.glyph(), u.name())
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// 길게 눌렀을 때 뜨는 창의 내용. 보이는 유닛이 없는 칸이면 빈 문자열.
@@ -583,6 +598,7 @@ pub extern "C" fn fingerprint_lo() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sim::Class;
 
     fn glyph_at(p: Pos) -> u32 {
         state().frame[idx(p)] & 0x1fffff
@@ -596,7 +612,7 @@ mod tests {
         let parts: Vec<String> = state().text.split(SEP).map(String::from).collect();
         assert_eq!(parts.len(), 5);
         assert_eq!(parts[0], "라운드 1");
-        assert_eq!(parts[1], "& ── h h h s h  연결");
+        assert_eq!(parts[4].lines().count(), 4);
 
         // 선택은 보여줄 일이 없다. 길게 누르면 체력과 행동이 나온다.
         assert_eq!(click(1, 3), 1);
@@ -635,13 +651,13 @@ mod tests {
 
         // 잠복 개조 유닛을 고르면 능력이 뜨고, 쓰면 흙더미가 된다.
         assert_eq!(click(1, 9), 1);
-        assert!(state().text.ends_with("잠복"));
+        assert_eq!(state().text.split(SEP).nth(3), Some("잠복"));
         assert_eq!(ability(), 1);
         assert_eq!(advance() >> 16, BEAT_BURROW);
         assert_eq!(glyph_at((1, 9)), '∩' as u32);
         assert_eq!(advance(), 0);
         assert!(state().game.units[2].burrowed);
-        assert!(!state().text.ends_with("잠복"));
+        assert_eq!(state().text.split(SEP).nth(3), Some(""));
         assert_eq!(ability(), 0);
         inspect(1, 9);
         assert!(state().popup.ends_with("행동 1\n숨음"));
