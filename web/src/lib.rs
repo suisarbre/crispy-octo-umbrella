@@ -710,6 +710,9 @@ pub extern "C" fn fingerprint_lo() -> u32 {
 }
 
 #[cfg(test)]
+pub(crate) static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use sim::Class;
@@ -718,9 +721,10 @@ mod tests {
         state().frame[idx(p)] & 0x1fffff
     }
 
-    // 전역 상태 하나를 쓰므로 한 테스트 안에서 순서대로 본다.
+    // 전역 상태 하나를 쓰므로 테스트 간 경합을 막기 위해 잠금을 잡는다.
     #[test]
     fn playback() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         init(3);
         assert!(state().frame.iter().all(|&c| c != 0));
         let parts: Vec<String> = state().text.split(SEP).map(String::from).collect();

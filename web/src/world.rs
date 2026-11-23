@@ -679,6 +679,7 @@ mod tests {
 
     #[test]
     fn hex_world_screen_80x52() {
+        let _guard = crate::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         w_init(3);
         let s = state();
         let home = s.world.special().pos;
@@ -717,6 +718,7 @@ mod tests {
 
     #[test]
     fn world_clash_enters_battle_and_persists_casualties() {
+        let _guard = crate::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         w_init(5);
         let enemy_idx = state().world.forces.iter().position(|f| f.alive && f.side == Side::Empire).unwrap();
         state().world.clash = Some((0, enemy_idx));
