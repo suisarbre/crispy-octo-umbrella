@@ -776,6 +776,7 @@ mod tests {
             ambush: true,
             garrison: false,
             relay_cut: true,
+            biome: sim::BattleBiome::Forest,
             title: "테스트 교전".to_string(),
             tags: vec!["기습".to_string()],
         };

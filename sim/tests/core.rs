@@ -141,7 +141,11 @@ fn events_replay_to_the_same_positions() {
                         hp[target] -= dmg;
                         assert_eq!(killed, hp[target] <= 0);
                     }
-                    Event::Burrow { .. } | Event::Smoke { .. } | Event::Retreat { .. } => {}
+                    Event::Burrow { .. }
+                    | Event::Smoke { .. }
+                    | Event::Retreat { .. }
+                    | Event::Overwatch { .. }
+                    | Event::OverwatchTrigger { .. } => {}
                 }
             }
             for (i, u) in g.units.iter().enumerate() {

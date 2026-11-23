@@ -1,6 +1,7 @@
 // 80×52 육각(Hex) 월드 + 통합 전술 전투 화면.
 // 문명식 육각 지형·영토 경계·도로망(스크롤/다단계 줌/전체 보기/모바일 90도 회전),
 // 지휘망 1+2 제안, 보급권 정비/개조, 충돌 시 실제 전술 전투 진입과 복귀를 담당한다.
+import { createBattleView } from "./battle_view.js";
 
 const PALETTE = ["#0c0f11", "#38454a", "#cfcabb", "#63d6ac", "#e8823f", "#37725e"];
 const SAVE_KEY = "crispy-octo-umbrella/world-hex-v1";
@@ -32,8 +33,6 @@ const { instance } = await WebAssembly.instantiateStreaming(fetch("game.wasm"));
 const wasm = instance.exports;
 const W_COLS = wasm.w_cols();
 const W_ROWS = wasm.w_rows();
-const B_COLS = wasm.cols();
-const B_ROWS = wasm.rows();
 
 let save = { v: SAVE_VERSION, seed: 0, events: [] };
 let playing = false;
@@ -1521,35 +1520,44 @@ $("new").addEventListener("click", () => {
 });
 
 // ============================================================
-// 통합 전술 전투 뷰 (충돌 시 전환, 전투 종료 후 월드로 복귀)
+// 통합 전술 전투 뷰 (battle_view.js 공용 모듈 위임)
 // ============================================================
-const bCanvas = $("b-screen");
-const bCtx = bCanvas.getContext("2d");
 const bRosterModal = $("b-roster-modal");
-const B_FONT_PX = 20;
-const B_TERRAIN = new Set([0xb7, 0x2584, 0x2588, 0x2022, 0x2248, 0xd7, 0x25c1]);
-const B_BROOD = 3;
-const B_SNAP = 0.95;
-const BEAT_HIT = 3;
-const BEAT_KILL = 5;
 
-bCtx.font = `${B_FONT_PX}px ${FONT_FAMILY}`;
-const B_BASE_W = Math.ceil(bCtx.measureText("M").width) + 4;
-const B_BASE_H = Math.ceil(B_FONT_PX * 1.3);
+const battle = createBattleView({
+  wasm,
+  canvas: $("b-screen"),
+  mainEl: $("b-main"),
+  popEl: pop,
+  rosterModal: bRosterModal,
+  rosterList: $("b-roster-list"),
+  els: {
+    status: $("b-status"),
+    ledger: $("b-ledger"),
+    result: $("b-result"),
+    abilityBtn: $("b-ability"),
+    abilityName: $("b-ability-name"),
+    overwatchBtn: $("b-overwatch"),
+    retreatBtn: $("b-retreat"),
+    confirmBtn: $("b-confirm"),
+    aimEl: $("b-aim"),
+    endBtn: $("b-end"),
+    endBtn2: $("b-end2"),
+    headerEl: $("b-header"),
+    aiNoteEl: $("b-ai-note"),
+    returnBtn: $("b-return"),
+    returnBtnMob: $("b-return-mob"),
+  },
+  isActive: () => inBattle,
+});
 
-let bView = { rot: false, cols: B_COLS, rows: B_ROWS, cw: B_BASE_W, ch: B_BASE_H, font: B_FONT_PX };
-let bPending = null;
-let bLastPointer = "mouse";
-let bPlaying = false;
-let bSkip = false;
-let bLastRosterRaw = "";
-let bHoldTimer = 0;
-let bHoldStart = null;
-let bSwallowClick = false;
+function battleLayout() {
+  battle.layout();
+}
 
-const bToDisplay = (gx, gy) => (bView.rot ? [gy, B_COLS - 1 - gx] : [gx, gy]);
-const bToGame = (dx, dy) => (bView.rot ? [B_COLS - 1 - dy, dx] : [dx, dy]);
-const bFrameNow = () => new Uint32Array(wasm.memory.buffer, wasm.frame_ptr(), B_COLS * B_ROWS);
+function battleDraw() {
+  battle.draw();
+}
 
 function enterBattle() {
   if (playing || inBattle || !wasm.w_has_clash()) return;
@@ -1558,18 +1566,15 @@ function enterBattle() {
   refitModal.hidden = true;
   menu.hidden = true;
   inBattle = true;
-  bPending = null;
-  bPlaying = false;
-  bSkip = false;
-  bLastRosterRaw = "";
+  battle.reset();
   $("app").hidden = true;
   $("battle-app").hidden = false;
-  battleLayout();
-  battleDraw();
+  battle.layout();
+  battle.draw();
 }
 
 function finishBattleAndReturn() {
-  if (!inBattle || bPlaying || !wasm.battle_done()) return;
+  if (!inBattle || battle.isPlaying() || !wasm.battle_done()) return;
   if (!wasm.w_finish_battle()) return;
   const record = [
     wasm.w_last_battle_word(0),
@@ -1581,6 +1586,7 @@ function finishBattleAndReturn() {
   persist();
   inBattle = false;
   bRosterModal.hidden = true;
+  battle.hidePop();
   hidePop();
   $("battle-app").hidden = true;
   $("app").hidden = false;
@@ -1594,299 +1600,6 @@ function finishBattleAndReturn() {
 $("btn-enter-battle").addEventListener("click", enterBattle);
 $("b-return").addEventListener("click", finishBattleAndReturn);
 $("b-return-mob").addEventListener("click", finishBattleAndReturn);
-
-function battleLayout() {
-  const narrow = window.innerWidth < 700;
-  const rot = narrow && window.innerHeight > window.innerWidth;
-  const cols = rot ? B_ROWS : B_COLS;
-  const rows = rot ? B_COLS : B_ROWS;
-  let cw = B_BASE_W;
-  let ch = B_BASE_H;
-  let font = B_FONT_PX;
-  if (narrow) {
-    const avail = document.documentElement.clientWidth - 18;
-    cw = Math.min(28, Math.floor(avail / cols));
-    ch = rot ? cw + 2 : Math.round((cw * B_BASE_H) / B_BASE_W);
-    font = Math.min(22, Math.floor(Math.min(ch * 0.8, cw * 1.4)));
-  }
-  bView = { rot, cols, rows, cw, ch, font };
-  const dpr = window.devicePixelRatio || 1;
-  bCanvas.width = cols * cw * dpr;
-  bCanvas.height = rows * ch * dpr;
-  bCanvas.style.width = `${cols * cw}px`;
-  bCanvas.style.height = `${rows * ch}px`;
-  $("b-main").style.width = narrow ? "" : `${cols * cw}px`;
-  bCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
-}
-
-function battleKick(kind) {
-  if (stillness.matches || !bCanvas.animate) return;
-  const d = kind === BEAT_KILL ? 3 : 2;
-  bCanvas.animate(
-    [{ transform: `translate(${d}px, ${d - 1}px)` }, { transform: `translate(${-d + 1}px, -1px)` }, { transform: "none" }],
-    { duration: kind === BEAT_KILL ? 140 : 90, easing: "ease-out" },
-  );
-}
-
-async function battlePlay() {
-  if (bPlaying) return;
-  bPlaying = true;
-  bSkip = false;
-  for (;;) {
-    const beat = wasm.advance();
-    if (!beat) break;
-    const kind = beat >>> 16;
-    battleDraw();
-    if (kind === BEAT_HIT || kind === BEAT_KILL) battleKick(kind);
-    await sleep(beat & 0xffff);
-    if (bSkip) { wasm.skip(); break; }
-  }
-  bPlaying = false;
-  battleDraw();
-}
-
-function bSkipIfPlaying() {
-  if (bPlaying) bSkip = true;
-  return bPlaying;
-}
-
-function battleDraw() {
-  const frame = bFrameNow();
-  const { cw, ch } = bView;
-  bCtx.font = `${bView.font}px ${FONT_FAMILY}`;
-  bCtx.textAlign = "center";
-  bCtx.textBaseline = "middle";
-  for (let y = 0; y < B_ROWS; y++) {
-    for (let x = 0; x < B_COLS; x++) {
-      const c = frame[y * B_COLS + x];
-      const glyph = c & 0x1fffff;
-      const [dx, dy] = bToDisplay(x, y);
-      const px = dx * cw;
-      const py = dy * ch;
-      bCtx.fillStyle = PALETTE[c >>> 28];
-      bCtx.fillRect(px, py, cw, ch);
-      bCtx.fillStyle = PALETTE[(c >>> 24) & 0xf];
-      if (glyph === 0x2588) bCtx.fillRect(px, py, cw, ch);
-      else if (glyph === 0x2584) bCtx.fillRect(px + 2, py + ch / 2, cw - 4, ch / 2 - 2);
-      else bCtx.fillText(String.fromCodePoint(glyph), px + cw / 2, py + ch / 2 + 1);
-    }
-  }
-  if (bPending) {
-    const [dx, dy] = bToDisplay(bPending[0], bPending[1]);
-    bCtx.strokeStyle = PALETTE[2];
-    bCtx.lineWidth = 1;
-    bCtx.strokeRect(dx * cw + 0.5, dy * ch + 0.5, cw - 1, ch - 1);
-  }
-  const fl = wasm.damage_float();
-  if (fl) {
-    const [dx, dy] = bToDisplay((fl >>> 8) & 0xff, (fl >>> 16) & 0xff);
-    const label = fl & (1 << 24) ? "빗나감!" : `−${fl & 0xff}`;
-    const row = dy > 0 ? dy - 1 : dy + 1;
-    const w = Math.max(cw, bCtx.measureText(label).width + 6);
-    const left = Math.min(Math.max(dx * cw + cw / 2 - w / 2, 0), bView.cols * cw - w);
-    bCtx.fillStyle = PALETTE[0];
-    bCtx.fillRect(left, row * ch, w, ch);
-    bCtx.fillStyle = PALETTE[2];
-    bCtx.fillText(label, left + w / 2, row * ch + ch / 2 + 1);
-  }
-
-  const bytes = new Uint8Array(wasm.memory.buffer, wasm.text_ptr(), wasm.text_len());
-  const parts = new TextDecoder().decode(bytes).split("\u001f");
-  $("b-status").textContent = parts[0] ?? "";
-  $("b-ledger").textContent = parts[1] ?? "";
-  $("b-result").textContent = parts[2] ?? "";
-  const ability = parts[3] ?? "";
-  $("b-ability-name").textContent = ability;
-  $("b-ability").toggleAttribute("data-off", !ability);
-  $("b-retreat").toggleAttribute("data-off", !(parts[5] ?? ""));
-  $("b-header").textContent = parts[6] ?? "";
-  $("b-ai-note").textContent = parts[7] ?? "";
-  renderBattleRoster(parts[4] ?? "");
-
-  const done = !!wasm.battle_done();
-  $("b-return").hidden = !done;
-  $("b-return-mob").hidden = !done;
-  $("b-end").disabled = done;
-  $("b-end2").hidden = done;
-
-  const aim = bPending
-    ? [parts[2] ?? "", ...(parts[1] ?? "").split("\n").slice(1), (parts[1] ?? "").split("\n")[0]]
-        .filter((t) => t && t !== "—")
-        .join("  ")
-        .replace(/ {3,}/g, " ")
-    : "";
-  $("b-aim").textContent = done ? parts[0] ?? "" : bPending ? aim || "이동" : "";
-  $("b-confirm").hidden = done || !bPending;
-}
-
-function renderBattleRoster(raw) {
-  if (raw === bLastRosterRaw) return;
-  bLastRosterRaw = raw;
-  const list = $("b-roster-list");
-  list.innerHTML = "";
-  for (const line of raw.split("\n").filter(Boolean)) {
-    const [x, y, sel, glyph, name, pips, ap, tag] = line.split("\t");
-    const btn = document.createElement("button");
-    btn.type = "button";
-    btn.className = sel === "1" ? "roster-row selected" : "roster-row";
-    btn.innerHTML = `<span class="roster-glyph">${glyph}</span><span>${name}</span><span class="roster-pips">${pips}</span><span class="roster-ap">${ap}</span><span class="roster-tag">${tag || ""}</span>`;
-    btn.addEventListener("click", () => {
-      bRosterModal.hidden = true;
-      if (bSkipIfPlaying()) return;
-      bClearPending();
-      wasm.click(Number(x), Number(y));
-      battlePlay();
-    });
-    list.appendChild(btn);
-  }
-}
-
-function bCellAt(ev, snap) {
-  const r = bCanvas.getBoundingClientRect();
-  const fx = ((ev.clientX - r.left) / r.width) * bView.cols;
-  const fy = ((ev.clientY - r.top) / r.height) * bView.rows;
-  const cx = Math.floor(fx);
-  const cy = Math.floor(fy);
-  if (!snap) return bToGame(cx, cy);
-  const frame = bFrameNow();
-  const isUnit = (dx, dy) => {
-    if (dx < 0 || dy < 0 || dx >= bView.cols || dy >= bView.rows) return false;
-    const [gx, gy] = bToGame(dx, dy);
-    return !B_TERRAIN.has(frame[gy * B_COLS + gx] & 0x1fffff);
-  };
-  if (isUnit(cx, cy)) return bToGame(cx, cy);
-  let best = null;
-  let bestD = B_SNAP;
-  for (let oy = -1; oy <= 1; oy++) {
-    for (let ox = -1; ox <= 1; ox++) {
-      if (!isUnit(cx + ox, cy + oy)) continue;
-      const d = Math.hypot(fx - (cx + ox + 0.5), fy - (cy + oy + 0.5));
-      if (d < bestD) { bestD = d; best = [cx + ox, cy + oy]; }
-    }
-  }
-  return best ? bToGame(best[0], best[1]) : bToGame(cx, cy);
-}
-
-function bClearPending() { bPending = null; wasm.hover(-1, -1); }
-function bIsOwnUnit(x, y) {
-  const c = bFrameNow()[y * B_COLS + x];
-  const fg = (c >>> 24) & 0xf;
-  const bg = c >>> 28;
-  return !B_TERRAIN.has(c & 0x1fffff) && (fg === B_BROOD || bg === B_BROOD || fg === 1);
-}
-function bIsReachable(x, y) {
-  const c = bFrameNow()[y * B_COLS + x];
-  const glyph = c & 0x1fffff;
-  return (glyph === 0xb7 || glyph === 0x2022 || glyph === 0x25c1) && ((c >>> 24) & 0xf) === B_BROOD;
-}
-function bIsEnemyUnit(x, y) {
-  const c = bFrameNow()[y * B_COLS + x];
-  return !B_TERRAIN.has(c & 0x1fffff) && ((c >>> 24) & 0xf) === 4;
-}
-
-function bShowPop(x, y, clientX, clientY) {
-  const len = x >= 0 && y >= 0 && x < B_COLS && y < B_ROWS ? wasm.inspect(x, y) : 0;
-  if (!len) { pop.hidden = true; return false; }
-  pop.textContent = new TextDecoder().decode(new Uint8Array(wasm.memory.buffer, wasm.popup_ptr(), len));
-  pop.hidden = false;
-  const left = Math.min(Math.max(clientX + 12, 8), window.innerWidth - pop.offsetWidth - 8);
-  let top = clientY - pop.offsetHeight - 10;
-  if (top < 8) top = clientY + 16;
-  pop.style.left = `${left}px`;
-  pop.style.top = `${top}px`;
-  return true;
-}
-
-bCanvas.addEventListener("pointerdown", (ev) => {
-  bLastPointer = ev.pointerType;
-  bSwallowClick = false;
-  if (ev.pointerType === "mouse") return;
-  bHoldStart = [ev.clientX, ev.clientY];
-  clearTimeout(bHoldTimer);
-  bHoldTimer = setTimeout(() => {
-    const [x, y] = bCellAt(ev, true);
-    if (bShowPop(x, y, ev.clientX, ev.clientY)) bSwallowClick = true;
-  }, HOLD_MS);
-});
-bCanvas.addEventListener("pointerup", (ev) => { if (ev.pointerType !== "mouse") hidePop(); });
-bCanvas.addEventListener("pointercancel", () => { clearTimeout(bHoldTimer); hidePop(); });
-bCanvas.addEventListener("contextmenu", (ev) => ev.preventDefault());
-
-bCanvas.addEventListener("click", (ev) => {
-  if (bSwallowClick) { bSwallowClick = false; return; }
-  if (bSkipIfPlaying() || wasm.battle_done()) return;
-  if (bLastPointer === "mouse") {
-    const [x, y] = bCellAt(ev, false);
-    wasm.click(x, y);
-    battlePlay();
-    bShowPop(x, y, ev.clientX, ev.clientY);
-    battleDraw();
-    return;
-  }
-  const [x, y] = bCellAt(ev, true);
-  if (bPending && bPending[0] === x && bPending[1] === y) {
-    bClearPending(); wasm.click(x, y); battlePlay();
-  } else if (bIsOwnUnit(x, y)) {
-    bClearPending(); wasm.click(x, y); battlePlay();
-  } else if (bIsEnemyUnit(x, y) || bIsReachable(x, y)) {
-    bPending = [x, y]; wasm.hover(x, y);
-  } else {
-    bClearPending(); wasm.click(x, y); battlePlay();
-  }
-  battleDraw();
-});
-
-bCanvas.addEventListener("pointermove", (ev) => {
-  if (ev.pointerType !== "mouse") {
-    if (bHoldStart && Math.hypot(ev.clientX - bHoldStart[0], ev.clientY - bHoldStart[1]) > 10) {
-      clearTimeout(bHoldTimer); hidePop();
-    }
-    return;
-  }
-  bLastPointer = "mouse";
-  const [x, y] = bCellAt(ev, false);
-  bShowPop(x, y, ev.clientX, ev.clientY);
-  if (bPlaying) return;
-  wasm.hover(x, y);
-  battleDraw();
-});
-bCanvas.addEventListener("pointerleave", (ev) => {
-  if (ev.pointerType !== "mouse") return;
-  hidePop();
-  if (bPlaying) return;
-  wasm.hover(-1, -1);
-  battleDraw();
-});
-
-$("b-confirm").addEventListener("click", () => {
-  if (bSkipIfPlaying() || !bPending) return;
-  const [x, y] = bPending;
-  bClearPending();
-  wasm.click(x, y);
-  battlePlay();
-});
-function bEndTurn() {
-  if (bSkipIfPlaying() || wasm.battle_done()) return;
-  bClearPending();
-  wasm.end_turn();
-  battlePlay();
-}
-function bUseAbility() {
-  if ($("b-ability").hasAttribute("data-off") || bSkipIfPlaying()) return;
-  bClearPending();
-  wasm.ability();
-  battlePlay();
-}
-function bUseRetreat() {
-  if ($("b-retreat").hasAttribute("data-off") || bSkipIfPlaying()) return;
-  bClearPending();
-  wasm.retreat();
-  battlePlay();
-}
-$("b-end").addEventListener("click", bEndTurn);
-$("b-end2").addEventListener("click", bEndTurn);
-$("b-ability").addEventListener("click", bUseAbility);
-$("b-retreat").addEventListener("click", bUseRetreat);
 $("b-btn-roster").addEventListener("click", () => { bRosterModal.hidden = !bRosterModal.hidden; });
 $("b-roster-close").addEventListener("click", () => { bRosterModal.hidden = true; });
 bRosterModal.addEventListener("click", (ev) => { if (ev.target === bRosterModal) bRosterModal.hidden = true; });
@@ -1900,9 +1613,10 @@ document.addEventListener("keydown", (ev) => {
     if (ev.code === "Space" || ev.code === "Enter") {
       ev.preventDefault();
       if (wasm.battle_done()) finishBattleAndReturn();
-      else bEndTurn();
-    } else if (ev.code === "KeyB" && !$("b-ability").hasAttribute("data-off")) bUseAbility();
-    else if (ev.code === "KeyR" && !$("b-retreat").hasAttribute("data-off")) bUseRetreat();
+      else battle.endTurn();
+    } else if (ev.code === "KeyO" && !$("b-overwatch").hasAttribute("data-off")) battle.useOverwatch();
+    else if (ev.code === "KeyB" && !$("b-ability").hasAttribute("data-off")) battle.useAbility();
+    else if (ev.code === "KeyR" && !$("b-retreat").hasAttribute("data-off")) battle.useRetreat();
     return;
   }
 

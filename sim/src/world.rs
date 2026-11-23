@@ -7,7 +7,7 @@ use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
 use crate::rng::Rng;
-use crate::{BattleConfig, Class, Gene, Pos, Side};
+use crate::{BattleBiome, BattleConfig, Class, Gene, Pos, Side};
 
 /// 문명 5 보통(Standard) 크기 기준 80×52 육각 전구.
 pub const WW: i32 = 80;
@@ -1552,6 +1552,18 @@ impl World {
         if allied_ai > 0 { tags.push(format!("아군 일반군 +{allied_ai}")); }
 
         let special = self.squad.iter().enumerate().map(|(slot, t)| (slot, t.gene, t.hp)).collect();
+        let terrain_biome = match self.terrain_at(foe.pos) {
+            Terrain::Forest => BattleBiome::Forest,
+            Terrain::Hill => BattleBiome::Hill,
+            _ if self.has_road(foe.pos) => BattleBiome::Road,
+            _ => BattleBiome::Skirmish,
+        };
+        let biome = match self.site_index_at(foe.pos) {
+            Some(si) if matches!(self.sites[si].kind, SiteKind::Outpost | SiteKind::Relay | SiteKind::Landing | SiteKind::Hq(_)) => {
+                BattleBiome::Outpost
+            }
+            _ => terrain_biome,
+        };
 
         Some(BattleConfig {
             seed: bseed,
@@ -1561,6 +1573,7 @@ impl World {
             ambush,
             garrison,
             relay_cut,
+            biome,
             title,
             tags,
         })

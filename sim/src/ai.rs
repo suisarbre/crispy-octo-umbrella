@@ -431,12 +431,20 @@ pub fn run_allied_ai(g: &mut Game) {
 }
 
 fn run_inner(g: &mut Game, side: Side, only_ai: bool) {
+    // 새 턴이 시작된 진영의 이전 경계 태세를 해제한다.
+    for u in &mut g.units {
+        if u.side == side && (!only_ai || u.ai_controlled) {
+            u.overwatch = false;
+        }
+    }
+
     let mine = |g: &Game, i: usize| {
         let u = &g.units[i];
         u.side == side && u.alive() && u.ap > 0 && (!only_ai || u.ai_controlled)
     };
     let n = g.units.len();
     let mut done = vec![false; n];
+    let shared = side == Side::Brood || g.network_up();
 
     // 분대가 한 머리로 둔다: 매번 분대 전체에서 이득이 가장 큰 행동 하나.
     while g.outcome.is_none() && (side == Side::Brood || g.network_up()) {
@@ -449,23 +457,43 @@ fn run_inner(g: &mut Game, side: Side, only_ai: bool) {
                 }
             }
         }
-        let Some((i, act, _)) = pick else { return };
+        let Some((i, act, _)) = pick else { break };
         if !apply(g, i, act) {
             done[i] = true;
         }
     }
 
     // 중계 두절: 각자, 번호 순서대로, 자기 눈으로.
-    for i in 0..n {
-        while g.outcome.is_none() && mine(g, i) {
-            let picked = Plan::new(g, side, Some(i)).best_action(i);
-            match picked {
-                Some((act, gain)) if gain > 0 => {
-                    if !apply(g, i, act) {
-                        break;
+    if !(side == Side::Brood || g.network_up()) {
+        for i in 0..n {
+            while g.outcome.is_none() && mine(g, i) {
+                let picked = Plan::new(g, side, Some(i)).best_action(i);
+                match picked {
+                    Some((act, gain)) if gain > 0 => {
+                        if !apply(g, i, act) {
+                            break;
+                        }
                     }
+                    _ => break,
                 }
-                _ => break,
+            }
+        }
+    }
+
+    // 남은 행동이 있는 전투 유닛은 가까운 위협 방향을 향해 경계 태세로 마무리한다.
+    if g.outcome.is_none() {
+        for i in 0..n {
+            if !mine(g, i) {
+                continue;
+            }
+            let u = &g.units[i];
+            if u.burrowed || u.overwatch || u.range() == 0 || u.class == Class::Relay {
+                continue;
+            }
+            let plan = Plan::new(g, side, if shared && (side == Side::Brood || g.network_up()) { None } else { Some(i) });
+            let watch_dist = u.range() + 6;
+            if plan.known.iter().any(|k| dist(u.pos, k.pos) <= watch_dist) {
+                g.set_overwatch(i);
             }
         }
     }

@@ -120,7 +120,8 @@
   #b-ledger { min-height:7.5em; }
   #b-result { color:var(--brood); }
   #b-nav { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
-  #b-ability[data-off], #b-retreat[data-off] { visibility:hidden; }
+  #b-ability[data-off], #b-overwatch[data-off], #b-retreat[data-off] { visibility:hidden; }
+  #b-overwatch { border-color:var(--brood); color:var(--brood); }
   #b-retreat { border-color:var(--empire); color:var(--empire); }
   #b-return { border-color:var(--brood); color:var(--bg); background:var(--brood); font-weight:bold; }
   #b-return[hidden] { display:none; }
@@ -179,7 +180,7 @@
     #b-main { width:auto; }
     #b-screen { margin:0 auto; }
     #b-end { display:none; }
-    #b-ability { border-color:var(--brood); color:var(--brood); }
+    #b-ability, #b-overwatch { border-color:var(--brood); color:var(--brood); }
     #b-nav button { min-height:40px; }
     #b-bar { display:flex; position:fixed; left:0; right:0; bottom:0; gap:8px; align-items:center; padding:8px; background:var(--bg); border-top:1px solid var(--dim); z-index:12; }
     #b-aim { flex:1; min-width:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
@@ -301,6 +302,7 @@
       <p id="b-result"></p>
     </section>
     <nav id="b-nav">
+      <button id="b-overwatch" data-off type="button">경계<kbd>O</kbd></button>
       <button id="b-ability" data-off type="button"><span id="b-ability-name"></span><kbd>B</kbd></button>
       <button id="b-retreat" data-off type="button">후퇴<kbd>R</kbd></button>
       <button id="b-end" type="button">턴 종료<kbd>Space</kbd></button>
