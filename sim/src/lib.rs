@@ -1481,7 +1481,7 @@ impl Game {
         };
         if hit {
             self.units[t].hp -= dmg;
-            let tag = if crit { "치명!" } else { "적중" };
+            let tag = if crit { "치명 적중!" } else { "적중" };
             if self.units[t].alive() {
                 self.log.push(format!("{sn} → {tn}  {}%  {tag}, 피해 {dmg}", shot.chance));
             } else {
