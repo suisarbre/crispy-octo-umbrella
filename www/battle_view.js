@@ -14,6 +14,7 @@ const BEAT_SMOKE = 7;
 const BEAT_RETREAT = 8;
 const BEAT_OVERWATCH = 9;
 const BEAT_OW_TRIGGER = 10;
+const BEAT_HUNKER = 11;
 
 const SNAP = 0.95;
 const HOLD_MS = 350;
@@ -28,18 +29,25 @@ export function createBattleView(cfg) {
   const ROWS = wasm.rows();
   const isActive = cfg.isActive ?? (() => true);
 
-  let view = { rot: false, cols: COLS, rows: ROWS, cw: 28, ch: 30, font: 17 };
+  let view = { rot: false, cols: COLS, rows: ROWS, cw: 26, ch: 28, font: 16 };
   let pending = null;
   let hoverCell = null;
   let lastPointer = "mouse";
   let playing = false;
   let skipRequested = false;
   let lastRosterRaw = "";
+  let lastTargetsKey = "";
+  let lastBadgeRaw = "";
   let holdTimer = 0;
   let holdStart = null;
   let swallowClick = false;
 
-  // 실시간 캔버스 애니메이션 FX (클릭 리액션, ⊘ 불가 흔들림, 트레이서/충격파/스파크, 중계 펄스, 경계 슬로모)
+  // XCOM 조준 모드 상태 (1번/공격 버튼 진입, Tab으로 표적 순환, 1/Enter/확정으로 발사)
+  let aimMode = false;
+  let aimIndex = 0;
+  let currentTargets = [];
+
+  // 실시간 캔버스 애니메이션 FX (클릭 리액션, ⊘ 불가 흔들림, 트레이서/충격파/스파크, 중계 펄스, 경계 슬로모, 엄호)
   let fxList = [];
   let fxRaf = 0;
 
@@ -80,6 +88,7 @@ export function createBattleView(cfg) {
         flanked: !!(w1 & (1 << 28)),
         canRetreatHere: !!(w1 & (1 << 29)),
         isOverwatch: !!(w1 & (1 << 30)),
+        isHunkered: !!(w1 & (1 << 31)),
       });
     }
     return out;
@@ -225,6 +234,14 @@ export function createBattleView(cfg) {
         lockDur: durMs,
         dur: durMs + 460,
       });
+    } else if (kind === BEAT_HUNKER && bfx[0] === 11) {
+      pushFx({
+        kind: "hunker",
+        x: bfx[1],
+        y: bfx[2],
+        color: PALETTE[bfx[3]] || PALETTE[2],
+        dur: 340,
+      });
     }
   }
 
@@ -232,6 +249,7 @@ export function createBattleView(cfg) {
     if (playing) return;
     playing = true;
     skipRequested = false;
+    aimMode = false;
     for (;;) {
       const beat = wasm.advance();
       if (!beat) break;
@@ -247,6 +265,9 @@ export function createBattleView(cfg) {
       }
     }
     playing = false;
+    if (!wasm.battle_done()) {
+      ensureSelected(true);
+    }
     draw();
     if (wasm.battle_done() && cfg.onDone) cfg.onDone();
   }
@@ -265,15 +286,22 @@ export function createBattleView(cfg) {
     let ch;
     let font;
     if (narrow) {
-      const avail = document.documentElement.clientWidth - 18;
-      cw = Math.max(16, Math.min(30, Math.floor(avail / cols)));
-      ch = rot ? cw + 2 : Math.round(cw * 1.12);
-      font = Math.max(12, Math.min(20, Math.floor(Math.min(ch * 0.56, cw * 0.72))));
+      const availW = document.documentElement.clientWidth - 16;
+      const availH = Math.max(240, window.innerHeight - 190);
+      const cwW = Math.floor(availW / cols);
+      const cwH = Math.floor(availH / (rows * (rot ? 1.06 : 1.1)));
+      cw = Math.max(14, Math.min(28, cwW, cwH));
+      ch = rot ? cw + 1 : Math.round(cw * 1.1);
+      font = Math.max(11, Math.min(18, Math.floor(Math.min(ch * 0.56, cw * 0.72))));
     } else {
-      const availW = Math.min(860, document.documentElement.clientWidth - 36);
-      cw = Math.max(22, Math.min(30, Math.floor(availW / cols)));
-      ch = Math.round(cw * 1.1);
-      font = Math.max(13, Math.min(18, Math.round(cw * 0.6)));
+      // 상단 바(~38px) + 하단 XCOM HUD(~96px) + 여백을 제외한 1화면 높이와 폭에 딱 맞춘다.
+      const availW = Math.min(920, document.documentElement.clientWidth - 28);
+      const availH = Math.max(260, window.innerHeight - 156);
+      const cwW = Math.floor(availW / cols);
+      const cwH = Math.floor(availH / (rows * 1.08));
+      cw = Math.max(18, Math.min(31, cwW, cwH));
+      ch = Math.round(cw * 1.08);
+      font = Math.max(12, Math.min(18, Math.round(cw * 0.6)));
     }
     view = { rot, cols, rows, cw, ch, font };
     const dpr = window.devicePixelRatio || 1;
@@ -704,7 +732,8 @@ export function createBattleView(cfg) {
       }
     }
 
-    // 8. 유닛 카운터 + 인라인 체력 핍 + AP 점 + 방패병 90° 방패 호
+    // 8. 유닛 카운터 + 인라인 체력 핍 + AP 점 + 경계/엄호 배지 + 방패병 90° 방패 호
+    const lockedTarget = aimMode && !playing && currentTargets[aimIndex] ? currentTargets[aimIndex] : null;
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
     for (const u of units) {
@@ -714,9 +743,10 @@ export function createBattleView(cfg) {
       const cx = px + cw / 2;
       const cy = py + ch * 0.44;
       const pad = 2;
+      const isLocked = !!(lockedTarget && u.isEmpire && u.x === lockedTarget.x && u.y === lockedTarget.y);
 
-      // 호버된 적의 지형 엄폐 방패 표시
-      if (u.isEmpire && u.hovered) {
+      // 호버 또는 조준 잠금된 적의 지형 엄폐 방패 표시
+      if (u.isEmpire && (u.hovered || isLocked)) {
         const ucov = (meta[u.y * COLS + u.x] >>> 8) & 0xff;
         drawCoverShields(u.x, u.y, ucov, PALETTE[4], true);
       }
@@ -733,7 +763,7 @@ export function createBattleView(cfg) {
         glyphCol = PALETTE[0];
         solid = true;
       } else if (u.isEmpire) {
-        if (u.hovered) {
+        if (u.hovered || isLocked) {
           bgFill = PALETTE[4];
           borderCol = PALETTE[4];
           glyphCol = PALETTE[0];
@@ -762,6 +792,10 @@ export function createBattleView(cfg) {
           bgFill = "rgba(99, 214, 172, 0.14)";
           borderCol = PALETTE[3];
           glyphCol = PALETTE[3];
+        } else if (u.isHunkered) {
+          bgFill = "rgba(207, 202, 187, 0.15)";
+          borderCol = PALETTE[2];
+          glyphCol = PALETTE[2];
         } else if (u.ap > 0 || playing) {
           bgFill = "rgba(99, 214, 172, 0.13)";
           borderCol = "rgba(99, 214, 172, 0.75)";
@@ -790,22 +824,30 @@ export function createBattleView(cfg) {
         ctx.fillStyle = bgFill;
         ctx.fill();
         ctx.strokeStyle = borderCol;
-        ctx.lineWidth = u.inFireLane || u.hovered || u.isOverwatch ? 1.5 : 1.1;
+        ctx.lineWidth = u.inFireLane || u.hovered || isLocked || u.isOverwatch ? 1.5 : 1.1;
         ctx.stroke();
       } else {
-        // 아군: 깔끔한 사각 단말 프레임 (잠복 중이면 점선)
+        // 아군: 깔끔한 사각 단말 프레임 (잠복 중이면 점선, 엄호 중이면 이중 보강 프레임)
         ctx.fillStyle = bgFill;
         ctx.fillRect(px + pad, py + pad, cw - pad * 2, ch - pad * 2);
         ctx.strokeStyle = borderCol;
-        ctx.lineWidth = u.isSelected || u.isOverwatch ? 1.5 : 1.1;
+        ctx.lineWidth = u.isSelected || u.isOverwatch || u.isHunkered ? 1.5 : 1.1;
         if (u.isBurrowed) ctx.setLineDash([3, 2]);
         ctx.strokeRect(px + pad + 0.5, py + pad + 0.5, cw - pad * 2 - 1, ch - pad * 2 - 1);
         ctx.setLineDash([]);
+        if (u.isHunkered) {
+          ctx.strokeStyle = solid ? "rgba(12, 15, 17, 0.48)" : "rgba(207, 202, 187, 0.52)";
+          ctx.lineWidth = 1;
+          ctx.strokeRect(px + pad + 2.5, py + pad + 2.5, cw - pad * 2 - 5, ch - pad * 2 - 5);
+        }
       }
       ctx.restore();
 
-      // 측면 노출(Flanked, cover == 0) 적 강조 코너 브래킷 (민트색)
-      if (u.isEmpire && u.flanked && !u.struck) {
+      // XCOM 조준 모드 잠금 표적 강조 브래킷
+      if (isLocked && !u.struck) {
+        drawCornerBrackets(px, py, cw, ch, PALETTE[2], -1, 6, 2);
+      } else if (u.isEmpire && u.flanked && !u.struck) {
+        // 측면 노출(Flanked, cover == 0) 적 강조 코너 브래킷 (민트색)
         drawCornerBrackets(px, py, cw, ch, PALETTE[3], 0.5, 5, 1.8);
       }
       // 선택 아군 강조 코너 브래킷
@@ -863,7 +905,7 @@ export function createBattleView(cfg) {
         }
       }
 
-      // 경계 태세(Overwatch) 조준경 배지 (좌상단 조준원 + 십자선)
+      // 경계 태세(Overwatch) 조준경 배지 / 엄호(Hunker Down) 방패 문장 배지 (좌상단)
       if (u.isOverwatch) {
         const owCol = solid ? PALETTE[0] : u.isEmpire ? PALETTE[4] : u.isAi ? PALETTE[5] : PALETTE[3];
         const ox = px + pad + 4.8;
@@ -881,6 +923,25 @@ export function createBattleView(cfg) {
         ctx.lineTo(ox, oy - 1.7);
         ctx.moveTo(ox, oy + 1.7);
         ctx.lineTo(ox, oy + 4.4);
+        ctx.stroke();
+        ctx.restore();
+      } else if (u.isHunkered) {
+        const hkCol = solid ? PALETTE[0] : PALETTE[2];
+        const ox = px + pad + 4.8;
+        const oy = py + pad + 4.8;
+        ctx.save();
+        ctx.strokeStyle = hkCol;
+        ctx.fillStyle = solid ? "rgba(12, 15, 17, 0.25)" : "rgba(207, 202, 187, 0.22)";
+        ctx.lineWidth = 1.25;
+        ctx.beginPath();
+        ctx.moveTo(ox, oy - 3.4);
+        ctx.lineTo(ox + 3.2, oy - 2.0);
+        ctx.lineTo(ox + 2.6, oy + 1.4);
+        ctx.lineTo(ox, oy + 3.6);
+        ctx.lineTo(ox - 2.6, oy + 1.4);
+        ctx.lineTo(ox - 3.2, oy - 2.0);
+        ctx.closePath();
+        ctx.fill();
         ctx.stroke();
         ctx.restore();
       }
@@ -1314,6 +1375,27 @@ export function createBattleView(cfg) {
         ctx.textAlign = "center";
         ctx.textBaseline = "middle";
         ctx.fillText("경계", cx, cy - cellR - 6 - t * 8);
+      } else if (f.kind === "hunker") {
+        // 엄호 진입 시 수축하는 방패 육각형 + "엄호 +30" 마이크로 태그
+        const [cx, cy] = cellCenter(f.x, f.y);
+        const rad = cellR * (1.28 - t * 0.55);
+        ctx.strokeStyle = f.color;
+        ctx.globalAlpha = 1 - t * 0.85;
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(cx, cy - rad);
+        ctx.lineTo(cx + rad * 0.88, cy - rad * 0.48);
+        ctx.lineTo(cx + rad * 0.72, cy + rad * 0.45);
+        ctx.lineTo(cx, cy + rad);
+        ctx.lineTo(cx - rad * 0.72, cy + rad * 0.45);
+        ctx.lineTo(cx - rad * 0.88, cy - rad * 0.48);
+        ctx.closePath();
+        ctx.stroke();
+        ctx.fillStyle = f.color;
+        ctx.font = `bold 10px ${FONT_FAMILY}`;
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        ctx.fillText("엄호 +30", cx, cy - cellR - 6 - t * 8);
       } else if (f.kind === "relay_link") {
         // 제국 턴 개시 시 중계기(&)에서 제국 분대로 퍼지는 동기화 파동
         ctx.strokeStyle = PALETTE[4];
@@ -1383,41 +1465,233 @@ export function createBattleView(cfg) {
     }
   }
 
+  let hoveredChipIndex = -1;
+
+  function hpPips(hp, maxHp) {
+    const n = Math.max(0, Math.min(hp, maxHp));
+    return "●".repeat(n) + "○".repeat(Math.max(0, maxHp - n));
+  }
+
+  function parseTargets(raw) {
+    if (!raw) return [];
+    const out = [];
+    for (const line of raw.split("\n")) {
+      if (!line) continue;
+      const [x, y, glyph, name, hp, maxHp, chance, aim, cover, falloff] = line.split("\t");
+      out.push({
+        x: Number(x),
+        y: Number(y),
+        glyph,
+        name,
+        hp: Number(hp),
+        maxHp: Number(maxHp),
+        chance: Number(chance),
+        aim: Number(aim),
+        cover: Number(cover),
+        falloff: Number(falloff),
+      });
+    }
+    return out;
+  }
+
+  function formatTargetReadout(t) {
+    const cov = t.cover > 0 ? `−${t.cover}` : "0";
+    const fall = t.falloff > 0 ? `−${t.falloff}` : "0";
+    const detail = `${t.glyph} ${t.name} ${hpPips(t.hp, t.maxHp)} ${t.hp}/${t.maxHp} │ 조준 ${t.aim} · 엄폐 ${cov} · 거리 ${fall}`;
+    const result = t.cover === 0 ? `명중 ${t.chance}% ◈ 측면` : `명중 ${t.chance}%`;
+    return [detail, result];
+  }
+
+  function renderTargetChips(rawTargets, done) {
+    if (!els.targetList) return;
+    const key = `${rawTargets}|${playing ? 1 : 0}|${done ? 1 : 0}`;
+    if (key !== lastTargetsKey) {
+      lastTargetsKey = key;
+      hoveredChipIndex = -1;
+      els.targetList.innerHTML = "";
+      if (playing) {
+        const span = document.createElement("span");
+        span.className = "tgt-empty";
+        span.textContent = "교전 진행 중…";
+        els.targetList.appendChild(span);
+      } else if (done) {
+        const span = document.createElement("span");
+        span.className = "tgt-empty";
+        span.textContent = "교전 종료";
+        els.targetList.appendChild(span);
+      } else if (currentTargets.length === 0) {
+        const span = document.createElement("span");
+        span.className = "tgt-empty";
+        span.textContent = "사선 내 적 없음";
+        els.targetList.appendChild(span);
+      } else {
+        currentTargets.forEach((t, idx) => {
+          const btn = document.createElement("button");
+          btn.type = "button";
+          btn.className = `tgt-chip${t.cover === 0 ? " flanked" : ""}`;
+          btn.dataset.idx = String(idx);
+          btn.title = `${t.name} (체력 ${t.hp}/${t.maxHp}) · 클릭해 조준 / 재클릭 발사`;
+          btn.innerHTML = `<span>${t.glyph} ${t.name}</span><span class="tgt-hp">${hpPips(t.hp, t.maxHp)}</span><span class="tgt-pct">${t.chance}%</span>`;
+          btn.addEventListener("mouseenter", () => {
+            if (playing || done) return;
+            hoveredChipIndex = idx;
+            wasm.hover(t.x, t.y);
+            draw();
+          });
+          btn.addEventListener("mouseleave", () => {
+            if (hoveredChipIndex === idx) hoveredChipIndex = -1;
+            if (playing || done) return;
+            if (aimMode && currentTargets[aimIndex]) {
+              wasm.hover(currentTargets[aimIndex].x, currentTargets[aimIndex].y);
+            } else {
+              wasm.hover(-1, -1);
+            }
+            draw();
+          });
+          btn.addEventListener("click", (ev) => {
+            ev.currentTarget.blur();
+            if (skipIfPlaying() || wasm.battle_done()) return;
+            if (aimMode && aimIndex === idx) {
+              confirmFire();
+            } else {
+              selectAimTarget(idx);
+            }
+          });
+          els.targetList.appendChild(btn);
+        });
+      }
+    }
+
+    // DOM을 재생성하지 않고 잠금 상태(.active)만 부드럽게 갱신한다.
+    const chips = els.targetList.querySelectorAll(".tgt-chip");
+    chips.forEach((el, idx) => {
+      el.classList.toggle("active", aimMode && idx === aimIndex);
+    });
+  }
+
+  function renderUnitBadge(raw) {
+    if (!els.unitBadge || raw === lastBadgeRaw) return 0;
+    lastBadgeRaw = raw;
+    const [glyph, name, hpStr, maxStr, apStr, tag, , , readyStr] = (raw || "").split("\t");
+    if (!glyph) {
+      els.unitBadge.innerHTML = `<span class="u-ap">대기</span>`;
+      return Number(readyStr || 0);
+    }
+    const hp = Number(hpStr || 0);
+    const maxHp = Number(maxStr || 0);
+    const ap = Number(apStr || 0);
+    const tagHtml = tag ? `<span class="u-tag">[${tag}]</span>` : "";
+    els.unitBadge.innerHTML = `<span class="u-g">${glyph}</span><span>${name}</span><span class="u-hp">${hpPips(hp, maxHp)}</span><span class="u-ap">AP ${ap}</span>${tagHtml}`;
+    return Number(readyStr || 0);
+  }
+
   function draw() {
-    drawCanvasOnly();
     const bytes = new Uint8Array(wasm.memory.buffer, wasm.text_ptr(), wasm.text_len());
     const parts = new TextDecoder().decode(bytes).split("\u001f");
+    const done = !!wasm.battle_done();
+
+    // 사선 내 표적 파싱 및 XCOM 조준 모드 동기화 (캔버스 그리기 전에 완료)
+    const rawTargets = parts[10] ?? "";
+    currentTargets = playing || done ? [] : parseTargets(rawTargets);
+    if (playing || done || currentTargets.length === 0) {
+      aimMode = false;
+      aimIndex = 0;
+    } else if (aimIndex >= currentTargets.length) {
+      aimIndex = 0;
+    }
+
+    drawCanvasOnly();
 
     const setText = (el, val) => {
       if (el && el.textContent !== val) el.textContent = val;
     };
     setText(els.status, parts[0] ?? "");
-    setText(els.ledger, parts[1] ?? "");
-    setText(els.result, parts[2] ?? "");
-
-    const ability = parts[3] ?? "";
-    setText(els.abilityName, ability);
-    if (els.abilityBtn) els.abilityBtn.toggleAttribute("data-off", !ability);
-    if (els.retreatBtn) els.retreatBtn.toggleAttribute("data-off", !(parts[5] ?? ""));
-    if (els.overwatchBtn) els.overwatchBtn.toggleAttribute("data-off", !(parts[8] ?? ""));
     setText(els.headerEl, parts[6] ?? "");
     setText(els.aiNoteEl, parts[7] ?? "");
     renderRoster(parts[4] ?? "");
+    renderTargetChips(rawTargets, done);
 
-    const done = !!wasm.battle_done();
+    const selRaw = parts[11] ?? "";
+    const readyCount = Number((selRaw.split("\t")[8]) || 0);
+    renderUnitBadge(selRaw);
+
+    // 상단 스트립 우측 명중률/체력 리드아웃 (단일 줄 컴팩트 요약)
+    const activeChip =
+      hoveredChipIndex >= 0 && currentTargets[hoveredChipIndex]
+        ? currentTargets[hoveredChipIndex]
+        : aimMode && currentTargets[aimIndex]
+        ? currentTargets[aimIndex]
+        : null;
+    let detail = "";
+    let result = "";
+    if (activeChip && !playing && !done) {
+      [detail, result] = formatTargetReadout(activeChip);
+    } else if (parts[2] && !playing && !done) {
+      const lines = (parts[1] ?? "")
+        .split("\n")
+        .map((l) => l.replace(/\s+/g, " ").trim())
+        .filter(Boolean);
+      const matchedTarget = hoverCell
+        ? currentTargets.find((t) => t.x === hoverCell[0] && t.y === hoverCell[1])
+        : null;
+      if (matchedTarget) {
+        [detail, result] = formatTargetReadout(matchedTarget);
+      } else {
+        detail = lines.join(" · ");
+        result = parts[2].replace(/\s+/g, " ").trim();
+      }
+    } else if (pending && !playing && !done) {
+      detail = "이동 예정 · 실행 또는 재탭으로 확정";
+    } else if (done) {
+      detail = parts[0] ?? "";
+    } else if (!playing) {
+      detail =
+        currentTargets.length > 0
+          ? "표적 클릭·[1] 조준 · [Tab] 전환"
+          : "이동 타일 클릭 · [Tab] 분대원 전환";
+    }
+    setText(els.readoutDetail, detail);
+    setText(els.readoutResult, result);
+
+    // XCOM 조준 모드 UI 상태
+    if (els.hudEl) els.hudEl.classList.toggle("aim-mode", aimMode);
+    if (els.aimActions) els.aimActions.hidden = !aimMode || playing || done;
+
+    // 액션 바 버튼 활성/비활성 및 표시 상태
+    const canAttack = !playing && !done && currentTargets.length > 0;
+    const canOverwatch = !playing && !done && !!(parts[8] ?? "");
+    const canHunker = !playing && !done && !!(parts[9] ?? "");
+    const ability = parts[3] ?? "";
+    const canBurrow = !playing && !done && !!ability;
+    const canRetreat = !playing && !done && !!(parts[5] ?? "");
+
+    if (els.attackBtn) {
+      els.attackBtn.disabled = !canAttack;
+      els.attackBtn.classList.toggle("ready", canAttack && !aimMode);
+      els.attackBtn.classList.toggle("active", aimMode);
+    }
+    setText(els.attackCount, currentTargets.length > 0 ? `(${currentTargets.length})` : "");
+    if (els.overwatchBtn) els.overwatchBtn.disabled = !canOverwatch;
+    if (els.hunkerBtn) els.hunkerBtn.disabled = !canHunker;
+    const burrowBtn = els.burrowBtn || els.abilityBtn;
+    if (burrowBtn) {
+      burrowBtn.hidden = !ability;
+      burrowBtn.disabled = !canBurrow;
+    }
+    if (els.retreatBtn) {
+      els.retreatBtn.hidden = !(parts[5] ?? "");
+      els.retreatBtn.disabled = !canRetreat;
+    }
+    if (els.prevUnitBtn) els.prevUnitBtn.disabled = playing || done;
+    if (els.nextUnitBtn) els.nextUnitBtn.disabled = playing || done;
+
     if (els.returnBtn) els.returnBtn.hidden = !done;
-    if (els.returnBtnMob) els.returnBtnMob.hidden = !done;
-    if (els.endBtn && els.returnBtn) els.endBtn.disabled = done;
-    if (els.endBtn2 && els.returnBtnMob) els.endBtn2.hidden = done;
-
-    const aim = pending
-      ? [parts[2] ?? "", ...(parts[1] ?? "").split("\n").slice(1), (parts[1] ?? "").split("\n")[0]]
-          .filter((t) => t && t !== "—")
-          .join("  ")
-          .replace(/ {3,}/g, " ")
-      : "";
-    if (els.aimEl) els.aimEl.textContent = done && els.returnBtn ? parts[0] ?? "" : pending ? aim || "이동" : "";
-    if (els.confirmBtn) els.confirmBtn.hidden = (done && !!els.returnBtn) || !pending;
+    if (els.endBtn) {
+      els.endBtn.hidden = done && !!els.returnBtn;
+      els.endBtn.disabled = playing || done;
+      els.endBtn.classList.toggle("all-done", !playing && !done && readyCount === 0);
+    }
+    if (els.confirmBtn) els.confirmBtn.hidden = playing || done || !pending;
     if (els.seedEl && cfg.getSeed) els.seedEl.textContent = `시드 ${cfg.getSeed()}`;
   }
 
@@ -1435,6 +1709,7 @@ export function createBattleView(cfg) {
         if (rosterModal) rosterModal.hidden = true;
         if (skipIfPlaying()) return;
         clearPending();
+        aimMode = false;
         act(Number(x), Number(y));
         draw();
       });
@@ -1481,8 +1756,84 @@ export function createBattleView(cfg) {
     return best ? toGame(best[0], best[1]) : toGame(cx, cy);
   }
 
+  function ensureSelected(silent = false) {
+    if (playing || wasm.battle_done()) return false;
+    const res = wasm.ensure_selected();
+    if (res & (1 << 16)) {
+      const x = res & 0xff;
+      const y = (res >>> 8) & 0xff;
+      if (cfg.onEvent) cfg.onEvent([x, y]);
+      if (!silent) draw();
+      return true;
+    }
+    return false;
+  }
+
+  function cycleUnit(dir = 1) {
+    if (skipIfPlaying() || wasm.battle_done()) return;
+    clearPending();
+    aimMode = false;
+    hoveredChipIndex = -1;
+    const res = wasm.select_next(dir >= 0 ? 1 : -1);
+    if (res & (1 << 16)) {
+      const x = res & 0xff;
+      const y = (res >>> 8) & 0xff;
+      if (cfg.onEvent) cfg.onEvent([x, y]);
+      pushFx({ kind: "pulse", x, y, color: PALETTE[3], dur: 260 });
+    }
+    draw();
+  }
+
+  function selectAimTarget(idx) {
+    if (playing || wasm.battle_done() || currentTargets.length === 0) return;
+    const n = currentTargets.length;
+    aimIndex = ((idx % n) + n) % n;
+    aimMode = true;
+    pending = null;
+    const t = currentTargets[aimIndex];
+    wasm.hover(t.x, t.y);
+    pushFx({ kind: "pulse", x: t.x, y: t.y, color: PALETTE[4], dur: 240 });
+    draw();
+  }
+
+  function cycleTarget(dir = 1) {
+    if (!aimMode || currentTargets.length === 0) return;
+    selectAimTarget(aimIndex + (dir >= 0 ? 1 : -1));
+  }
+
+  function cancelAim() {
+    if (!aimMode) return;
+    aimMode = false;
+    hoveredChipIndex = -1;
+    if (hoverCell) wasm.hover(hoverCell[0], hoverCell[1]);
+    else wasm.hover(-1, -1);
+    draw();
+  }
+
+  function confirmFire() {
+    if (skipIfPlaying() || wasm.battle_done()) return;
+    if (!aimMode || !currentTargets[aimIndex]) return;
+    const t = currentTargets[aimIndex];
+    aimMode = false;
+    hoveredChipIndex = -1;
+    pending = null;
+    act(t.x, t.y);
+  }
+
+  function pressAttack() {
+    if (skipIfPlaying() || wasm.battle_done()) return;
+    if (currentTargets.length === 0) return;
+    if (aimMode) {
+      confirmFire();
+    } else {
+      selectAimTarget(0);
+    }
+  }
+
   function act(x, y) {
     if (x < 0 || y < 0 || x >= COLS || y >= ROWS) return;
+    aimMode = false;
+    hoveredChipIndex = -1;
     const units = parseUnits();
     const sel = units.find((u) => u.isSelected);
     const targetU = units.find((u) => u.x === x && u.y === y);
@@ -1490,17 +1841,28 @@ export function createBattleView(cfg) {
     const tile = m & 0x3;
     const reach = !!(m & (1 << 4));
 
-    // 모든 클릭에 즉각 리액션 (선택 펄스, 이동 펄스, 장애물/사선불가 ⊘ 흔들림)
+    // 항상 1명의 분대원 선택을 유지: 자기 자신·AI 아군·벽·이동불가·사선불가 적 클릭은 리액션만 주고 선택을 유지한다.
+    if (sel && targetU && (targetU.isSelected || targetU.isAi)) {
+      pushFx({ kind: "pulse", x, y, color: targetU.isAi ? PALETTE[5] : PALETTE[3], dur: 220 });
+      draw();
+      return;
+    }
+    if (sel && targetU && targetU.isEmpire && !targetU.inFireLane) {
+      pushFx({ kind: "invalid", x, y, dur: 320 });
+      draw();
+      return;
+    }
+    if (sel && !targetU && !reach) {
+      pushFx({ kind: tile !== 0 ? "invalid" : "pulse", x, y, color: PALETTE[1], dur: tile !== 0 ? 320 : 220 });
+      draw();
+      return;
+    }
+
+    // 유효 클릭 즉각 리액션 (분대원 전환 펄스, 이동 펄스)
     if (targetU && !targetU.isEmpire) {
       pushFx({ kind: "pulse", x, y, color: targetU.isAi ? PALETTE[5] : PALETTE[3], dur: 260 });
     } else if (sel && reach) {
       pushFx({ kind: "pulse", x, y, color: PALETTE[3], dur: 260 });
-    } else if (sel && targetU && targetU.isEmpire && !targetU.inFireLane) {
-      pushFx({ kind: "invalid", x, y, dur: 320 });
-    } else if (sel && tile !== 0) {
-      pushFx({ kind: "invalid", x, y, dur: 320 });
-    } else if (sel && !targetU && !reach) {
-      pushFx({ kind: "pulse", x, y, color: PALETTE[1], dur: 220 });
     }
 
     if (wasm.click(x, y) && cfg.onEvent) {
@@ -1554,32 +1916,120 @@ export function createBattleView(cfg) {
 
   function endTurn() {
     if (skipIfPlaying()) return;
-    if (els.returnBtn && wasm.battle_done()) return;
+    if (wasm.battle_done()) return;
     clearPending();
+    aimMode = false;
+    hoveredChipIndex = -1;
     wasm.end_turn();
     if (cfg.onEvent) cfg.onEvent("e");
     play();
   }
 
   function useAbility() {
-    if (!els.abilityBtn || els.abilityBtn.hasAttribute("data-off") || skipIfPlaying()) return;
+    const btn = els.burrowBtn || els.abilityBtn;
+    if (btn && (btn.disabled || btn.hidden)) return;
+    if (skipIfPlaying() || wasm.battle_done()) return;
     clearPending();
+    aimMode = false;
     if (wasm.ability() && cfg.onEvent) cfg.onEvent("b");
     play();
   }
 
   function useOverwatch() {
-    if (!els.overwatchBtn || els.overwatchBtn.hasAttribute("data-off") || skipIfPlaying()) return;
+    if (els.overwatchBtn && els.overwatchBtn.disabled) return;
+    if (skipIfPlaying() || wasm.battle_done()) return;
     clearPending();
+    aimMode = false;
     if (wasm.overwatch() && cfg.onEvent) cfg.onEvent("o");
     play();
   }
 
-  function useRetreat() {
-    if (!els.retreatBtn || els.retreatBtn.hasAttribute("data-off") || skipIfPlaying()) return;
+  function useHunker() {
+    if (els.hunkerBtn && els.hunkerBtn.disabled) return;
+    if (skipIfPlaying() || wasm.battle_done()) return;
     clearPending();
+    aimMode = false;
+    if (wasm.hunker() && cfg.onEvent) cfg.onEvent("h");
+    play();
+  }
+
+  function useRetreat() {
+    if (els.retreatBtn && (els.retreatBtn.disabled || els.retreatBtn.hidden)) return;
+    if (skipIfPlaying() || wasm.battle_done()) return;
+    clearPending();
+    aimMode = false;
     if (wasm.retreat() && cfg.onEvent) cfg.onEvent("r");
     play();
+  }
+
+  function handleKey(ev) {
+    if (ev.ctrlKey || ev.metaKey || ev.altKey) return false;
+    if (ev.code === "Tab") {
+      ev.preventDefault();
+      if (aimMode && currentTargets.length > 0) cycleTarget(ev.shiftKey ? -1 : 1);
+      else cycleUnit(ev.shiftKey ? -1 : 1);
+      return true;
+    }
+    if (ev.code === "Digit1") {
+      ev.preventDefault();
+      pressAttack();
+      return true;
+    }
+    if (ev.code === "Digit2" || ev.code === "KeyO") {
+      ev.preventDefault();
+      useOverwatch();
+      return true;
+    }
+    if (ev.code === "Digit3" || ev.code === "KeyH") {
+      ev.preventDefault();
+      useHunker();
+      return true;
+    }
+    if (ev.code === "Digit4" || ev.code === "KeyB") {
+      ev.preventDefault();
+      useAbility();
+      return true;
+    }
+    if (ev.code === "Digit5" || ev.code === "KeyR") {
+      ev.preventDefault();
+      useRetreat();
+      return true;
+    }
+    if (ev.code === "Enter") {
+      if (aimMode) {
+        ev.preventDefault();
+        confirmFire();
+        return true;
+      }
+      if (pending) {
+        ev.preventDefault();
+        const [x, y] = pending;
+        clearPending();
+        act(x, y);
+        return true;
+      }
+      return false;
+    }
+    if (ev.code === "Escape") {
+      if (aimMode) {
+        ev.preventDefault();
+        cancelAim();
+        return true;
+      }
+      if (pending) {
+        ev.preventDefault();
+        clearPending();
+        draw();
+        return true;
+      }
+      return false;
+    }
+    if (ev.code === "Space") {
+      ev.preventDefault();
+      endTurn();
+      return true;
+    }
+    return false;
   }
 
   function reset() {
@@ -1587,7 +2037,13 @@ export function createBattleView(cfg) {
     hoverCell = null;
     playing = false;
     skipRequested = false;
+    aimMode = false;
+    aimIndex = 0;
+    currentTargets = [];
+    hoveredChipIndex = -1;
     lastRosterRaw = "";
+    lastTargetsKey = "";
+    lastBadgeRaw = "";
     fxList = [];
   }
 
@@ -1608,7 +2064,10 @@ export function createBattleView(cfg) {
     if (ev.pointerType !== "mouse") hidePop();
   });
   canvas.addEventListener("pointercancel", hidePop);
-  canvas.addEventListener("contextmenu", (ev) => ev.preventDefault());
+  canvas.addEventListener("contextmenu", (ev) => {
+    ev.preventDefault();
+    if (aimMode) cancelAim();
+  });
 
   canvas.addEventListener("click", (ev) => {
     if (swallowClick) {
@@ -1616,7 +2075,7 @@ export function createBattleView(cfg) {
       return;
     }
     if (skipIfPlaying()) return;
-    if (els.returnBtn && wasm.battle_done()) return;
+    if (wasm.battle_done()) return;
 
     if (lastPointer === "mouse") {
       const [x, y] = cellAt(ev, false);
@@ -1634,6 +2093,7 @@ export function createBattleView(cfg) {
       clearPending();
       act(x, y);
     } else if ((u && u.isEmpire) || isReachable(x, y)) {
+      aimMode = false;
       pending = [x, y];
       wasm.hover(x, y);
       pushFx({ kind: "pulse", x, y, color: u && u.isEmpire ? PALETTE[4] : PALETTE[3], dur: 220 });
@@ -1654,7 +2114,13 @@ export function createBattleView(cfg) {
     hoverCell = [x, y];
     showPop(x, y, ev.clientX, ev.clientY);
     if (playing) return;
-    wasm.hover(x, y);
+    if (aimMode && currentTargets[aimIndex]) {
+      const hitIdx = currentTargets.findIndex((t) => t.x === x && t.y === y);
+      if (hitIdx >= 0) wasm.hover(x, y);
+      else wasm.hover(currentTargets[aimIndex].x, currentTargets[aimIndex].y);
+    } else {
+      wasm.hover(x, y);
+    }
     draw();
   });
 
@@ -1663,23 +2129,37 @@ export function createBattleView(cfg) {
     hoverCell = null;
     hidePop();
     if (playing) return;
-    wasm.hover(-1, -1);
+    if (aimMode && currentTargets[aimIndex]) {
+      wasm.hover(currentTargets[aimIndex].x, currentTargets[aimIndex].y);
+    } else {
+      wasm.hover(-1, -1);
+    }
     draw();
   });
 
-  if (els.confirmBtn) {
-    els.confirmBtn.addEventListener("click", () => {
-      if (skipIfPlaying() || !pending) return;
-      const [x, y] = pending;
-      clearPending();
-      act(x, y);
+  const bindBtn = (el, fn) => {
+    if (!el) return;
+    el.addEventListener("click", (ev) => {
+      ev.currentTarget.blur();
+      fn();
     });
-  }
-  if (els.endBtn) els.endBtn.addEventListener("click", endTurn);
-  if (els.endBtn2) els.endBtn2.addEventListener("click", endTurn);
-  if (els.abilityBtn) els.abilityBtn.addEventListener("click", useAbility);
-  if (els.overwatchBtn) els.overwatchBtn.addEventListener("click", useOverwatch);
-  if (els.retreatBtn) els.retreatBtn.addEventListener("click", useRetreat);
+  };
+  bindBtn(els.prevUnitBtn, () => cycleUnit(-1));
+  bindBtn(els.nextUnitBtn, () => cycleUnit(1));
+  bindBtn(els.attackBtn, pressAttack);
+  bindBtn(els.fireBtn, confirmFire);
+  bindBtn(els.cancelAimBtn, cancelAim);
+  bindBtn(els.overwatchBtn, useOverwatch);
+  bindBtn(els.hunkerBtn, useHunker);
+  bindBtn(els.burrowBtn || els.abilityBtn, useAbility);
+  bindBtn(els.retreatBtn, useRetreat);
+  bindBtn(els.endBtn, endTurn);
+  bindBtn(els.confirmBtn, () => {
+    if (skipIfPlaying() || !pending) return;
+    const [x, y] = pending;
+    clearPending();
+    act(x, y);
+  });
 
   return {
     layout,
@@ -1691,7 +2171,14 @@ export function createBattleView(cfg) {
     endTurn,
     useAbility,
     useOverwatch,
+    useHunker,
     useRetreat,
+    ensureSelected,
+    cycleUnit,
+    pressAttack,
+    confirmFire,
+    cancelAim,
+    handleKey,
     hidePop,
     isPlaying: () => playing,
   };

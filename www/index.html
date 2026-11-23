@@ -7,30 +7,116 @@
 <style>
   :root { --bg:#0c0f11; --dim:#38454a; --fg:#cfcabb; --brood:#63d6ac; --brood-dim:#37725e; --empire:#e8823f; }
   * { box-sizing:border-box; }
-  html, body { margin:0; background:var(--bg); color:var(--fg); }
-  body { font:15px/1.5 ui-monospace, "Cascadia Mono", Menlo, Consolas, "D2Coding", monospace; padding:16px; font-variant-numeric:tabular-nums; }
-  main { width:max-content; max-width:100%; margin:0 auto; position:relative; }
-  #topbar { display:flex; align-items:center; justify-content:space-between; gap:10px; border:1px solid var(--dim); border-bottom:0; padding:6px 10px; }
-  #status { margin:0; white-space:pre; }
-  #top-right { display:flex; gap:6px; align-items:center; }
-  canvas { display:block; border:1px solid var(--dim); cursor:crosshair; touch-action:manipulation; -webkit-touch-callout:none; user-select:none; -webkit-user-select:none; -webkit-tap-highlight-color:transparent; }
-  #panel { margin:14px 0; }
-  #panel > * { margin:0; min-height:1.5em; white-space:pre; font:inherit; }
-  #panel #ledger { min-height:8em; }
-  #result { color:var(--brood); }
-  #pop { position:absolute; z-index:10; margin:0; padding:4px 8px; white-space:pre; pointer-events:none; background:var(--bg); border:1px solid var(--fg); font-variant-numeric:tabular-nums; }
-  nav { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
-  button, nav a, #topbar a { font:inherit; color:var(--fg); background:none; border:1px solid var(--dim); padding:4px 12px; cursor:pointer; text-decoration:none; }
-  button:hover, button:focus-visible, a:hover, a:focus-visible { border-color:var(--fg); outline:none; }
-  #ability[data-off], #overwatch[data-off], #retreat[data-off] { visibility:hidden; }
-  #overwatch { border-color:var(--brood); color:var(--brood); }
-  #retreat { border-color:var(--empire); color:var(--empire); }
-  kbd { font:inherit; font-size:12px; border:1px solid var(--dim); border-bottom-width:2px; padding:0 4px; margin-left:8px; }
-  #seed { margin-left:auto; color:var(--dim); }
-  #bar { display:none; }
-  #err { color:var(--empire); }
+  html, body { margin:0; height:100%; background:var(--bg); color:var(--fg); }
+  body {
+    font:14px/1.4 ui-monospace, "Cascadia Mono", Menlo, Consolas, "D2Coding", monospace;
+    padding:10px 12px;
+    font-variant-numeric:tabular-nums;
+    display:flex;
+    flex-direction:column;
+    align-items:center;
+    justify-content:center;
+    min-height:100dvh;
+  }
+  main { width:max-content; max-width:100%; margin:0 auto; position:relative; display:flex; flex-direction:column; }
 
-  /* 분대 정보 토글 창 (데스크탑 오버레이 / 모바일 하단 시트) */
+  #topbar {
+    display:flex; align-items:center; justify-content:space-between; gap:8px; flex-wrap:wrap;
+    border:1px solid var(--dim); border-bottom:0; padding:5px 10px; background:#0e1316;
+  }
+  #status { margin:0; white-space:pre; font-weight:bold; color:var(--fg); }
+  #top-right { display:flex; gap:6px; align-items:center; flex-wrap:wrap; }
+  #seed { color:var(--dim); font-size:12px; }
+
+  canvas {
+    display:block; border:1px solid var(--dim); cursor:crosshair;
+    touch-action:manipulation; -webkit-touch-callout:none; user-select:none; -webkit-user-select:none; -webkit-tap-highlight-color:transparent;
+  }
+
+  /* XCOM 통합 전술 HUD 도크 (캔버스 바로 아래 창 안에 수납) */
+  #hud {
+    border:1px solid var(--dim); border-top:0; background:#0e1316;
+    display:flex; flex-direction:column;
+  }
+  #hud.aim-mode { border-color:var(--empire); }
+
+  #target-strip {
+    display:flex; align-items:center; justify-content:space-between; gap:8px; flex-wrap:wrap;
+    min-height:36px; padding:4px 8px; border-bottom:1px solid #1d262b; background:#0b0f12;
+  }
+  #hud.aim-mode #target-strip { background:#18120e; border-bottom-color:rgba(232,130,63,0.45); }
+  #target-list { display:flex; align-items:center; gap:5px; flex-wrap:wrap; }
+  .tgt-chip {
+    display:inline-flex; align-items:center; gap:5px; padding:3px 7px; font-size:12px;
+    border:1px solid rgba(232,130,63,0.55); color:var(--empire); background:rgba(232,130,63,0.08);
+    cursor:pointer; white-space:nowrap;
+  }
+  .tgt-chip:hover { border-color:var(--empire); background:rgba(232,130,63,0.18); }
+  .tgt-chip.active { background:var(--empire); color:var(--bg); border-color:var(--empire); font-weight:bold; }
+  .tgt-chip .tgt-hp { font-size:10px; opacity:0.85; letter-spacing:0.5px; }
+  .tgt-chip .tgt-pct { color:var(--fg); font-weight:bold; }
+  .tgt-chip.flanked .tgt-pct { color:var(--brood); }
+  .tgt-chip.active .tgt-pct, .tgt-chip.active .tgt-hp { color:var(--bg); }
+  .tgt-empty { color:var(--dim); font-size:12px; }
+
+  #readout {
+    display:flex; align-items:center; gap:8px; margin-left:auto; font-size:12px; white-space:nowrap;
+    overflow:hidden; text-overflow:ellipsis;
+  }
+  #readout-detail { color:var(--fg); }
+  #readout-result { color:var(--brood); font-weight:bold; }
+
+  #aim-actions { display:flex; align-items:center; gap:6px; }
+  #aim-actions[hidden] { display:none; }
+  #btn-fire { border-color:var(--empire); background:var(--empire); color:var(--bg); font-weight:bold; }
+  #btn-fire kbd { border-color:rgba(12,15,17,0.5); color:var(--bg); }
+
+  #action-row {
+    display:flex; align-items:center; justify-content:space-between; gap:8px; flex-wrap:wrap;
+    padding:6px 8px;
+  }
+  #unit-slot { display:flex; align-items:center; gap:6px; }
+  #unit-badge {
+    display:inline-flex; align-items:center; gap:6px; padding:2px 6px;
+    border:1px solid #222d33; background:#0c0f11; font-size:13px; white-space:nowrap;
+  }
+  #unit-badge .u-g { color:var(--brood); font-weight:bold; }
+  #unit-badge .u-hp { color:var(--brood); font-size:11px; letter-spacing:1px; }
+  #unit-badge .u-ap { color:var(--fg); font-size:12px; }
+  #unit-badge .u-tag { color:var(--empire); font-size:11px; }
+
+  #action-btns { display:flex; align-items:center; gap:6px; flex-wrap:wrap; }
+  #act-attack.ready { border-color:var(--empire); color:var(--empire); }
+  #act-attack.active { background:var(--empire); color:var(--bg); border-color:var(--empire); font-weight:bold; }
+  #act-attack.active kbd { border-color:rgba(12,15,17,0.5); color:var(--bg); }
+  #attack-count { margin-left:4px; font-size:11px; opacity:0.85; }
+  #act-overwatch:not(:disabled) { border-color:var(--brood); color:var(--brood); }
+  #act-hunker:not(:disabled) { border-color:var(--fg); color:var(--fg); }
+  #act-burrow:not(:disabled) { border-color:var(--brood-dim); color:var(--brood); }
+  #act-retreat:not(:disabled) { border-color:var(--empire); color:var(--empire); }
+  #act-burrow[hidden], #act-retreat[hidden] { display:none; }
+
+  #turn-slot { display:flex; align-items:center; gap:6px; margin-left:auto; }
+  #end.all-done { border-color:var(--brood); background:var(--brood); color:var(--bg); font-weight:bold; }
+  #end.all-done kbd { border-color:rgba(12,15,17,0.5); color:var(--bg); }
+  #confirm { border-color:var(--brood); color:var(--brood); }
+  #confirm[hidden] { display:none; }
+
+  button, #topbar a {
+    font:inherit; color:var(--fg); background:none; border:1px solid var(--dim);
+    padding:4px 9px; cursor:pointer; text-decoration:none; line-height:1.2;
+  }
+  button:hover:not(:disabled), button:focus-visible, a:hover, a:focus-visible { border-color:var(--fg); outline:none; }
+  button:disabled { opacity:0.35; cursor:not-allowed; }
+  kbd { font:inherit; font-size:11px; border:1px solid var(--dim); border-bottom-width:2px; padding:0 3px; margin-left:6px; }
+
+  #err { color:var(--empire); margin:4px 0 0; min-height:1.2em; font-size:12px; }
+  #pop {
+    position:absolute; z-index:10; margin:0; padding:4px 8px; white-space:pre; pointer-events:none;
+    background:var(--bg); border:1px solid var(--fg); font-variant-numeric:tabular-nums; font-size:13px;
+  }
+
+  /* 분대 정보 토글 창 */
   #roster-modal { position:fixed; z-index:20; inset:0; background:rgba(12,15,17,0.65); display:flex; align-items:center; justify-content:center; padding:16px; }
   #roster-modal[hidden] { display:none; }
   #roster-box { width:min(400px, 100%); background:var(--bg); border:1px solid var(--fg); }
@@ -46,16 +132,17 @@
   .roster-tag { color:var(--brood); min-width:2.5em; text-align:right; font-size:12px; }
 
   @media (max-width:699px) {
-    body { padding:8px 8px 72px; font-size:14px; }
-    main { width:auto; }
+    body { padding:6px; justify-content:flex-start; font-size:13px; }
+    main { width:100%; }
     canvas { margin:0 auto; }
-    #end, kbd { display:none; }
-    #ability, #overwatch { border-color:var(--brood); color:var(--brood); }
-    #bar { display:flex; position:fixed; left:0; right:0; bottom:0; gap:8px; align-items:center; padding:8px; background:var(--bg); border-top:1px solid var(--dim); font-variant-numeric:tabular-nums; z-index:12; }
-    #aim { flex:1; min-width:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-    #bar button { min-height:44px; padding:4px 16px; flex:none; }
-    #confirm { border-color:var(--brood); color:var(--brood); }
-    nav button, nav a, #topbar button, #topbar a { min-height:40px; display:inline-flex; align-items:center; }
+    kbd, #seed, #export, #import { display:none; }
+    #target-strip { padding:4px 6px; }
+    #target-list { flex-wrap:nowrap; overflow-x:auto; max-width:100%; }
+    #readout { width:100%; margin-left:0; justify-content:space-between; }
+    #action-row { padding:6px; gap:6px; }
+    #action-row button { min-height:38px; padding:4px 8px; }
+    #unit-slot { width:100%; justify-content:space-between; }
+    #action-btns { flex:1; }
     #roster-modal { align-items:flex-end; padding:0; }
     #roster-box { width:100%; border-left:0; border-right:0; border-bottom:0; }
     .roster-row { min-height:44px; }
@@ -67,40 +154,56 @@
   <header id="topbar">
     <p id="status"></p>
     <div id="top-right">
-      <button id="btn-roster">분대<kbd>Tab</kbd></button>
+      <button id="btn-roster" type="button">분대<kbd>U</kbd></button>
+      <button id="new" type="button">새 판</button>
+      <button id="export" type="button">내보내기</button>
+      <button id="import" type="button">불러오기</button>
+      <input id="file" type="file" accept="application/json,.json" hidden>
+      <span id="seed"></span>
       <a href="world.html">월드</a>
     </div>
   </header>
   <canvas id="screen" aria-label="전장"></canvas>
-  <section id="panel">
-    <pre id="ledger"></pre>
-    <p id="result"></p>
+  <section id="hud" aria-label="전술 지휘 바">
+    <div id="target-strip">
+      <div id="target-list"></div>
+      <div id="readout">
+        <span id="readout-detail"></span>
+        <span id="readout-result"></span>
+      </div>
+      <div id="aim-actions" hidden>
+        <button id="btn-fire" type="button">사격 확정<kbd>1</kbd></button>
+        <button id="btn-cancel-aim" type="button">취소<kbd>Esc</kbd></button>
+      </div>
+    </div>
+    <div id="action-row">
+      <div id="unit-slot">
+        <button id="btn-prev-unit" type="button" title="이전 분대원 (Shift+Tab)">◀</button>
+        <span id="unit-badge"></span>
+        <button id="btn-next-unit" type="button" title="다음 분대원 (Tab)">▶<kbd>Tab</kbd></button>
+      </div>
+      <div id="action-btns">
+        <button id="act-attack" type="button">공격<span id="attack-count"></span><kbd>1</kbd></button>
+        <button id="act-overwatch" type="button">경계<kbd>2</kbd></button>
+        <button id="act-hunker" type="button">엄호<kbd>3</kbd></button>
+        <button id="act-burrow" type="button" hidden>잠복<kbd>4</kbd></button>
+        <button id="act-retreat" type="button" hidden>후퇴<kbd>5</kbd></button>
+      </div>
+      <div id="turn-slot">
+        <button id="confirm" hidden type="button">실행</button>
+        <button id="end" type="button">턴 종료<kbd>Space</kbd></button>
+      </div>
+    </div>
   </section>
-  <nav>
-    <button id="overwatch" data-off>경계<kbd>O</kbd></button>
-    <button id="ability" data-off><span id="ability-name"></span><kbd>B</kbd></button>
-    <button id="retreat" data-off>후퇴<kbd>R</kbd></button>
-    <button id="end">턴 종료<kbd>Space</kbd></button>
-    <button id="new">새 판</button>
-    <button id="export">세이브 내보내기</button>
-    <button id="import">불러오기</button>
-    <input id="file" type="file" accept="application/json,.json" hidden>
-    <span id="seed"></span>
-  </nav>
   <p id="err" role="alert"></p>
   <pre id="pop" role="status" hidden></pre>
-  <div id="bar">
-    <span id="aim"></span>
-    <button id="confirm" hidden>실행</button>
-    <button id="end2">턴 종료</button>
-  </div>
 </main>
 
 <div id="roster-modal" hidden>
   <div id="roster-box" role="dialog" aria-label="분대 현황">
     <div id="roster-head">
       <span>■ 분대 현황</span>
-      <button id="roster-close">닫기<kbd>Esc</kbd></button>
+      <button id="roster-close" type="button">닫기<kbd>Esc</kbd></button>
     </div>
     <div id="roster-list"></div>
   </div>

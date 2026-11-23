@@ -31,6 +31,7 @@ pub const BEAT_SMOKE: u32 = 7;
 pub const BEAT_RETREAT: u32 = 8;
 pub const BEAT_OVERWATCH: u32 = 9;
 pub const BEAT_OW_TRIGGER: u32 = 10;
+pub const BEAT_HUNKER: u32 = 11;
 
 const STEP_MS_BROOD: u32 = 55;
 const STEP_MS_EMPIRE: u32 = 90;
@@ -44,13 +45,15 @@ const SMOKE_MS: u32 = 240;
 const RETREAT_MS: u32 = 160;
 const OVERWATCH_MS: u32 = 180;
 const OW_TRIGGER_MS: u32 = 560;
+const HUNKER_MS: u32 = 160;
 /// 빗나간 탄이 표적을 지나 더 날아가는 칸 수.
 const OVERSHOOT: usize = 3;
 
 const CELLS: usize = (W * H) as usize;
 /// 문구 구역 구분자.
 /// 0: 상황, 1: 장부 내역, 2: 장부 결과, 3: 잠복 능력, 4: 분대원 목록,
-/// 5: 후퇴 가능, 6: 월드 전투 헤더, 7: 합동 아군 AI 요약, 8: 경계 가능.
+/// 5: 후퇴 가능, 6: 월드 전투 헤더, 7: 합동 아군 AI 요약, 8: 경계 가능,
+/// 9: 엄호 가능, 10: 사격 가능 적 목록, 11: 선택 분대원 요약.
 const SEP: &str = "\u{1f}";
 
 #[derive(Clone, Copy)]
@@ -60,6 +63,7 @@ struct ViewUnit {
     burrowed: bool,
     retreated: bool,
     overwatch: bool,
+    hunkered: bool,
 }
 
 enum Fx {
@@ -76,6 +80,7 @@ enum Fx {
     Retreat { pos: Pos },
     OverwatchSet { pos: Pos, color: u32 },
     OverwatchTrigger { from: Pos, to: Pos, color: u32 },
+    Hunker { pos: Pos, color: u32 },
 }
 
 struct State {
@@ -171,6 +176,7 @@ impl State {
                 burrowed: u.burrowed,
                 retreated: u.retreated,
                 overwatch: u.overwatch,
+                hunkered: u.hunkered,
             })
             .collect();
         self.view_smoke = self.game.smoke.iter().map(|&s| s > 0).collect();
@@ -230,6 +236,7 @@ impl State {
                     self.view[unit].pos = to;
                     self.view[unit].burrowed = false;
                     self.view[unit].overwatch = false;
+                    self.view[unit].hunkered = false;
                     // 시야 밖에서 시야 밖으로 가는 적은 보여주지 않는다.
                     if empire && !before && !self.seen(to) {
                         continue;
@@ -254,6 +261,7 @@ impl State {
                         0 => {
                             self.view[shooter].burrowed = false;
                             self.view[shooter].overwatch = false;
+                            self.view[shooter].hunkered = false;
                             self.fx = Fx::Tracer { from: a, to: b, cells: Game::line(a, b), color };
                             self.shot_stage = 1;
                             let ms = if self.slowmo_shot { TRACER_SLOW_MS } else { TRACER_MS };
@@ -291,6 +299,7 @@ impl State {
                     self.slowmo_shot = false;
                     self.view[unit].burrowed = true;
                     self.view[unit].overwatch = false;
+                    self.view[unit].hunkered = false;
                     self.fx = Fx::Burrow { pos: self.view[unit].pos };
                     return BEAT_BURROW << 16 | BURROW_MS;
                 }
@@ -317,6 +326,7 @@ impl State {
                     self.slowmo_shot = false;
                     self.view[unit].retreated = true;
                     self.view[unit].overwatch = false;
+                    self.view[unit].hunkered = false;
                     self.fx = Fx::Retreat { pos: self.view[unit].pos };
                     return BEAT_RETREAT << 16 | RETREAT_MS;
                 }
@@ -327,6 +337,7 @@ impl State {
                     let empire = u.side == Side::Empire;
                     self.allied_ai_phase = !empire && u.ai_controlled;
                     self.view[unit].overwatch = true;
+                    self.view[unit].hunkered = false;
                     let pos = self.view[unit].pos;
                     if empire && !self.seen(pos) {
                         continue;
@@ -360,6 +371,28 @@ impl State {
                         color,
                     };
                     return BEAT_OW_TRIGGER << 16 | OW_TRIGGER_MS;
+                }
+                Event::Hunker { unit } => {
+                    self.queue.pop_front();
+                    self.slowmo_shot = false;
+                    let u = &self.game.units[unit];
+                    let empire = u.side == Side::Empire;
+                    self.allied_ai_phase = !empire && u.ai_controlled;
+                    self.view[unit].hunkered = true;
+                    self.view[unit].overwatch = false;
+                    let pos = self.view[unit].pos;
+                    if empire && !self.seen(pos) {
+                        continue;
+                    }
+                    let color = if empire {
+                        EMPIRE
+                    } else if u.ai_controlled {
+                        BROOD_DIM
+                    } else {
+                        BROOD
+                    };
+                    self.fx = Fx::Hunker { pos, color };
+                    return BEAT_HUNKER << 16 | HUNKER_MS;
                 }
             }
         }
@@ -552,6 +585,9 @@ fn render(s: &mut State) {
         Fx::OverwatchTrigger { from, to, color } => {
             s.b_fx = [10, from.0 as u32, from.1 as u32, to.0 as u32, to.1 as u32, *color, 0, 0];
         }
+        Fx::Hunker { pos, color } => {
+            s.b_fx = [11, pos.0 as u32, pos.1 as u32, *color, 0, 0, 0, 0];
+        }
         Fx::None => {
             // 조준 미리보기 (선택한 아군이 보이는 적을 가리킬 때)
             if let (true, Some(sel), Some(hp)) = (can_act, g.selected, s.hover) {
@@ -652,6 +688,7 @@ fn render(s: &mut State) {
                 w1 |= 1 << 29;
             }
             if v.overwatch { w1 |= 1 << 30; }
+            if v.hunkered { w1 |= 1 << 31; }
             s.b_units.push(w0);
             s.b_units.push(w1);
         }
@@ -683,8 +720,87 @@ fn render(s: &mut State) {
         s.battle_header.clone(),
         if ai_alive > 0 { format!("AI 아군 {ai_alive}명") } else { String::new() },
         if can_act && g.can_overwatch() { "경계".to_string() } else { String::new() },
+        if can_act && g.can_hunker() { "엄호".to_string() } else { String::new() },
+        if can_act { targets_text(s) } else { String::new() },
+        selected_text(s, can_act),
     ];
     s.text = sections.join(SEP);
+}
+
+/// 현재 선택 분대원이 제자리에서 쏠 수 있는 적 표적 목록 (XCOM 조준/하단 표적 칩용).
+/// 줄마다 x\ty\t글리프\t이름\t체력\t최대체력\t명중률\t조준\t엄폐\t거리감점.
+fn targets_text(s: &State) -> String {
+    let g = &s.game;
+    let Some(sel) = g.selected.filter(|&i| g.units[i].alive() && g.units[i].ap > 0) else {
+        return String::new();
+    };
+    let mut list = Vec::new();
+    for (t, u) in g.units.iter().enumerate() {
+        if u.side == Side::Empire && g.visible_to(Side::Brood, t) {
+            if let Some(shot) = g.shot(sel, t) {
+                list.push((shot.chance, t, shot));
+            }
+        }
+    }
+    list.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    list.into_iter()
+        .map(|(_, t, shot)| {
+            let u = &g.units[t];
+            format!(
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                u.pos.0,
+                u.pos.1,
+                u.glyph(),
+                u.name(),
+                u.hp.max(0),
+                u.class.def().hp,
+                shot.chance,
+                shot.aim,
+                shot.cover,
+                shot.falloff
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// 현재 선택 분대원 요약 (하단 XCOM HUD 좌측 슬롯용).
+/// 형식: 글리프\t이름\t체력\t최대체력\t행동\t상태태그\tx\ty\t남은행동유닛수.
+fn selected_text(s: &State, can_act: bool) -> String {
+    let g = &s.game;
+    let ready_count = g
+        .units
+        .iter()
+        .filter(|u| u.side == Side::Brood && !u.ai_controlled && u.alive() && u.ap > 0)
+        .count();
+    let Some(i) = g.selected else {
+        return format!("\t\t0\t0\t0\t\t-1\t-1\t{ready_count}");
+    };
+    let u = &g.units[i];
+    let v = s.view[i];
+    let ap = if can_act { u.ap } else { 0 };
+    let tag = if v.overwatch {
+        "경계"
+    } else if v.hunkered {
+        "엄호"
+    } else if v.burrowed {
+        "잠복"
+    } else if v.pos.0 == 0 && ap > 0 {
+        "후퇴가능"
+    } else if ap == 0 {
+        "완료"
+    } else {
+        ""
+    };
+    format!(
+        "{}\t{}\t{}\t{}\t{ap}\t{tag}\t{}\t{}\t{ready_count}",
+        u.glyph(),
+        u.name(),
+        v.hp.max(0),
+        u.class.def().hp,
+        v.pos.0,
+        v.pos.1
+    )
 }
 
 /// 분대원 목록(토글 창용). 줄마다 x\ty\t선택\t글리프\t이름\t체력핍\t행동\t상태.
@@ -704,6 +820,8 @@ fn roster_text(s: &State) -> String {
             let ap = if playing { 0 } else { u.ap };
             let tag = if v.overwatch {
                 "경계"
+            } else if v.hunkered {
+                "엄호"
             } else if v.burrowed {
                 "숨음"
             } else if v.pos.0 == 0 && ap > 0 {
@@ -737,6 +855,9 @@ fn inspect_text(s: &State, p: Pos) -> String {
     }
     if s.view[i].overwatch {
         out.push_str("\n경계 태세");
+    }
+    if s.view[i].hunkered {
+        out.push_str("\n엄호 중 (+30 방어)");
     }
     out
 }
@@ -869,6 +990,16 @@ pub extern "C" fn overwatch() -> u32 {
     changed as u32
 }
 
+/// 선택한 유닛을 엄호(Hunker Down) 태세로 전환한다.
+#[no_mangle]
+pub extern "C" fn hunker() -> u32 {
+    let s = state();
+    let changed = s.game.hunker();
+    s.enqueue(false);
+    render(s);
+    changed as u32
+}
+
 /// 선택한 플레이어 유닛을 좌측 가장자리에서 후퇴시킨다.
 #[no_mangle]
 pub extern "C" fn retreat() -> u32 {
@@ -877,6 +1008,96 @@ pub extern "C" fn retreat() -> u32 {
     s.enqueue(false);
     render(s);
     changed as u32
+}
+
+fn pack_selected(pos: Pos) -> u32 {
+    (1 << 16) | (pos.0 as u32) | ((pos.1 as u32) << 8)
+}
+
+/// 항상 분대원 1명이 선택돼 있도록 보장한다.
+/// 현재 선택 유닛이 없거나 행동이 끝났다면 남은 AP가 있는 첫 분대원을, 모두가 0 AP면 첫 생존 분대원을 고른다.
+/// 선택이 바뀌면 `(1 << 16) | x | (y << 8)`, 그대로면 0을 돌려준다.
+#[no_mangle]
+pub extern "C" fn ensure_selected() -> u32 {
+    let s = state();
+    if s.playing() || s.game.outcome.is_some() {
+        return 0;
+    }
+    let g = &mut s.game;
+    let player_units: Vec<usize> = g
+        .units
+        .iter()
+        .enumerate()
+        .filter(|(_, u)| u.side == Side::Brood && !u.ai_controlled && u.alive())
+        .map(|(i, _)| i)
+        .collect();
+    if player_units.is_empty() {
+        return 0;
+    }
+    let cur_ok = g
+        .selected
+        .is_some_and(|i| player_units.contains(&i) && (g.units[i].ap > 0 || player_units.iter().all(|&j| g.units[j].ap == 0)));
+    if cur_ok {
+        return 0;
+    }
+    let pick = player_units
+        .iter()
+        .copied()
+        .find(|&i| g.units[i].ap > 0)
+        .unwrap_or(player_units[0]);
+    if g.selected == Some(pick) {
+        return 0;
+    }
+    g.selected = Some(pick);
+    let pos = g.units[pick].pos;
+    render(s);
+    pack_selected(pos)
+}
+
+/// 다음(dir >= 0) 또는 이전(dir < 0) 분대원으로 전환한다 (행동 가능한 분대원 우선 순환).
+/// 선택이 바뀌면 `(1 << 16) | x | (y << 8)`, 그대로면 0.
+#[no_mangle]
+pub extern "C" fn select_next(dir: i32) -> u32 {
+    let s = state();
+    if s.playing() || s.game.outcome.is_some() {
+        return 0;
+    }
+    let g = &mut s.game;
+    let all: Vec<usize> = g
+        .units
+        .iter()
+        .enumerate()
+        .filter(|(_, u)| u.side == Side::Brood && !u.ai_controlled && u.alive())
+        .map(|(i, _)| i)
+        .collect();
+    if all.is_empty() {
+        return 0;
+    }
+    let ready: Vec<usize> = all.iter().copied().filter(|&i| g.units[i].ap > 0).collect();
+    let pool = if ready.is_empty() { &all } else { &ready };
+    let next = match g.selected.and_then(|cur| pool.iter().position(|&i| i == cur)) {
+        Some(idx) => {
+            if dir >= 0 {
+                pool[(idx + 1) % pool.len()]
+            } else {
+                pool[(idx + pool.len() - 1) % pool.len()]
+            }
+        }
+        None => {
+            if dir >= 0 {
+                pool[0]
+            } else {
+                pool[pool.len() - 1]
+            }
+        }
+    };
+    if g.selected == Some(next) {
+        return 0;
+    }
+    g.selected = Some(next);
+    let pos = g.units[next].pos;
+    render(s);
+    pack_selected(pos)
 }
 
 /// 전투가 끝났는가. 0: 진행 중, 1: 아군 승리, 2: 패배/후퇴.
@@ -1064,7 +1285,7 @@ mod tests {
         init(3);
         assert!(state().frame.iter().all(|&c| c != 0));
         let parts: Vec<String> = state().text.split(SEP).map(String::from).collect();
-        assert_eq!(parts.len(), 9);
+        assert_eq!(parts.len(), 12);
         assert_eq!(parts[0], "라운드 1");
         assert_eq!(parts[4].lines().count(), 4);
 
@@ -1317,5 +1538,45 @@ mod tests {
         let imp_beat = advance();
         assert!(imp_beat >> 16 == BEAT_HIT || imp_beat >> 16 == BEAT_MISS);
         assert_eq!(imp_beat & 0xffff, IMPACT_SLOW_MS);
+    }
+
+    #[test]
+    fn xcom_hunker_and_unit_cycling() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut g = Game::with_units(33, &[sim::Gene::Sniper, sim::Gene::Burst], &[Class::Trooper, Class::Shield]);
+        g.tiles.fill(Tile::Floor);
+        g.units[0].pos = (4, 6);
+        g.units[1].pos = (4, 9);
+        g.units[2].pos = (10, 6);
+        g.units[3].pos = (12, 8);
+        let s = state();
+        *s = State::from_game(g, String::new());
+        render(s);
+
+        // ensure_selected는 첫 분대원을 자동 선택한다.
+        let p0 = ensure_selected();
+        assert_ne!(p0 & (1 << 16), 0);
+        assert_eq!((p0 & 0xff, (p0 >> 8) & 0xff), (4, 6));
+        assert_eq!(state().game.selected, Some(0));
+
+        // 사격 가능 적 목록(parts[10])에 적 2명이 포함된다.
+        let parts: Vec<String> = state().text.split(SEP).map(String::from).collect();
+        assert_eq!(parts[9], "엄호");
+        assert_eq!(parts[10].lines().count(), 2);
+        assert!(parts[11].starts_with("ψ\t저격"));
+
+        // Tab(select_next)으로 다음 분대원으로 순환한다.
+        let p1 = select_next(1);
+        assert_eq!((p1 & 0xff, (p1 >> 8) & 0xff), (4, 9));
+        assert_eq!(state().game.selected, Some(1));
+
+        // 3번 엄호 실행 -> BEAT_HUNKER 재생 -> 다음 ensure_selected는 행동 가능한 0번 분대원으로 자동 전환.
+        assert_eq!(hunker(), 1);
+        assert_eq!(advance() >> 16, BEAT_HUNKER);
+        assert_eq!(state().b_fx[0], 11);
+        assert!(state().b_units.chunks_exact(2).any(|c| (c[1] & (1 << 31)) != 0));
+        assert_eq!(advance(), 0);
+        let next = ensure_selected();
+        assert_eq!((next & 0xff, (next >> 8) & 0xff), (4, 6));
     }
 }

@@ -1,4 +1,4 @@
-// 단독 전술 전투 화면: 세이브/불러오기/단축키를 관리하고 렌더링·입력은 battle_view.js에 위임한다.
+// 단독 전술 전투 화면: 세이브/불러오기/XCOM 단축키를 관리하고 렌더링·입력은 battle_view.js에 위임한다.
 import { createBattleView } from "./battle_view.js";
 
 const SAVE_KEY = "crispy-octo-umbrella/save";
@@ -33,16 +33,24 @@ const battle = createBattleView({
   rosterList: $("roster-list"),
   els: {
     status: $("status"),
-    ledger: $("ledger"),
-    result: $("result"),
-    abilityBtn: $("ability"),
-    abilityName: $("ability-name"),
-    overwatchBtn: $("overwatch"),
-    retreatBtn: $("retreat"),
+    hudEl: $("hud"),
+    targetList: $("target-list"),
+    readoutDetail: $("readout-detail"),
+    readoutResult: $("readout-result"),
+    aimActions: $("aim-actions"),
+    fireBtn: $("btn-fire"),
+    cancelAimBtn: $("btn-cancel-aim"),
+    unitBadge: $("unit-badge"),
+    prevUnitBtn: $("btn-prev-unit"),
+    nextUnitBtn: $("btn-next-unit"),
+    attackBtn: $("act-attack"),
+    attackCount: $("attack-count"),
+    overwatchBtn: $("act-overwatch"),
+    hunkerBtn: $("act-hunker"),
+    burrowBtn: $("act-burrow"),
+    retreatBtn: $("act-retreat"),
     confirmBtn: $("confirm"),
-    aimEl: $("aim"),
     endBtn: $("end"),
-    endBtn2: $("end2"),
     seedEl: $("seed"),
   },
   getSeed: () => save.seed,
@@ -56,6 +64,7 @@ function newGame(seed) {
   battle.reset();
   save = { v: SAVE_VERSION, seed, events: [] };
   wasm.init(seed);
+  battle.ensureSelected();
   persist();
   battle.draw();
 }
@@ -70,6 +79,7 @@ function load(data) {
     if (e === "e") wasm.end_turn();
     else if (e === "b") wasm.ability();
     else if (e === "o") wasm.overwatch();
+    else if (e === "h") wasm.hunker();
     else if (e === "r") wasm.retreat();
     else if (Array.isArray(e) && e.length === 2) wasm.click(e[0] | 0, e[1] | 0);
     else throw new Error("세이브 형식이 맞지 않음");
@@ -79,6 +89,7 @@ function load(data) {
     throw new Error("다른 버전에서 만든 세이브라 재현이 안 됨");
   }
   save = { v: SAVE_VERSION, seed: data.seed, events: data.events };
+  battle.ensureSelected();
 }
 
 let resizeTimer = 0;
@@ -106,27 +117,20 @@ rosterModal.addEventListener("click", (ev) => {
 });
 
 document.addEventListener("keydown", (ev) => {
-  if (ev.code === "Tab") {
+  if (ev.code === "KeyU") {
     ev.preventDefault();
     rosterModal.hidden = !rosterModal.hidden;
     return;
   }
-  if (ev.code === "Escape" && !rosterModal.hidden) {
-    rosterModal.hidden = true;
-    return;
+  if (ev.code === "Escape") {
+    if (!rosterModal.hidden) {
+      rosterModal.hidden = true;
+      return;
+    }
+    if (battle.handleKey(ev)) return;
   }
   if (!rosterModal.hidden) return;
-  if (ev.target instanceof HTMLButtonElement) return;
-  if (ev.code === "Space" || ev.code === "Enter") {
-    ev.preventDefault();
-    battle.endTurn();
-  } else if (ev.code === "KeyO" && !$("overwatch").hasAttribute("data-off")) {
-    battle.useOverwatch();
-  } else if (ev.code === "KeyB" && !$("ability").hasAttribute("data-off")) {
-    battle.useAbility();
-  } else if (ev.code === "KeyR" && !$("retreat").hasAttribute("data-off")) {
-    battle.useRetreat();
-  }
+  if (battle.handleKey(ev)) return;
 });
 
 $("export").addEventListener("click", () => {

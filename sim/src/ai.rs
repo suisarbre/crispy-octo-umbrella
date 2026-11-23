@@ -431,10 +431,11 @@ pub fn run_allied_ai(g: &mut Game) {
 }
 
 fn run_inner(g: &mut Game, side: Side, only_ai: bool) {
-    // 새 턴이 시작된 진영의 이전 경계 태세를 해제한다.
+    // 새 턴이 시작된 진영의 이전 경계·엄호 태세를 해제한다.
     for u in &mut g.units {
         if u.side == side && (!only_ai || u.ai_controlled) {
             u.overwatch = false;
+            u.hunkered = false;
         }
     }
 

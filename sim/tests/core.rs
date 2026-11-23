@@ -145,7 +145,8 @@ fn events_replay_to_the_same_positions() {
                     | Event::Smoke { .. }
                     | Event::Retreat { .. }
                     | Event::Overwatch { .. }
-                    | Event::OverwatchTrigger { .. } => {}
+                    | Event::OverwatchTrigger { .. }
+                    | Event::Hunker { .. } => {}
                 }
             }
             for (i, u) in g.units.iter().enumerate() {

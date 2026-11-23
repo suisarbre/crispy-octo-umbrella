@@ -35,6 +35,8 @@ pub const SMOKE_ROUNDS: u8 = 3;
 pub const SMOKE_CHARGES: u8 = 2;
 /// 경계 사격 명중률 감점 (이동 표적 대응 사격).
 pub const OVERWATCH_PENALTY: i32 = 15;
+/// 엄호(Hunker Down) 시 더해지는 추가 방어(엄폐) 수치.
+pub const HUNKER_BONUS: i32 = 30;
 
 pub type Pos = (i32, i32);
 
@@ -119,6 +121,8 @@ pub struct Unit {
     pub burrowed: bool,
     /// 경계 태세인가 (시야·사거리 안으로 이동하는 적에게 자동 대응 사격).
     pub overwatch: bool,
+    /// 엄호(Hunker Down) 태세인가 (다음 자기 턴까지 추가 엄폐 방어).
+    pub hunkered: bool,
     /// 남은 연막 수.
     pub charges: u8,
     /// 합동전 아군 AI 일반군처럼 기계가 조종하는 아군 유닛인가.
@@ -142,6 +146,7 @@ impl Unit {
             moved: false,
             burrowed: false,
             overwatch: false,
+            hunkered: false,
             charges,
             ai_controlled: false,
             retreated: false,
@@ -243,6 +248,8 @@ pub enum Event {
     Overwatch { unit: usize },
     /// 이동 중 경계에 걸려 대응 사격이 발동한다 (바로 뒤 `Shot`이 이어진다).
     OverwatchTrigger { shooter: usize, target: usize },
+    /// 엄호(Hunker Down) 태세에 들어갔다.
+    Hunker { unit: usize },
 }
 
 #[derive(Clone, Debug)]
@@ -563,7 +570,9 @@ impl Game {
         let cover = if ambush {
             0
         } else {
-            self.cover(from, target).max(target_unit.map_or(0, |t| self.shield_cover(t, target, from)))
+            let base = self.cover(from, target).max(target_unit.map_or(0, |t| self.shield_cover(t, target, from)));
+            let hunker = if target_unit.is_some_and(|t| self.units[t].hunkered) { HUNKER_BONUS } else { 0 };
+            base + hunker
         };
         let falloff = if steady { 0 } else { (d - FALLOFF_START).max(0) * FALLOFF_PER_TILE };
         let chance = (aim - cover - falloff).clamp(0, 100);
@@ -702,6 +711,7 @@ impl Game {
         let mut from = self.units[uid].pos;
         self.units[uid].burrowed = false;
         self.units[uid].overwatch = false;
+        self.units[uid].hunkered = false;
         self.units[uid].moved = true;
         for p in path {
             self.events.push(Event::Step { unit: uid, from, to: p });
@@ -783,10 +793,26 @@ impl Game {
             return false;
         }
         u.overwatch = true;
+        u.hunkered = false;
         u.ap = 0;
         let name = u.name();
         self.log.push(format!("{name} 경계 태세"));
         self.events.push(Event::Overwatch { unit: uid });
+        true
+    }
+
+    /// 남은 행동을 모두 써서 엄호(Hunker Down) 태세에 들어간다.
+    pub(crate) fn set_hunker(&mut self, uid: usize) -> bool {
+        let u = &mut self.units[uid];
+        if !u.alive() || u.ap == 0 || u.hunkered || u.burrowed {
+            return false;
+        }
+        u.hunkered = true;
+        u.overwatch = false;
+        u.ap = 0;
+        let name = u.name();
+        self.log.push(format!("{name} 엄호 태세"));
+        self.events.push(Event::Hunker { unit: uid });
         true
     }
 
@@ -798,6 +824,7 @@ impl Game {
         }
         u.burrowed = true;
         u.overwatch = false;
+        u.hunkered = false;
         u.ap -= 1;
         self.events.push(Event::Burrow { unit: uid });
         self.observe();
@@ -819,6 +846,7 @@ impl Game {
         }
         self.units[uid].charges -= 1;
         self.units[uid].overwatch = false;
+        self.units[uid].hunkered = false;
         self.units[uid].ap -= 1;
         self.events.push(Event::Smoke { unit: uid, center });
         self.observe();
@@ -939,6 +967,29 @@ impl Game {
         self.set_overwatch(s)
     }
 
+    /// 선택한 유닛이 지금 엄호(Hunker Down) 태세에 들어갈 수 있는가.
+    pub fn can_hunker(&self) -> bool {
+        self.selected.is_some_and(|s| {
+            let u = &self.units[s];
+            self.outcome.is_none()
+                && u.side == Side::Brood
+                && !u.ai_controlled
+                && u.alive()
+                && u.ap > 0
+                && !u.hunkered
+                && !u.burrowed
+        })
+    }
+
+    /// 플레이어 입력: 선택한 유닛을 엄호(Hunker Down) 태세로 전환한다 (남은 행동 전부 소비, 엄폐 방어 +30).
+    pub fn hunker(&mut self) -> bool {
+        if !self.can_hunker() {
+            return false;
+        }
+        let s = self.selected.unwrap();
+        self.set_hunker(s)
+    }
+
     /// 선택한 플레이어 유닛이 아군 쪽 가장자리(`x == 0`)에서 후퇴할 수 있는가.
     pub fn can_retreat(&self) -> bool {
         self.selected.is_some_and(|s| {
@@ -960,6 +1011,7 @@ impl Game {
         let s = self.selected.unwrap();
         self.units[s].retreated = true;
         self.units[s].overwatch = false;
+        self.units[s].hunkered = false;
         self.units[s].ap = 0;
         self.selected = None;
         let name = self.units[s].name();
@@ -990,7 +1042,7 @@ impl Game {
     }
 
     /// 라운드를 넘긴다. 행동이 돌아오고 연막이 한 라운드만큼 걷힌다.
-    /// 아군의 경계 태세는 새 턴이 시작되며 해제되고, 제국의 경계는 이번 플레이어 턴 동안 유지된다.
+    /// 아군의 경계·엄호 태세는 새 턴이 시작되며 해제되고, 제국의 경계는 이번 플레이어 턴 동안 유지된다.
     pub fn next_round(&mut self) {
         for u in &mut self.units {
             if u.alive() {
@@ -998,6 +1050,7 @@ impl Game {
                 u.moved = false;
                 if u.side == Side::Brood {
                     u.overwatch = false;
+                    u.hunkered = false;
                 }
             }
         }
@@ -1035,6 +1088,7 @@ impl Game {
         }
         self.units[s].burrowed = false;
         self.units[s].overwatch = false;
+        self.units[s].hunkered = false;
         let log_before = self.log.len();
         let (sn, tn) = (self.units[s].name(), self.units[t].name());
         if hit {
@@ -1080,7 +1134,13 @@ impl Game {
             mix(u.pos.0 as u64);
             mix(u.pos.1 as u64);
             mix(u.ap as u64);
-            mix(u.moved as u64 | (u.burrowed as u64) << 1 | (u.charges as u64) << 2 | (u.overwatch as u64) << 6);
+            mix(
+                u.moved as u64
+                    | (u.burrowed as u64) << 1
+                    | (u.charges as u64) << 2
+                    | (u.overwatch as u64) << 6
+                    | (u.hunkered as u64) << 7,
+            );
         }
         for m in &self.memory {
             mix(m.map_or(u64::MAX, |p| (p.1 * W + p.0) as u64));
@@ -1311,6 +1371,31 @@ mod battle_biome_tests {
             .expect("제국 경계 발동 이벤트가 있어야 한다");
         assert!(matches!(g.events.get(trig2 + 1), Some(Event::Shot { shooter: 1, target: 0, .. })));
         assert!(!g.units[1].overwatch);
+    }
+
+    #[test]
+    fn hunker_increases_cover_and_clears_next_round() {
+        let mut g = Game::with_units(21, &[Gene::Plain], &[Class::Trooper]);
+        g.tiles.fill(Tile::Floor);
+        g.tiles[idx((5, 6))] = Tile::Low;
+        g.units[0].pos = (4, 6);
+        g.units[1].pos = (9, 6);
+        let before = g.shot(1, 0).unwrap();
+        assert_eq!(before.cover, COVER_LOW);
+
+        assert!(g.click((4, 6)));
+        assert!(g.can_hunker());
+        assert!(g.hunker());
+        assert!(g.units[0].hunkered);
+        assert_eq!(g.units[0].ap, 0);
+        assert!(matches!(g.events.last(), Some(Event::Hunker { unit: 0 })));
+
+        let after = g.shot(1, 0).unwrap();
+        assert_eq!(after.cover, COVER_LOW + HUNKER_BONUS);
+        assert_eq!(after.chance, (before.chance - HUNKER_BONUS).max(0));
+
+        g.next_round();
+        assert!(!g.units[0].hunkered);
     }
 }
 

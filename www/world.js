@@ -1533,20 +1533,27 @@ const battle = createBattleView({
   rosterList: $("b-roster-list"),
   els: {
     status: $("b-status"),
-    ledger: $("b-ledger"),
-    result: $("b-result"),
-    abilityBtn: $("b-ability"),
-    abilityName: $("b-ability-name"),
-    overwatchBtn: $("b-overwatch"),
-    retreatBtn: $("b-retreat"),
+    hudEl: $("b-hud"),
+    targetList: $("b-target-list"),
+    readoutDetail: $("b-readout-detail"),
+    readoutResult: $("b-readout-result"),
+    aimActions: $("b-aim-actions"),
+    fireBtn: $("b-btn-fire"),
+    cancelAimBtn: $("b-btn-cancel-aim"),
+    unitBadge: $("b-unit-badge"),
+    prevUnitBtn: $("b-btn-prev-unit"),
+    nextUnitBtn: $("b-btn-next-unit"),
+    attackBtn: $("b-act-attack"),
+    attackCount: $("b-attack-count"),
+    overwatchBtn: $("b-act-overwatch"),
+    hunkerBtn: $("b-act-hunker"),
+    burrowBtn: $("b-act-burrow"),
+    retreatBtn: $("b-act-retreat"),
     confirmBtn: $("b-confirm"),
-    aimEl: $("b-aim"),
     endBtn: $("b-end"),
-    endBtn2: $("b-end2"),
     headerEl: $("b-header"),
     aiNoteEl: $("b-ai-note"),
     returnBtn: $("b-return"),
-    returnBtnMob: $("b-return-mob"),
   },
   isActive: () => inBattle,
 });
@@ -1567,6 +1574,7 @@ function enterBattle() {
   menu.hidden = true;
   inBattle = true;
   battle.reset();
+  battle.ensureSelected();
   $("app").hidden = true;
   $("battle-app").hidden = false;
   battle.layout();
@@ -1599,24 +1607,21 @@ function finishBattleAndReturn() {
 
 $("btn-enter-battle").addEventListener("click", enterBattle);
 $("b-return").addEventListener("click", finishBattleAndReturn);
-$("b-return-mob").addEventListener("click", finishBattleAndReturn);
 $("b-btn-roster").addEventListener("click", () => { bRosterModal.hidden = !bRosterModal.hidden; });
 $("b-roster-close").addEventListener("click", () => { bRosterModal.hidden = true; });
 bRosterModal.addEventListener("click", (ev) => { if (ev.target === bRosterModal) bRosterModal.hidden = true; });
 
 document.addEventListener("keydown", (ev) => {
   if (inBattle) {
-    if (ev.code === "Tab") { ev.preventDefault(); bRosterModal.hidden = !bRosterModal.hidden; return; }
+    if (ev.code === "KeyU") { ev.preventDefault(); bRosterModal.hidden = !bRosterModal.hidden; return; }
     if (ev.code === "Escape" && !bRosterModal.hidden) { bRosterModal.hidden = true; return; }
     if (!bRosterModal.hidden) return;
-    if (ev.target instanceof HTMLButtonElement) return;
-    if (ev.code === "Space" || ev.code === "Enter") {
+    if (wasm.battle_done() && (ev.code === "Space" || ev.code === "Enter")) {
       ev.preventDefault();
-      if (wasm.battle_done()) finishBattleAndReturn();
-      else battle.endTurn();
-    } else if (ev.code === "KeyO" && !$("b-overwatch").hasAttribute("data-off")) battle.useOverwatch();
-    else if (ev.code === "KeyB" && !$("b-ability").hasAttribute("data-off")) battle.useAbility();
-    else if (ev.code === "KeyR" && !$("b-retreat").hasAttribute("data-off")) battle.useRetreat();
+      finishBattleAndReturn();
+      return;
+    }
+    battle.handleKey(ev);
     return;
   }
 
