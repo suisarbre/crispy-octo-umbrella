@@ -35,6 +35,10 @@ struct State {
     labels: Vec<u32>,
     routes: Vec<u32>,
     last_battle: [u32; 4],
+    /// 선택 중 마우스 호버 또는 웨이포인트 드래그로 가리키는 헥스 (시뮬 상태에는 영향 없음).
+    hover_hex: Option<Pos>,
+    /// 드래그 중일 때는 기존 target보다 hover_hex 경로 미리보기를 우선 표시한다.
+    hover_override: bool,
 }
 
 static mut STATE: Option<State> = None;
@@ -50,6 +54,8 @@ fn state() -> &'static mut State {
             labels: Vec::new(),
             routes: Vec::new(),
             last_battle: [0; 4],
+            hover_hex: None,
+            hover_override: false,
         })
     }
 }
@@ -196,9 +202,18 @@ fn render(s: &mut State) {
             push_route(&mut s.routes, w, f.role, f.size, f.pos, path, flags);
         }
     }
-    let preview_target = w
-        .target
-        .or_else(|| w.preview_proposal.and_then(|pi| w.proposals.get(pi)).map(|p| p.target));
+    let hover_preview = if w.selected.is_some() {
+        s.hover_hex.filter(|&p| p != w.special().pos && w.walkable(p))
+    } else {
+        None
+    };
+    let preview_target = if s.hover_override {
+        hover_preview.or(w.target)
+    } else {
+        w.target
+            .or(hover_preview)
+            .or_else(|| w.preview_proposal.and_then(|pi| w.proposals.get(pi)).map(|p| p.target))
+    };
     if let Some(target) = preview_target {
         let sp = w.special();
         if let Some(path) = w.route(sp.pos, target) {
@@ -398,6 +413,8 @@ fn inspect_text(w: &World, p: Pos) -> String {
 pub extern "C" fn w_init(seed: u32) {
     let s = state();
     s.world = World::new(seed as u64);
+    s.hover_hex = None;
+    s.hover_override = false;
     render(s);
 }
 
@@ -405,14 +422,30 @@ pub extern "C" fn w_init(seed: u32) {
 pub extern "C" fn w_click(x: i32, y: i32) -> u32 {
     let s = state();
     let changed = s.world.click((x, y));
+    s.hover_override = false;
     render(s);
     changed as u32
+}
+
+/// 마우스 호버 또는 웨이포인트 드래그 중 실시간 경로 미리보기 갱신 (시뮬 상태 불변).
+#[no_mangle]
+pub extern "C" fn w_hover(x: i32, y: i32, override_target: u32) {
+    let s = state();
+    let next = if in_world((x, y)) { Some((x, y)) } else { None };
+    let ov = override_target != 0;
+    if s.hover_hex == next && s.hover_override == ov {
+        return;
+    }
+    s.hover_hex = next;
+    s.hover_override = ov;
+    render(s);
 }
 
 #[no_mangle]
 pub extern "C" fn w_select_special() -> u32 {
     let s = state();
     let changed = s.world.select_special();
+    s.hover_override = false;
     render(s);
     changed as u32
 }

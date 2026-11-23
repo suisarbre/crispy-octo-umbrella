@@ -927,6 +927,7 @@ impl World {
     }
 
     /// 비선택 상태 클릭은 조사만 하고, 특수부대를 클릭한 뒤 목적지 헥스를 찍으면 명령 메뉴가 열린다.
+    /// 통행 불가 헥스(산맥/해역)를 찍으면 선택을 풀지 않고 false를 돌려 UI가 이동 불가 표시를 띄우게 한다.
     pub fn click(&mut self, p: Pos) -> bool {
         if !in_world(p) {
             return false;
@@ -948,14 +949,15 @@ impl World {
             self.target = None;
             return true;
         }
+        if !self.walkable(p) {
+            return false;
+        }
         if self.route(self.forces[sp].pos, p).is_some_and(|path| !path.is_empty()) {
             let changed = self.target != Some(p);
             self.target = Some(p);
             return changed;
         }
-        self.selected = None;
-        self.target = None;
-        true
+        false
     }
 
     pub fn can_garrison(&self) -> bool {
@@ -1798,6 +1800,15 @@ mod tests {
         assert!(w.selected.is_none());
         assert!(w.click(sp_pos));
         assert_eq!(w.selected, Some(0));
+        // 통행 불가(산맥) 헥스를 눌러도 선택은 풀리지 않고 false를 돌려 UI가 불가 표시를 띄울 수 있게 한다.
+        if let Some(mtn) = (0..HEX_COUNT)
+            .map(|i| ((i as i32) % WW, (i as i32) / WW))
+            .find(|&p| w.terrain_at(p) == Terrain::Mountain)
+        {
+            assert!(!w.click(mtn));
+            assert_eq!(w.selected, Some(0));
+            assert!(w.target.is_none());
+        }
         assert!(w.click(other));
         assert_eq!(w.target, Some(other));
         assert!(w.command(Command::Move));
