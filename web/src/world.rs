@@ -36,10 +36,19 @@ struct State {
     labels: Vec<u32>,
     routes: Vec<u32>,
     last_battle: [u32; 5],
-    /// 선택 중 마우스 호버 또는 웨이포인트 드래그로 가리키는 헥스 (시뮬 상태에는 영향 없음).
+    /// 선택 중 마우스 호버 또는 명령 모드에서 가리키는 헥스 (시뮬 상태에는 영향 없음).
     hover_hex: Option<Pos>,
-    /// 드래그 중일 때는 기존 target보다 hover_hex 경로 미리보기를 우선 표시한다.
-    hover_override: bool,
+    /// 0: 선택 중 target 없을 때만, 1: 선택 중 target 덮어쓰기, 2: 비선택이어도 미리보기.
+    hover_mode: u32,
+    /// 정적 지형·도로·영토·거점·보급 비트가 바뀔 때마다 증가 (오프스크린 캐시 무효화용).
+    static_version: u32,
+    /// 전체 상태/텍스트가 갱신될 때마다 증가 (DOM 동기화 생략용).
+    state_version: u32,
+    /// 경로 버퍼가 바뀔 때마다 증가.
+    routes_version: u32,
+    /// 현재 미리보기 경로의 총 소요 틱과 헥스 수.
+    preview_ticks: u32,
+    preview_steps: u32,
 }
 
 static mut STATE: Option<State> = None;
@@ -56,7 +65,12 @@ fn state() -> &'static mut State {
             routes: Vec::new(),
             last_battle: [0; 5],
             hover_hex: None,
-            hover_override: false,
+            hover_mode: 0,
+            static_version: 0,
+            state_version: 0,
+            routes_version: 0,
+            preview_ticks: 0,
+            preview_steps: 0,
         })
     }
 }
@@ -115,10 +129,52 @@ fn push_route(out: &mut Vec<u32>, w: &World, role: ForceRole, size: u32, start: 
     }
 }
 
+/// 경로 버퍼와 미리보기 ETA만 빠르게 갱신한다 (호버·제안 미리보기용, 4160헥스/텍스트 재생성 없음).
+fn render_routes(s: &mut State) {
+    let w = &s.world;
+    let sp_idx = w.special_index();
+    s.routes.clear();
+    s.preview_ticks = 0;
+    s.preview_steps = 0;
+    for (i, f) in w.forces.iter().enumerate() {
+        if !f.alive || f.side != Side::Brood {
+            continue;
+        }
+        if let Order::Move(path) = &f.order {
+            let flags = if i == sp_idx { ROUTE_SPECIAL } else { 0 };
+            push_route(&mut s.routes, w, f.role, f.size, f.pos, path, flags);
+        }
+    }
+    let allow_hover = w.selected.is_some() || s.hover_mode >= 2;
+    let hover_preview = if allow_hover {
+        s.hover_hex.filter(|&p| p != w.special().pos && w.walkable(p))
+    } else {
+        None
+    };
+    let preview_target = if s.hover_mode >= 1 {
+        hover_preview.or(w.target)
+    } else {
+        w.target
+            .or(hover_preview)
+            .or_else(|| w.preview_proposal.and_then(|pi| w.proposals.get(pi)).map(|p| p.target))
+    };
+    if let Some(target) = preview_target {
+        let sp = w.special();
+        if let Some((path, ticks)) = w.route_for(ForceRole::Special, sp.size, sp.pos, target) {
+            s.preview_ticks = ticks;
+            s.preview_steps = path.len() as u32;
+            push_route(&mut s.routes, w, ForceRole::Special, sp.size, sp.pos, &path, ROUTE_PREVIEW);
+        }
+    }
+    s.routes_version = s.routes_version.wrapping_add(1);
+}
+
 fn render(s: &mut State) {
     let w = &s.world;
+    let mut static_changed = s.static_version == 0;
     if s.hexes.len() != HEX_COUNT {
         s.hexes.resize(HEX_COUNT, 0);
+        static_changed = true;
     }
 
     // 1. 헥스 지형 + 도로 연결 마스크 + Civ 영토 경계 마스크 패킹
@@ -152,7 +208,7 @@ fn render(s: &mut State) {
                 }
             }
 
-            s.hexes[i] = tcode
+            let packed_static = tcode
                 | ((has_road as u32) << 3)
                 | (side_code(terr) << 4)
                 | (skind << 6)
@@ -160,7 +216,14 @@ fn render(s: &mut State) {
                 | (in_sup << 12)
                 | (road_mask << 13)
                 | (border_mask << 19);
+            if (s.hexes[i] & 0x01ff_ffff) != packed_static {
+                static_changed = true;
+            }
+            s.hexes[i] = packed_static;
         }
+    }
+    if static_changed {
+        s.static_version = s.static_version.wrapping_add(1).max(1);
     }
 
     // 2. 부대 마커 (특수부대가 우선 표시되도록 마지막에 덮는다)
@@ -193,34 +256,9 @@ fn render(s: &mut State) {
     }
 
     // 3. 이동 경로 & 미리보기 경로 패킹
-    s.routes.clear();
-    for (i, f) in w.forces.iter().enumerate() {
-        if !f.alive || f.side != Side::Brood {
-            continue;
-        }
-        if let Order::Move(path) = &f.order {
-            let flags = if i == sp_idx { ROUTE_SPECIAL } else { 0 };
-            push_route(&mut s.routes, w, f.role, f.size, f.pos, path, flags);
-        }
-    }
-    let hover_preview = if w.selected.is_some() {
-        s.hover_hex.filter(|&p| p != w.special().pos && w.walkable(p))
-    } else {
-        None
-    };
-    let preview_target = if s.hover_override {
-        hover_preview.or(w.target)
-    } else {
-        w.target
-            .or(hover_preview)
-            .or_else(|| w.preview_proposal.and_then(|pi| w.proposals.get(pi)).map(|p| p.target))
-    };
-    if let Some(target) = preview_target {
-        let sp = w.special();
-        if let Some(path) = w.route(sp.pos, target) {
-            push_route(&mut s.routes, w, ForceRole::Special, sp.size, sp.pos, &path, ROUTE_PREVIEW);
-        }
-    }
+    render_routes(s);
+    let w = &s.world;
+    let sp_idx = w.special_index();
 
     // 4. 인원 라벨 패킹
     let mut order: Vec<usize> = (0..w.forces.len()).filter(|&i| w.forces[i].alive).collect();
@@ -426,6 +464,7 @@ fn render(s: &mut State) {
         campaign_text,
     ]
     .join(SEP);
+    s.state_version = s.state_version.wrapping_add(1).max(1);
 }
 
 fn doing(w: &World, f: &sim::world::Force) -> String {
@@ -481,7 +520,8 @@ pub extern "C" fn w_init(seed: u32) {
     let s = state();
     s.world = World::new(seed as u64);
     s.hover_hex = None;
-    s.hover_override = false;
+    s.hover_mode = 0;
+    s.static_version = s.static_version.wrapping_add(1).max(1);
     render(s);
 }
 
@@ -489,30 +529,29 @@ pub extern "C" fn w_init(seed: u32) {
 pub extern "C" fn w_click(x: i32, y: i32) -> u32 {
     let s = state();
     let changed = s.world.click((x, y));
-    s.hover_override = false;
+    s.hover_mode = 0;
     render(s);
     changed as u32
 }
 
-/// 마우스 호버 또는 웨이포인트 드래그 중 실시간 경로 미리보기 갱신 (시뮬 상태 불변).
+/// 마우스 호버 또는 명령 모드에서 실시간 경로 미리보기만 경량 갱신 (전체 헥스·텍스트 재생성 없음).
 #[no_mangle]
-pub extern "C" fn w_hover(x: i32, y: i32, override_target: u32) {
+pub extern "C" fn w_hover(x: i32, y: i32, mode: u32) {
     let s = state();
     let next = if in_world((x, y)) { Some((x, y)) } else { None };
-    let ov = override_target != 0;
-    if s.hover_hex == next && s.hover_override == ov {
+    if s.hover_hex == next && s.hover_mode == mode {
         return;
     }
     s.hover_hex = next;
-    s.hover_override = ov;
-    render(s);
+    s.hover_mode = mode;
+    render_routes(s);
 }
 
 #[no_mangle]
 pub extern "C" fn w_select_special() -> u32 {
     let s = state();
     let changed = s.world.select_special();
-    s.hover_override = false;
+    s.hover_mode = 0;
     render(s);
     changed as u32
 }
@@ -528,12 +567,16 @@ pub extern "C" fn w_special_pos() -> u32 {
 #[no_mangle]
 pub extern "C" fn w_preview_proposal(idx: i32) {
     let s = state();
-    s.world.preview_proposal = if idx >= 0 && (idx as usize) < s.world.proposals.len() {
+    let next = if idx >= 0 && (idx as usize) < s.world.proposals.len() {
         Some(idx as usize)
     } else {
         None
     };
-    render(s);
+    if s.world.preview_proposal == next {
+        return;
+    }
+    s.world.preview_proposal = next;
+    render_routes(s);
 }
 
 #[no_mangle]
@@ -780,6 +823,31 @@ pub extern "C" fn w_fingerprint_lo() -> u32 {
     state().world.fingerprint() as u32
 }
 
+#[no_mangle]
+pub extern "C" fn w_static_version() -> u32 {
+    state().static_version
+}
+
+#[no_mangle]
+pub extern "C" fn w_state_version() -> u32 {
+    state().state_version
+}
+
+#[no_mangle]
+pub extern "C" fn w_routes_version() -> u32 {
+    state().routes_version
+}
+
+#[no_mangle]
+pub extern "C" fn w_preview_ticks() -> u32 {
+    state().preview_ticks
+}
+
+#[no_mangle]
+pub extern "C" fn w_preview_steps() -> u32 {
+    state().preview_steps
+}
+
 #[doc(hidden)]
 pub fn dump(seed: u32, clicks: &[Pos], ticks: u32) -> String {
     w_init(seed);
@@ -834,6 +902,17 @@ mod tests {
         assert_ne!(w_menu(), 0);
         assert_eq!(w_command(2), 1);
         assert_eq!(w_menu(), 0);
+
+        // 경량 호버 미리보기는 정적/전체 상태를 다시 렌더링하지 않고 경로와 ETA만 갱신한다.
+        let sv_before = w_static_version();
+        let st_before = w_state_version();
+        let rv_before = w_routes_version();
+        w_hover(dest.0, dest.1, 2);
+        assert_eq!(w_static_version(), sv_before);
+        assert_eq!(w_state_version(), st_before);
+        assert_ne!(w_routes_version(), rv_before);
+        assert!(w_preview_ticks() > 0 && w_preview_steps() > 0);
+        w_hover(-1, -1, 0);
 
         // 제안 수락 및 시간 진행
         assert_eq!(w_accept_proposal(0), 1);

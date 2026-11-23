@@ -920,8 +920,8 @@ impl World {
         sp.alive && in_world(sp.pos) && self.brood_supply[idx(sp.pos)]
     }
 
-    /// 부대 역할·크기를 반영한 최소 시간(틱) 육각 다익스트라 경로 탐색.
-    /// 도로 비용이 낮기 때문에 정규군·보급대는 자연스럽게 도로를 탄다.
+    /// 부대 역할·크기를 반영한 최소 시간(틱) 육각 A* 경로 탐색.
+    /// 도로 비용(`min_step`)을 하한 휴리스틱으로 사용해 다익스트라와 동일한 최적 경로를 훨씬 빠르게 찾는다.
     pub fn route_for(&self, role: ForceRole, size: u32, from: Pos, to: Pos) -> Option<(Vec<Pos>, u32)> {
         if !self.walkable(from) || !self.walkable(to) {
             return None;
@@ -929,16 +929,18 @@ impl World {
         if from == to {
             return Some((Vec::new(), 0));
         }
+        let min_step = if role == ForceRole::Special { 4 } else { 5 } + size / 4;
         let mut dist = vec![u32::MAX; HEX_COUNT];
         let mut prev = vec![usize::MAX; HEX_COUNT];
-        let mut heap: BinaryHeap<Reverse<(u32, usize)>> = BinaryHeap::new();
+        let mut heap: BinaryHeap<Reverse<(u32, u32, usize)>> = BinaryHeap::new();
         let start = idx(from);
         let goal = idx(to);
+        let h0 = (hex_dist(from, to) as u32).saturating_mul(min_step);
         dist[start] = 0;
-        heap.push(Reverse((0, start)));
+        heap.push(Reverse((h0, 0, start)));
 
-        while let Some(Reverse((d, u))) = heap.pop() {
-            if d > dist[u] {
+        while let Some(Reverse((_, g, u))) = heap.pop() {
+            if g > dist[u] {
                 continue;
             }
             if u == goal {
@@ -949,7 +951,7 @@ impl World {
                     cur = prev[cur];
                 }
                 path.reverse();
-                return Some((path, d));
+                return Some((path, g));
             }
             let up = ((u as i32) % WW, (u as i32) / WW);
             for np in hex_neighbors(up) {
@@ -958,11 +960,12 @@ impl World {
                 }
                 let v = idx(np);
                 let step = self.hex_step_ticks(role, size, np);
-                let nd = d.saturating_add(step);
-                if nd < dist[v] {
-                    dist[v] = nd;
+                let ng = g.saturating_add(step);
+                if ng < dist[v] {
+                    dist[v] = ng;
                     prev[v] = u;
-                    heap.push(Reverse((nd, v)));
+                    let f = ng.saturating_add((hex_dist(np, to) as u32).saturating_mul(min_step));
+                    heap.push(Reverse((f, ng, v)));
                 }
             }
         }

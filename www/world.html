@@ -34,9 +34,29 @@
   #workspace { display:flex; flex:1; min-height:0; gap:10px; }
   #map-wrap { position:relative; flex:1; min-width:0; min-height:0; border:1px solid var(--dim); display:flex; flex-direction:column; overflow:hidden; }
   #canvas-box { position:relative; flex:1; min-height:0; overflow:hidden; }
-  #screen { display:block; width:100%; height:100%; cursor:crosshair; touch-action:none; -webkit-touch-callout:none; user-select:none; -webkit-user-select:none; -webkit-tap-highlight-color:transparent; }
-  #map-hint { border-top:1px solid var(--dim); padding:4px 10px; font-size:12px; color:var(--dim); display:flex; justify-content:space-between; gap:8px; flex:none; }
-  #map-hint strong { color:var(--fg); font-weight:normal; }
+  #screen { display:block; width:100%; height:100%; cursor:grab; touch-action:none; -webkit-touch-callout:none; user-select:none; -webkit-user-select:none; -webkit-tap-highlight-color:transparent; }
+  #screen.panning { cursor:grabbing; }
+  #screen.targeting { cursor:crosshair; }
+
+  #minimap-wrap {
+    position:absolute; right:8px; bottom:8px; z-index:4;
+    border:1px solid var(--dim); background:rgba(12,15,17,0.92);
+    padding:2px; box-shadow:0 2px 10px rgba(0,0,0,0.6);
+    cursor:pointer; user-select:none;
+  }
+  #minimap-wrap:hover { border-color:var(--brood); }
+  #minimap { display:block; width:196px; height:128px; }
+
+  #map-hint {
+    border-top:1px solid var(--dim); padding:4px 10px; font-size:12px; color:var(--dim);
+    display:flex; align-items:center; justify-content:space-between; gap:10px; flex:none;
+    background:#0e1316; min-height:27px;
+  }
+  #hover-info { color:var(--fg); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; flex:1; min-width:0; }
+  #hover-info .hi-dim { color:var(--dim); }
+  #hover-info .hi-brood { color:var(--brood); }
+  #hover-info .hi-emp { color:var(--empire); }
+  #coords-hint { color:var(--dim); flex:none; font-size:11px; }
 
   #fab-wrap { display:none; position:absolute; right:8px; bottom:8px; flex-direction:column; gap:6px; z-index:4; }
   #fab-wrap button { background:var(--bg); border-color:var(--fg); min-height:38px; padding:4px 10px; font-size:13px; }
@@ -72,12 +92,23 @@
   .ev-day { color:var(--dim); flex:none; }
   .ev-item.alert .ev-text { color:var(--empire); }
 
-  /* 하단 바 */
-  #bottom { display:flex; align-items:center; gap:8px; flex-wrap:wrap; flex:none; }
-  #day { border-color:var(--brood); color:var(--brood); }
+  /* 하단 바 (시간 재생/배속 + 즉시 명령 모드) */
+  #bottom { display:flex; align-items:center; gap:6px; flex-wrap:wrap; flex:none; }
+  #btn-play { border-color:var(--brood); color:var(--brood); min-width:108px; }
+  #btn-play.running { background:var(--brood); color:var(--bg); font-weight:bold; }
+  #btn-play.running kbd { border-color:rgba(12,15,17,0.5); color:var(--bg); }
+  #speed-wrap, #cmd-mode-wrap { display:inline-flex; align-items:center; }
+  #speed-wrap button, #cmd-mode-wrap button { padding:4px 7px; font-size:12px; margin-left:-1px; }
+  #speed-wrap button:first-child, #cmd-mode-wrap button:first-child { margin-left:0; }
+  #speed-wrap button.active { border-color:var(--brood); color:var(--bg); background:var(--brood); font-weight:bold; z-index:1; }
+  #cmd-mode-wrap { margin-left:6px; }
+  #cmd-mode-wrap button.active { border-color:var(--brood); color:var(--brood); background:rgba(99,214,172,0.12); z-index:1; }
+  #cmd-mode-wrap button.armed { border-color:var(--brood); color:var(--bg); background:var(--brood); font-weight:bold; z-index:2; }
+  #cmd-mode-wrap button.armed kbd { border-color:rgba(12,15,17,0.5); color:var(--bg); }
+  #day { border-color:var(--dim); color:var(--fg); }
   #until { border-color:var(--fg); }
-  #notice { color:var(--empire); margin-left:6px; }
-  #seed { margin-left:auto; color:var(--dim); }
+  #notice { color:var(--empire); margin-left:4px; font-size:13px; }
+  #seed { margin-left:auto; color:var(--dim); font-size:12px; }
   #err { color:var(--empire); margin:0; font-size:12px; }
 
   /* 팝업, 컨텍스트 메뉴, 정비 모달 */
@@ -237,7 +268,7 @@
 
   @media (max-width:699px) {
     #app { padding:6px; gap:6px; height:100dvh; }
-    #hdr-desktop, #top-actions, #map-hint, kbd, #seed { display:none; }
+    #hdr-desktop, #top-actions, #map-hint, #minimap-wrap, #speed-wrap, #cmd-mode-wrap, kbd, #seed { display:none; }
     #hdr-mobile { display:block; font-size:13px; }
     #topbar { padding:5px 8px; }
     #clash-bar { flex-direction:column; align-items:stretch; padding:8px; gap:6px; }
@@ -264,7 +295,7 @@
     #mob-cmd-btns button { flex:1; min-height:44px; padding:4px 4px; font-size:13px; }
 
     #bottom { gap:6px; }
-    #bottom button, #bottom a { flex:1; min-height:44px; display:inline-flex; align-items:center; justify-content:center; padding:4px 8px; font-size:13px; }
+    #bottom > button, #bottom > a { flex:1; min-height:44px; display:inline-flex; align-items:center; justify-content:center; padding:4px 8px; font-size:13px; }
     #new, #notice { display:none; }
     #menu { display:none !important; }
 
@@ -308,14 +339,16 @@
     <div id="map-wrap">
       <div id="canvas-box">
         <canvas id="screen" aria-label="전구 지도"></canvas>
+        <div id="minimap-wrap" title="미니맵 · 클릭/드래그로 즉시 이동">
+          <canvas id="minimap" width="196" height="128" aria-label="전구 미니맵"></canvas>
+        </div>
         <div id="fab-wrap">
           <button id="fab-overview">전체</button>
           <button id="fab-squad">분대</button>
         </div>
       </div>
       <div id="map-hint">
-        <span id="view-mode"><strong>전술 헥스 뷰</strong> · 드래그/WASD 이동 · 휠 줌 · 분대 선택 후 클릭/드래그 명령</span>
-        <span id="legend" style="color:var(--fg);opacity:0.75;">▲산맥(불가) · △고지 · ∴숲 · ═도로</span>
+        <span id="hover-info">좌드래그 지도 이동 · 우클릭 즉시 행군 · Shift+우클릭 명령 메뉴 · 휠 커서 줌 · Space 재생/일시정지</span>
         <span id="coords-hint"></span>
       </div>
     </div>
@@ -371,9 +404,21 @@
   </div>
 
   <footer id="bottom">
-    <button id="day">하루 넘기기<kbd>Space</kbd></button>
-    <button id="until">사건까지 진행<kbd>Shift+Space</kbd></button>
-    <button id="new">새 판</button>
+    <button id="btn-play" type="button">▶ 재생<kbd>Space</kbd></button>
+    <div id="speed-wrap" role="group" aria-label="진행 배속">
+      <button type="button" data-speed="1">1×</button>
+      <button type="button" data-speed="2" class="active">2×</button>
+      <button type="button" data-speed="4">4×</button>
+    </div>
+    <button id="day" type="button">+1일<kbd>N</kbd></button>
+    <button id="until" type="button">사건까지<kbd>Shift+Space</kbd></button>
+    <div id="cmd-mode-wrap" role="group" aria-label="명령 모드">
+      <button type="button" data-mode="0" class="active" title="우클릭 즉시 이동 (1)">이동<kbd>1</kbd></button>
+      <button type="button" data-mode="1" title="클릭/우클릭 매복 이동 (2)">매복<kbd>2</kbd></button>
+      <button type="button" data-mode="2" title="클릭/우클릭 거점 주둔 (3)">주둔<kbd>3</kbd></button>
+      <button type="button" data-mode="3" title="클릭/우클릭 왕복 정찰 (4)">정찰<kbd>4</kbd></button>
+    </div>
+    <button id="new" type="button">새 판</button>
     <span id="notice" role="status"></span>
     <span id="seed"></span>
   </footer>
@@ -497,9 +542,18 @@
     <div class="help-body">
       <div class="help-sec">
         <h4>전략 전구 (80×52 헥스)</h4>
-        <p><b>▲ 산맥</b>은 통과 불가(자연 길목 형성), <b>═ 도로</b>는 이동 속도 2배 + 보급권 연장. 보급권 안에서 <b>정비/개조(G)</b>로 치료·재개조·충원이 가능합니다.</p>
-        <p>특수부대(<b>◆</b>) 선택 후 타일을 클릭/드래그해 이동·매복·주둔·정찰을 지시합니다. <b>매복</b> 상태로 교전하면 1턴 조준+15·엄폐 무시 선제 기습을 얻습니다.</p>
-        <p><b>거점 목표</b>: <b>┴ 중계탑</b> 전투는 중계기(&amp;)를 파괴하면 즉시 승리, <b>보급대</b> 차단은 생체질 대량 보상, <b>인류 본진(◉)</b> 점령 시 캠페인 승리!</p>
+        <div class="help-grid">
+          <span><b>좌드래그 / WASD</b> : 부드러운 지도 이동</span>
+          <span><b>마우스 휠 / M</b> : 커서 기준 줌 / 전체 보기</span>
+          <span><b>우클릭</b> : 즉시 행군 (선택 모드 실행)</span>
+          <span><b>Shift+우클릭 / 좌클릭</b> : 4종 명령 메뉴</span>
+          <span><b>1~4</b> : 이동 · 매복 · 주둔 · 정찰 모드</span>
+          <span><b>Space / N</b> : 실시간 재생·정지 / +1일</span>
+          <span><b>F / 미니맵</b> : 분대 포커스 / 즉시 점프</span>
+          <span><b>G / Esc</b> : 보급권 정비·개조 / 취소</span>
+        </div>
+        <p style="margin-top:6px;"><b>▲ 산맥</b>은 통과 불가(길목 형성), <b>═ 도로</b>는 속도 2배 + 보급권 연장. <b>매복</b> 교전 시 1턴 조준+15·엄폐 무시 선제 기습!</p>
+        <p><b>거점 목표</b>: <b>┴ 중계탑</b>은 중계기(&amp;) 파괴 시 즉시 승리, <b>보급대</b> 차단은 생체질 대량 보상, <b>인류 본진(◉)</b> 점령 시 캠페인 승리!</p>
       </div>
       <div class="help-sec">
         <h4>전술 전투 (XCOM 조작)</h4>
