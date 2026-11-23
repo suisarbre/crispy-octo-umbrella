@@ -162,21 +162,33 @@
     display:inline-flex; align-items:center; gap:6px; padding:2px 6px;
     border:1px solid #222d33; background:#0c0f11; font-size:13px; white-space:nowrap;
   }
+  #b-objective-bar {
+    font-size:12px; color:var(--empire); border:1px solid rgba(232,130,63,0.45);
+    padding:1px 6px; background:rgba(232,130,63,0.08);
+  }
+  #b-objective-bar[hidden] { display:none; }
   #b-unit-badge .u-g { color:var(--brood); font-weight:bold; }
+  #b-unit-badge .u-cs { color:var(--dim); font-size:11px; }
+  #b-unit-badge .u-rk { color:var(--fg); font-size:11px; border:1px solid var(--dim); padding:0 3px; }
   #b-unit-badge .u-hp { color:var(--brood); font-size:11px; letter-spacing:1px; }
   #b-unit-badge .u-ap { color:var(--fg); font-size:12px; }
   #b-unit-badge .u-tag { color:var(--empire); font-size:11px; }
 
   #b-action-btns { display:flex; align-items:center; gap:6px; flex-wrap:wrap; }
   #b-act-attack.ready { border-color:var(--empire); color:var(--empire); }
-  #b-act-attack.active { background:var(--empire); color:var(--bg); border-color:var(--empire); font-weight:bold; }
-  #b-act-attack.active kbd { border-color:rgba(12,15,17,0.5); color:var(--bg); }
-  #b-attack-count { margin-left:4px; font-size:11px; opacity:0.85; }
+  #b-act-attack.active, #b-act-grenade.active, #b-act-skill.active {
+    background:var(--empire); color:var(--bg); border-color:var(--empire); font-weight:bold;
+  }
+  #b-act-attack.active kbd, #b-act-grenade.active kbd, #b-act-skill.active kbd {
+    border-color:rgba(12,15,17,0.5); color:var(--bg);
+  }
+  #b-attack-count, #b-grenade-count { margin-left:3px; font-size:11px; opacity:0.85; }
   #b-act-overwatch:not(:disabled) { border-color:var(--brood); color:var(--brood); }
   #b-act-hunker:not(:disabled) { border-color:var(--fg); color:var(--fg); }
-  #b-act-burrow:not(:disabled) { border-color:var(--brood-dim); color:var(--brood); }
+  #b-act-grenade:not(:disabled):not(.active) { border-color:var(--empire); color:var(--empire); }
+  #b-act-skill:not(:disabled):not(.active) { border-color:var(--brood-dim); color:var(--brood); }
   #b-act-retreat:not(:disabled) { border-color:var(--empire); color:var(--empire); }
-  #b-act-burrow[hidden], #b-act-retreat[hidden] { display:none; }
+  #b-act-retreat[hidden] { display:none; }
 
   #b-turn-slot { display:flex; align-items:center; gap:6px; margin-left:auto; }
   #b-end.all-done { border-color:var(--brood); background:var(--brood); color:var(--bg); font-weight:bold; }
@@ -194,6 +206,31 @@
   .roster-pips { letter-spacing:1px; margin-left:auto; }
   .roster-ap { color:var(--dim); min-width:3.8em; text-align:right; }
   .roster-tag { color:var(--brood); min-width:3.2em; text-align:right; font-size:12px; }
+
+  /* 전투 브리핑 · 캠페인 결산 · 30초 매뉴얼 모달 */
+  .brief-win { color:var(--brood); }
+  .brief-loss { color:var(--empire); }
+  .brief-stats {
+    display:grid; grid-template-columns:repeat(auto-fit, minmax(110px, 1fr)); gap:8px;
+    padding:10px 12px; border-bottom:1px solid #1d262b; background:#0e1316; font-size:13px;
+  }
+  .brief-stats b { color:var(--fg); }
+  .brief-body { padding:10px 12px; display:flex; flex-direction:column; gap:8px; font-size:13px; }
+  .brief-promo {
+    padding:6px 8px; border:1px solid var(--brood-dim); background:rgba(99,214,172,0.08);
+    color:var(--brood); font-size:12px;
+  }
+  .brief-cap { color:var(--brood); font-weight:bold; }
+  .brief-foot { display:flex; justify-content:flex-end; gap:8px; padding:8px 12px; border-top:1px solid var(--dim); }
+  .camp-row {
+    display:flex; align-items:center; gap:8px; padding:5px 8px;
+    border-bottom:1px solid #172025; font-size:12px;
+  }
+  .camp-row:last-child { border-bottom:0; }
+  .help-body { padding:10px 14px; font-size:13px; display:flex; flex-direction:column; gap:10px; max-height:74dvh; overflow-y:auto; }
+  .help-sec h4 { margin:0 0 4px; color:var(--brood); font-size:13px; }
+  .help-sec p { margin:2px 0; color:var(--fg); }
+  .help-grid { display:grid; grid-template-columns:1fr 1fr; gap:4px 12px; font-size:12px; }
 
   /* 모바일 전용 서랍/명령 바 */
   #sheet-bar, #mob-cmd, #mob-tabs { display:none; }
@@ -256,6 +293,8 @@
     <div id="top-actions">
       <button id="btn-overview">전구 전체<kbd>M</kbd></button>
       <button id="btn-squad">내 분대<kbd>F</kbd></button>
+      <button id="btn-sfx" type="button" title="효과음 켜기/끄기">음향 ON</button>
+      <button id="btn-help" type="button" title="작전·전술 가이드 (?)">?</button>
       <a href="./">단독 전투</a>
     </div>
   </header>
@@ -348,9 +387,12 @@
       <div id="b-title-wrap">
         <p id="b-status"></p>
         <span id="b-header"></span>
+        <span id="b-objective-bar" hidden></span>
       </div>
       <div id="b-top-right">
         <button id="b-btn-roster" type="button">분대<kbd>U</kbd></button>
+        <button id="b-btn-sfx" type="button" title="효과음 켜기/끄기">음향 ON</button>
+        <button id="b-btn-help" type="button" title="전술 가이드 (?)">?</button>
       </div>
     </header>
     <canvas id="b-screen" aria-label="전장"></canvas>
@@ -376,8 +418,9 @@
           <button id="b-act-attack" type="button">공격<span id="b-attack-count"></span><kbd>1</kbd></button>
           <button id="b-act-overwatch" type="button">경계<kbd>2</kbd></button>
           <button id="b-act-hunker" type="button">엄호<kbd>3</kbd></button>
-          <button id="b-act-burrow" type="button" hidden>잠복<kbd>4</kbd></button>
-          <button id="b-act-retreat" type="button" hidden>후퇴<kbd>5</kbd></button>
+          <button id="b-act-grenade" type="button">파열탄<span id="b-grenade-count"></span><kbd>4</kbd></button>
+          <button id="b-act-skill" type="button"><span id="b-skill-label">스킬</span><kbd>5</kbd></button>
+          <button id="b-act-retreat" type="button" hidden>후퇴<kbd>6</kbd></button>
         </div>
         <div id="b-turn-slot">
           <button id="b-confirm" hidden type="button">실행</button>
@@ -413,6 +456,73 @@
       <button id="b-roster-close" type="button">닫기<kbd>Esc</kbd></button>
     </div>
     <div id="b-roster-list"></div>
+  </div>
+</div>
+
+<!-- 전투 결과 브리핑 카드 (월드 복귀 시 자동 표시) -->
+<div id="briefing-modal" class="modal" hidden>
+  <div class="modal-box" role="dialog" aria-label="전투 결과 브리핑">
+    <div class="modal-head">
+      <span id="brief-title">■ 작전 브리핑</span>
+      <button id="brief-close" type="button">확인<kbd>Esc</kbd></button>
+    </div>
+    <div id="brief-content"></div>
+    <div class="brief-foot">
+      <button id="brief-ok" type="button" style="border-color:var(--brood);color:var(--brood)">작전 계속</button>
+    </div>
+  </div>
+</div>
+
+<!-- 캠페인 승리/패배 결산 모달 -->
+<div id="campaign-modal" class="modal" hidden>
+  <div class="modal-box" role="dialog" aria-label="전구 작전 결산">
+    <div class="modal-head">
+      <span id="camp-title">■ 캠페인 결산</span>
+      <button id="camp-close" type="button">지도 보기</button>
+    </div>
+    <div id="camp-content"></div>
+    <div class="brief-foot">
+      <button id="camp-new" type="button" style="border-color:var(--brood);background:var(--brood);color:var(--bg);font-weight:bold">새 전구 시작</button>
+    </div>
+  </div>
+</div>
+
+<!-- 30초 작전·전술 매뉴얼 모달 -->
+<div id="help-modal" class="modal" hidden>
+  <div class="modal-box" role="dialog" aria-label="30초 작전·전술 가이드">
+    <div class="modal-head">
+      <span>■ 작전 · 전술 매뉴얼</span>
+      <button id="help-close" type="button">닫기<kbd>Esc</kbd></button>
+    </div>
+    <div class="help-body">
+      <div class="help-sec">
+        <h4>전략 전구 (80×52 헥스)</h4>
+        <p><b>▲ 산맥</b>은 통과 불가(자연 길목 형성), <b>═ 도로</b>는 이동 속도 2배 + 보급권 연장. 보급권 안에서 <b>정비/개조(G)</b>로 치료·재개조·충원이 가능합니다.</p>
+        <p>특수부대(<b>◆</b>) 선택 후 타일을 클릭/드래그해 이동·매복·주둔·정찰을 지시합니다. <b>매복</b> 상태로 교전하면 1턴 조준+15·엄폐 무시 선제 기습을 얻습니다.</p>
+        <p><b>거점 목표</b>: <b>┴ 중계탑</b> 전투는 중계기(&amp;)를 파괴하면 즉시 승리, <b>보급대</b> 차단은 생체질 대량 보상, <b>인류 본진(◉)</b> 점령 시 캠페인 승리!</p>
+      </div>
+      <div class="help-sec">
+        <h4>전술 전투 (XCOM 조작)</h4>
+        <div class="help-grid">
+          <span><b>Tab</b> : 분대원 / 표적 순환</span>
+          <span><b>1</b> : 공격 조준 → 재입력 사격</span>
+          <span><b>2 / O</b> : 경계 (이동 적 대응사격)</span>
+          <span><b>3 / H</b> : 엄호 (방어+30·치명 면역)</span>
+          <span><b>4 / G</b> : 파열탄 (3×3 엄폐 파괴·피해2)</span>
+          <span><b>5 / F</b> : 병과 스킬 (표식/제압/잠복/재생)</span>
+          <span><b>6 / R</b> : 좌측 가장자리 후퇴</span>
+          <span><b>Space</b> : 턴 종료 / <b>Esc</b> : 취소</span>
+        </div>
+      </div>
+      <div class="help-sec">
+        <h4>엄폐 · 측면 치명타 · 베테랑</h4>
+        <p>엄폐 없는 <b>측면 노출(◈)</b> 표적은 <b>치명타 50%(피해 +2)</b>! 대원이 살아남고 적을 처치하면 <b>숙련 → 정예 → 고참</b>으로 진급해 조준·최대체력·치명타·경계 명중이 영구 상승합니다.</p>
+      </div>
+      <div class="help-sec">
+        <h4>제국 특수 병과</h4>
+        <p><b>&amp; 중계기</b>(생존 시 제국 협공) · <b>H 방패병</b>(정면 90° −40 엄폐) · <b>s 탐지기</b>(6칸 잠복 탐지) · <b>m 연막병</b>(3×3 시야 차단)</p>
+      </div>
+    </div>
   </div>
 </div>
 

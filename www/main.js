@@ -1,5 +1,6 @@
-// 단독 전술 전투 화면: 세이브/불러오기/XCOM 단축키를 관리하고 렌더링·입력은 battle_view.js에 위임한다.
+// 단독 전술 전투 화면: 세이브/불러오기/음향/전술 가이드/XCOM 단축키를 관리하고 렌더링·입력은 battle_view.js에 위임한다.
 import { createBattleView } from "./battle_view.js";
+import { sfx } from "./sfx.js";
 
 const SAVE_KEY = "crispy-octo-umbrella/save";
 const SAVE_VERSION = 1;
@@ -10,6 +11,21 @@ const wasm = instance.exports;
 
 let save = { v: SAVE_VERSION, seed: 0, events: [] };
 const rosterModal = $("roster-modal");
+const helpModal = $("help-modal");
+const debriefModal = $("debrief-modal");
+const sfxBtn = $("btn-sfx");
+
+function syncSfxBtn() {
+  if (sfxBtn) sfxBtn.textContent = sfx.isMuted() ? "음향 OFF" : "음향 ON";
+}
+syncSfxBtn();
+if (sfxBtn) {
+  sfxBtn.addEventListener("click", (ev) => {
+    ev.currentTarget.blur();
+    sfx.toggleMute();
+    syncSfxBtn();
+  });
+}
 
 function persist() {
   save.fp = wasm.fingerprint_lo();
@@ -33,6 +49,7 @@ const battle = createBattleView({
   rosterList: $("roster-list"),
   els: {
     status: $("status"),
+    objectiveEl: $("objective-bar"),
     hudEl: $("hud"),
     targetList: $("target-list"),
     readoutDetail: $("readout-detail"),
@@ -47,11 +64,18 @@ const battle = createBattleView({
     attackCount: $("attack-count"),
     overwatchBtn: $("act-overwatch"),
     hunkerBtn: $("act-hunker"),
-    burrowBtn: $("act-burrow"),
+    grenadeBtn: $("act-grenade"),
+    grenadeCount: $("grenade-count"),
+    skillBtn: $("act-skill"),
+    skillLabel: $("skill-label"),
     retreatBtn: $("act-retreat"),
     confirmBtn: $("confirm"),
     endBtn: $("end"),
     seedEl: $("seed"),
+    debriefModal,
+    debriefTitle: $("debrief-title"),
+    debriefBody: $("debrief-body"),
+    debriefCloseBtn: $("debrief-close"),
   },
   getSeed: () => save.seed,
   onEvent: (ev) => {
@@ -81,6 +105,8 @@ function load(data) {
     else if (e === "o") wasm.overwatch();
     else if (e === "h") wasm.hunker();
     else if (e === "r") wasm.retreat();
+    else if (Array.isArray(e) && e.length === 3 && e[0] === "g") wasm.grenade(e[1] | 0, e[2] | 0);
+    else if (Array.isArray(e) && e.length === 3 && e[0] === "k") wasm.class_skill(e[1] | 0, e[2] | 0);
     else if (Array.isArray(e) && e.length === 2) wasm.click(e[0] | 0, e[1] | 0);
     else throw new Error("세이브 형식이 맞지 않음");
   }
@@ -101,12 +127,17 @@ window.addEventListener("resize", () => {
   }, 100);
 });
 
-$("new").addEventListener("click", () => {
+const startFresh = () => {
   fail("");
+  sfx.uiClick();
   newGame(crypto.getRandomValues(new Uint32Array(1))[0]);
-});
+};
+$("new").addEventListener("click", startFresh);
+$("debrief-new").addEventListener("click", startFresh);
 
-$("btn-roster").addEventListener("click", () => {
+$("btn-roster").addEventListener("click", (ev) => {
+  ev.currentTarget.blur();
+  sfx.uiClick();
   rosterModal.hidden = !rosterModal.hidden;
 });
 $("roster-close").addEventListener("click", () => {
@@ -116,20 +147,35 @@ rosterModal.addEventListener("click", (ev) => {
   if (ev.target === rosterModal) rosterModal.hidden = true;
 });
 
+$("btn-help").addEventListener("click", (ev) => {
+  ev.currentTarget.blur();
+  sfx.uiClick();
+  helpModal.hidden = !helpModal.hidden;
+});
+$("help-close").addEventListener("click", () => {
+  helpModal.hidden = true;
+});
+helpModal.addEventListener("click", (ev) => {
+  if (ev.target === helpModal) helpModal.hidden = true;
+});
+
 document.addEventListener("keydown", (ev) => {
+  if (ev.key === "?" || (ev.code === "Slash" && ev.shiftKey)) {
+    ev.preventDefault();
+    helpModal.hidden = !helpModal.hidden;
+    return;
+  }
   if (ev.code === "KeyU") {
     ev.preventDefault();
     rosterModal.hidden = !rosterModal.hidden;
     return;
   }
   if (ev.code === "Escape") {
-    if (!rosterModal.hidden) {
-      rosterModal.hidden = true;
-      return;
-    }
+    if (!helpModal.hidden) { helpModal.hidden = true; return; }
+    if (!rosterModal.hidden) { rosterModal.hidden = true; return; }
     if (battle.handleKey(ev)) return;
   }
-  if (!rosterModal.hidden) return;
+  if (!rosterModal.hidden || !helpModal.hidden) return;
   if (battle.handleKey(ev)) return;
 });
 

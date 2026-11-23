@@ -37,6 +37,83 @@ pub const SMOKE_CHARGES: u8 = 2;
 pub const OVERWATCH_PENALTY: i32 = 15;
 /// 엄호(Hunker Down) 시 더해지는 추가 방어(엄폐) 수치.
 pub const HUNKER_BONUS: i32 = 30;
+/// 생체 파열탄(수류탄) 투척 사거리 · 폭발 반경(3×3) · 확정 피해 · 기본 보유량.
+pub const GRENADE_RANGE: i32 = 6;
+pub const GRENADE_RADIUS: i32 = 1;
+pub const GRENADE_DMG: i32 = 2;
+pub const GRENADE_CHARGES: u8 = 1;
+/// 치명타 확률 및 추가 피해 (측면 노출 시 +40%, 엄호 대상은 치명타 면역).
+pub const BASE_CRIT: i32 = 10;
+pub const FLANK_CRIT: i32 = 40;
+pub const SNIPER_CRIT: i32 = 15;
+pub const CRIT_BONUS_DMG: i32 = 2;
+/// 병과 고유 스킬 수치: 저격 표식 / 화력 제압 / 원형 응급 재생 / 매복 기습.
+pub const MARK_RANGE: i32 = 14;
+pub const MARK_AIM: i32 = 20;
+pub const MARK_CRIT: i32 = 15;
+pub const SUPPRESS_AIM_PENALTY: i32 = 30;
+pub const REGEN_HEAL: i32 = 2;
+pub const REGEN_CHARGES: u8 = 1;
+pub const AMBUSH_AIM: i32 = 15;
+
+pub const CALLSIGN_PREFIX: [char; 8] = ['V', 'K', 'R', 'S', 'M', 'T', 'N', 'X'];
+
+pub fn format_callsign(id: u16) -> String {
+    let p = CALLSIGN_PREFIX[(id as usize) % CALLSIGN_PREFIX.len()];
+    let n = ((id as usize) % 99) + 1;
+    format!("{p}-{n:02}")
+}
+
+/// 생존 전투 수와 누적 처치 수로 베테랑 계급(0..=3)을 산출한다.
+pub fn rank_from_service(battles: u32, kills: u32) -> u8 {
+    let score = battles + kills / 2;
+    if score >= 6 {
+        3
+    } else if score >= 3 {
+        2
+    } else if score >= 1 {
+        1
+    } else {
+        0
+    }
+}
+
+pub fn rank_label(rank: u8) -> &'static str {
+    match rank {
+        0 => "신병",
+        1 => "숙련",
+        2 => "정예",
+        _ => "고참",
+    }
+}
+
+pub fn rank_aim_bonus(rank: u8) -> i32 {
+    (rank.min(3) as i32) * 5
+}
+
+pub fn rank_hp_bonus(rank: u8) -> i32 {
+    match rank {
+        0 | 1 => 0,
+        2 => 1,
+        _ => 2,
+    }
+}
+
+pub fn rank_crit_bonus(rank: u8) -> i32 {
+    match rank {
+        0 | 1 => 0,
+        2 => 5,
+        _ => 10,
+    }
+}
+
+pub fn rank_ow_bonus(rank: u8) -> i32 {
+    match rank {
+        0 => 0,
+        1 | 2 => 5,
+        _ => 10,
+    }
+}
 
 pub type Pos = (i32, i32);
 
@@ -113,6 +190,7 @@ pub struct Unit {
     pub class: Class,
     pub gene: Gene,
     pub hp: i32,
+    pub max_hp: i32,
     pub pos: Pos,
     pub ap: u8,
     /// 이번 턴에 움직였는가.
@@ -121,41 +199,84 @@ pub struct Unit {
     pub burrowed: bool,
     /// 경계 태세인가 (시야·사거리 안으로 이동하는 적에게 자동 대응 사격).
     pub overwatch: bool,
-    /// 엄호(Hunker Down) 태세인가 (다음 자기 턴까지 추가 엄폐 방어).
+    /// 엄호(Hunker Down) 태세인가 (다음 자기 턴까지 추가 엄폐 방어 + 치명타 면역).
     pub hunkered: bool,
-    /// 남은 연막 수.
+    /// 저격 표식 상태인가 (아군 사격 시 조준 +20, 치명타 +15%).
+    pub marked: bool,
+    /// 화력 제압 상태인가 (조준 -30, 이동력 절반).
+    pub suppressed: bool,
+    /// 남은 연막(연막병) 또는 응급 재생(원형 지원) 횟수.
     pub charges: u8,
+    /// 남은 생체 파열탄(엄폐 파괴 수류탄) 수.
+    pub grenades: u8,
     /// 합동전 아군 AI 일반군처럼 기계가 조종하는 아군 유닛인가.
     pub ai_controlled: bool,
     /// 전장 가장자리로 무사히 후퇴했는가.
     pub retreated: bool,
     /// 월드 특수부대 대원 번호 (특수부대원이 아니면 None).
     pub squad_slot: Option<usize>,
+    /// 베테랑 계급(0..=3) 및 호출부호 ID.
+    pub rank: u8,
+    pub callsign_id: u16,
+    /// 이번 전투에서 기록한 처치 수.
+    pub kills: u16,
 }
 
 impl Unit {
     fn new(side: Side, class: Class, gene: Gene, pos: Pos) -> Unit {
-        let charges = if class == Class::Smoker { SMOKE_CHARGES } else { 0 };
+        let charges = if class == Class::Smoker {
+            SMOKE_CHARGES
+        } else if side == Side::Brood && gene == Gene::Plain {
+            REGEN_CHARGES
+        } else {
+            0
+        };
+        let grenades = if side == Side::Brood { GRENADE_CHARGES } else { 0 };
+        let max_hp = class.def().hp;
         Unit {
             side,
             class,
             gene,
-            hp: class.def().hp,
+            hp: max_hp,
+            max_hp,
             pos,
             ap: AP_PER_TURN,
             moved: false,
             burrowed: false,
             overwatch: false,
             hunkered: false,
+            marked: false,
+            suppressed: false,
             charges,
+            grenades,
             ai_controlled: false,
             retreated: false,
             squad_slot: None,
+            rank: 0,
+            callsign_id: 0,
+            kills: 0,
         }
     }
 
     pub fn alive(&self) -> bool {
         self.hp > 0 && !self.retreated
+    }
+
+    pub fn effective_mv(&self) -> i32 {
+        let base = self.class.def().mv;
+        if self.suppressed {
+            (base / 2).max(2)
+        } else {
+            base
+        }
+    }
+
+    pub fn callsign(&self) -> String {
+        if self.side == Side::Brood && !self.ai_controlled {
+            format_callsign(self.callsign_id)
+        } else {
+            String::new()
+        }
     }
 
     pub fn glyph(&self) -> char {
@@ -201,31 +322,56 @@ pub enum BattleBiome {
     Road,
 }
 
+/// 전술 전투 승리 목표.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BattleObjective {
+    /// 적 전멸.
+    Eliminate,
+    /// 중계탑 파괴: 제국 중계기(&)를 모두 제거하면 즉시 승리.
+    DestroyRelay,
+    /// 제국 보급대 매복 차단: 격파 시 생체질 보너스.
+    AmbushConvoy,
+}
+
+impl BattleObjective {
+    pub fn label(self) -> &'static str {
+        match self {
+            BattleObjective::Eliminate => "적 섬멸",
+            BattleObjective::DestroyRelay => "중계기 파괴",
+            BattleObjective::AmbushConvoy => "보급대 차단",
+        }
+    }
+}
+
 /// 월드 충돌에서 전술 전투로 넘기는 설정.
 #[derive(Clone, Debug)]
 pub struct BattleConfig {
     pub seed: u64,
     /// 특수부대 대원들: `(월드 슬롯 번호, 개조, 현재 체력)`.
     pub special: Vec<(usize, Gene, i32)>,
+    /// 특수부대 베테랑 메타 정보: `(계급, 호출부호ID, 최대체력)`. 비어 있으면 기본값 사용.
+    pub member_meta: Vec<(u8, u16, i32)>,
     /// 합동 참전 아군 AI 일반군 수.
     pub allied_ai: usize,
     /// 제국 편제.
     pub empire: Vec<Class>,
-    /// 매복 기습: 제국이 엄폐 없이 노출 시작, 잠복 개조 대원은 숨은 채 시작.
+    /// 매복 기습: 제국이 엄폐 없이 노출 시작, 1턴 선제 기습 보너스.
     pub ambush: bool,
     /// 주둔 방어: 아군 앞줄에 낮은 엄폐 보장.
     pub garrison: bool,
     /// 중계탑 차단 구역: 제국 중계기 제외.
     pub relay_cut: bool,
     pub biome: BattleBiome,
+    pub objective: BattleObjective,
     pub title: String,
     pub tags: Vec<String>,
 }
 
-/// 사격 한 번의 명중률과 그 내역. 화면에 보이는 숫자가 곧 굴리는 숫자다.
+/// 사격 한 번의 명중률·치명타율과 그 내역. 화면에 보이는 숫자가 곧 굴리는 숫자다.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Shot {
     pub chance: i32,
+    pub crit: i32,
     pub aim: i32,
     pub cover: i32,
     pub falloff: i32,
@@ -237,7 +383,7 @@ pub enum Event {
     /// 한 칸 이동.
     Step { unit: usize, from: Pos, to: Pos },
     /// 사격 한 번. `log_lines`는 이 사격이 기록에 남긴 줄 수.
-    Shot { shooter: usize, target: usize, hit: bool, dmg: i32, killed: bool, log_lines: usize },
+    Shot { shooter: usize, target: usize, hit: bool, crit: bool, dmg: i32, killed: bool, log_lines: usize },
     /// 땅에 숨었다.
     Burrow { unit: usize },
     /// 연막이 깔렸다. `center` 둘레 3×3.
@@ -250,6 +396,14 @@ pub enum Event {
     OverwatchTrigger { shooter: usize, target: usize },
     /// 엄호(Hunker Down) 태세에 들어갔다.
     Hunker { unit: usize },
+    /// 생체 파열탄(수류탄) 투척. `destroyed`는 파괴된 엄폐물 좌표, `hits`는 피해 입은 `(유닛, 피해, 사망여부)`.
+    Grenade { unit: usize, to: Pos, destroyed: Vec<Pos>, hits: Vec<(usize, i32, bool)> },
+    /// 저격 표식 지정.
+    Mark { unit: usize, target: usize },
+    /// 화력 제압 사격.
+    Suppress { unit: usize, target: usize },
+    /// 원형 응급 재생.
+    Regen { unit: usize, target: usize, amount: i32 },
 }
 
 #[derive(Clone, Debug)]
@@ -260,6 +414,9 @@ pub struct Game {
     pub round: u32,
     pub selected: Option<usize>,
     pub outcome: Option<Side>,
+    pub objective: BattleObjective,
+    /// 매복 기습 1턴 보너스 활성 여부 (아군 특수부대 첫 턴 사격 조준+15·엄폐 무시).
+    pub ambush_turn: bool,
     pub log: Vec<String>,
     pub events: Vec<Event>,
     /// 칸마다 연막이 남아 있는 라운드 수.
@@ -322,7 +479,9 @@ impl Game {
         };
         let mut units = Vec::new();
         for (i, g) in brood.iter().enumerate() {
-            units.push(Unit::new(Side::Brood, Class::Proto, *g, (1, row(i, brood.len(), 3))));
+            let mut u = Unit::new(Side::Brood, Class::Proto, *g, (1, row(i, brood.len(), 3)));
+            u.callsign_id = ((seed as usize + i * 7) % 96) as u16;
+            units.push(u);
         }
         for (i, c) in empire.iter().enumerate() {
             let x = if *c == Class::Relay { W - 1 } else { W - 2 };
@@ -336,6 +495,8 @@ impl Game {
             round: 1,
             selected: None,
             outcome: None,
+            objective: BattleObjective::Eliminate,
+            ambush_turn: false,
             log: Vec::new(),
             events: Vec::new(),
             smoke: vec![0; (W * H) as usize],
@@ -348,7 +509,7 @@ impl Game {
         g
     }
 
-    /// 월드 충돌 설정으로 전술 전투를 만든다. 매복·주둔·중계 차단·합동 참전·지형 구조를 반영한다.
+    /// 월드 충돌 설정으로 전술 전투를 만든다. 매복·주둔·중계 차단·합동 참전·지형·목표·베테랑 계급을 반영한다.
     pub fn from_battle(cfg: &BattleConfig) -> Game {
         let mut rng = Rng::new(cfg.seed);
         let mut tiles = vec![Tile::Floor; (W * H) as usize];
@@ -382,7 +543,14 @@ impl Game {
         for (i, &(slot, gene, hp)) in cfg.special.iter().take(sp_count).enumerate() {
             let y = row(i, sp_count, 3);
             let mut u = Unit::new(Side::Brood, Class::Proto, gene, (1, y));
-            u.hp = hp.clamp(1, u.class.def().hp);
+            if let Some(&(rank, callsign_id, max_hp)) = cfg.member_meta.get(i) {
+                u.rank = rank.min(3);
+                u.callsign_id = callsign_id;
+                u.max_hp = max_hp.max(u.class.def().hp);
+            } else {
+                u.callsign_id = ((cfg.seed as usize + slot * 7) % 96) as u16;
+            }
+            u.hp = hp.clamp(1, u.max_hp);
             u.squad_slot = Some(slot);
             if cfg.ambush && gene == Gene::Burrow {
                 u.burrowed = true;
@@ -401,6 +569,8 @@ impl Game {
             tiles[idx((x, y))] = Tile::Floor;
             let mut u = Unit::new(Side::Brood, Class::Proto, Gene::Plain, (x, y));
             u.ai_controlled = true;
+            u.grenades = 0;
+            u.charges = 0;
             units.push(u);
         }
 
@@ -408,7 +578,7 @@ impl Game {
             .empire
             .iter()
             .copied()
-            .filter(|&c| !(cfg.relay_cut && c == Class::Relay))
+            .filter(|&c| !(cfg.relay_cut && c == Class::Relay && cfg.objective != BattleObjective::DestroyRelay))
             .take(H as usize)
             .collect();
         for (i, c) in emp_list.iter().enumerate() {
@@ -424,6 +594,15 @@ impl Game {
             units.push(Unit::new(Side::Empire, *c, Gene::Plain, (x, y)));
         }
 
+        // DestroyRelay 목표인데 중계기가 없으면 최소 1기를 보장한다.
+        let effective_obj = if cfg.objective == BattleObjective::DestroyRelay
+            && !units.iter().any(|u| u.side == Side::Empire && u.class == Class::Relay)
+        {
+            BattleObjective::Eliminate
+        } else {
+            cfg.objective
+        };
+
         let memory = vec![None; units.len()];
         let mut g = Game {
             seed: cfg.seed,
@@ -432,6 +611,8 @@ impl Game {
             round: 1,
             selected: None,
             outcome: None,
+            objective: effective_obj,
+            ambush_turn: cfg.ambush,
             log: Vec::new(),
             events: Vec::new(),
             smoke: vec![0; (W * H) as usize],
@@ -555,8 +736,8 @@ impl Game {
         }
     }
 
-    /// 명중률 계산의 한 곳. `shooter`가 `from`에서 `target` 칸을 쏜다고 칠 때.
-    /// - `target_unit`: 그 칸에 설 유닛. 방패를 따지는 데 쓴다.
+    /// 명중률·치명타율 계산의 한 곳. `shooter`가 `from`에서 `target` 칸을 쏜다고 칠 때.
+    /// - `target_unit`: 그 칸에 설 유닛. 방패·엄호·표식을 따지는 데 쓴다.
     /// - `settled`: 그 턴에 움직이지 않고 쏘는가 (저격).
     /// - `ambush`: 숨어 있다가 쏘는가 (잠복). 엄폐를 무시한다.
     pub fn shot_calc(&self, shooter: usize, from: Pos, target: Pos, target_unit: Option<usize>, settled: bool, ambush: bool) -> Option<Shot> {
@@ -566,17 +747,34 @@ impl Game {
             return None;
         }
         let steady = u.gene == Gene::Sniper && settled;
-        let aim = u.class.def().aim + if steady { SNIPER_AIM } else { 0 };
-        let cover = if ambush {
+        let ambush_bonus = self.ambush_turn && u.side == Side::Brood && !u.ai_controlled;
+        let mark_bonus = target_unit.is_some_and(|t| self.units[t].marked);
+        let suppress_penalty = if u.suppressed { SUPPRESS_AIM_PENALTY } else { 0 };
+        let aim = u.class.def().aim
+            + rank_aim_bonus(u.rank)
+            + if steady { SNIPER_AIM } else { 0 }
+            + if ambush_bonus { AMBUSH_AIM } else { 0 }
+            + if mark_bonus { MARK_AIM } else { 0 }
+            - suppress_penalty;
+        let target_hunkered = target_unit.is_some_and(|t| self.units[t].hunkered);
+        let cover = if ambush || ambush_bonus {
             0
         } else {
             let base = self.cover(from, target).max(target_unit.map_or(0, |t| self.shield_cover(t, target, from)));
-            let hunker = if target_unit.is_some_and(|t| self.units[t].hunkered) { HUNKER_BONUS } else { 0 };
+            let hunker = if target_hunkered { HUNKER_BONUS } else { 0 };
             base + hunker
         };
         let falloff = if steady { 0 } else { (d - FALLOFF_START).max(0) * FALLOFF_PER_TILE };
         let chance = (aim - cover - falloff).clamp(0, 100);
-        Some(Shot { chance, aim, cover, falloff })
+        let crit = if target_hunkered {
+            0
+        } else {
+            let flank = if cover == 0 { FLANK_CRIT } else { 0 };
+            let snipe = if steady { SNIPER_CRIT } else { 0 };
+            let mark = if mark_bonus { MARK_CRIT } else { 0 };
+            (BASE_CRIT + flank + snipe + mark + rank_crit_bonus(u.rank)).clamp(0, 100)
+        };
+        Some(Shot { chance, crit, aim, cover, falloff })
     }
 
     /// `shooter`가 `from` 칸에 있다고 치고 `target` 칸을 쏠 때의 명중률.
@@ -659,7 +857,7 @@ impl Game {
             head += 1;
             let pi = p.1 * W + p.0;
             let c = cost[pi as usize];
-            if c == u.class.def().mv {
+            if c == u.effective_mv() {
                 continue;
             }
             for d in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
@@ -732,10 +930,12 @@ impl Game {
         true
     }
 
-    /// 경계 사격의 명중률 (`OVERWATCH_PENALTY` 감점 적용).
+    /// 경계 사격의 명중률 (`OVERWATCH_PENALTY` 감점 적용, 베테랑 계급이 감점을 줄여 준다).
     pub fn overwatch_shot(&self, shooter: usize, target: usize) -> Option<Shot> {
         let mut shot = self.shot(shooter, target)?;
-        shot.chance = (shot.chance - OVERWATCH_PENALTY).clamp(0, 100);
+        let pen = (OVERWATCH_PENALTY - rank_ow_bonus(self.units[shooter].rank)).max(0);
+        shot.chance = (shot.chance - pen).clamp(0, 100);
+        shot.crit = 0;
         Some(shot)
     }
 
@@ -762,6 +962,7 @@ impl Game {
                 if self.units[mover].alive() {
                     self.log.push(format!("[경계] {sn} → {tn}  {}%  적중, 피해 {dmg}", shot.chance));
                 } else {
+                    self.units[w].kills = self.units[w].kills.saturating_add(1);
                     self.log.push(format!("[경계] {sn} → {tn}  {}%  적중, 사망", shot.chance));
                     if self.units[mover].class == Class::Relay && !self.network_up() {
                         self.log.push("중계 두절. 제국 분대가 각자 판단으로 전환.".to_string());
@@ -777,6 +978,7 @@ impl Game {
                 shooter: w,
                 target: mover,
                 hit,
+                crit: false,
                 dmg,
                 killed: !self.units[mover].alive(),
                 log_lines: self.log.len() - log_before,
@@ -1022,6 +1224,177 @@ impl Game {
         true
     }
 
+    /// 선택한 유닛이 지금 생체 파열탄(엄폐 파괴 수류탄)을 던질 수 있는가.
+    pub fn can_grenade(&self) -> bool {
+        self.selected.is_some_and(|s| {
+            let u = &self.units[s];
+            self.outcome.is_none()
+                && u.side == Side::Brood
+                && !u.ai_controlled
+                && u.alive()
+                && u.ap > 0
+                && u.grenades > 0
+        })
+    }
+
+    /// 선택한 유닛이 `to` 칸에 파열탄을 던져 3×3 범위 엄폐물을 파괴하고 확정 피해(`GRENADE_DMG`)를 준다.
+    pub fn grenade(&mut self, to: Pos) -> bool {
+        if !self.can_grenade() || !in_bounds(to) {
+            return false;
+        }
+        let s = self.selected.unwrap();
+        let from = self.units[s].pos;
+        if dist(from, to) == 0 || dist(from, to) > GRENADE_RANGE {
+            return false;
+        }
+        self.units[s].grenades -= 1;
+        self.units[s].ap = 0;
+        self.units[s].burrowed = false;
+        self.units[s].overwatch = false;
+        self.units[s].hunkered = false;
+
+        let mut destroyed = Vec::new();
+        for dy in -GRENADE_RADIUS..=GRENADE_RADIUS {
+            for dx in -GRENADE_RADIUS..=GRENADE_RADIUS {
+                let p = (to.0 + dx, to.1 + dy);
+                if in_bounds(p) && self.tile(p) != Tile::Floor {
+                    self.tiles[idx(p)] = Tile::Floor;
+                    destroyed.push(p);
+                }
+            }
+        }
+
+        let mut hits = Vec::new();
+        for i in 0..self.units.len() {
+            if !self.units[i].alive() {
+                continue;
+            }
+            if dist(self.units[i].pos, to) <= GRENADE_RADIUS {
+                self.units[i].hp -= GRENADE_DMG;
+                self.units[i].hunkered = false;
+                let killed = !self.units[i].alive();
+                if killed {
+                    if self.units[i].side != self.units[s].side {
+                        self.units[s].kills = self.units[s].kills.saturating_add(1);
+                    }
+                    if self.selected == Some(i) {
+                        self.selected = None;
+                    }
+                    if self.units[i].class == Class::Relay && !self.network_up() {
+                        self.log.push("중계 두절. 제국 분대가 각자 판단으로 전환.".to_string());
+                    }
+                }
+                hits.push((i, GRENADE_DMG, killed));
+            }
+        }
+
+        let sn = self.units[s].name();
+        self.log.push(format!(
+            "{sn} 파열탄 투척 (엄폐 {} 파괴, {}명 피격)",
+            destroyed.len(),
+            hits.len()
+        ));
+        self.events.push(Event::Grenade { unit: s, to, destroyed, hits });
+        self.observe();
+        self.check_outcome();
+        true
+    }
+
+    /// 선택한 유닛의 병과 고유 스킬 정보: `(스킬코드, 이름, 표적필요여부)`.
+    /// 스킬코드: 1=잠복(즉시), 2=저격 표식(적 표적), 3=화력 제압(적 표적), 4=원형 응급재생(아군/자기).
+    pub fn class_skill_info(&self) -> Option<(u8, &'static str, bool)> {
+        let s = self.selected?;
+        if self.outcome.is_some() {
+            return None;
+        }
+        let u = &self.units[s];
+        if u.side != Side::Brood || u.ai_controlled || !u.alive() || u.ap == 0 {
+            return None;
+        }
+        match u.gene {
+            Gene::Burrow if !u.burrowed => Some((1, "잠복", false)),
+            Gene::Sniper => Some((2, "표식", true)),
+            Gene::Burst => Some((3, "제압", true)),
+            Gene::Plain if u.charges > 0 => Some((4, "재생", true)),
+            _ => None,
+        }
+    }
+
+    /// 선택한 유닛의 병과 고유 스킬을 실행한다.
+    pub fn class_skill(&mut self, target: Option<Pos>) -> bool {
+        let Some((code, _, _)) = self.class_skill_info() else { return false };
+        let s = self.selected.unwrap();
+        match code {
+            1 => self.dig_in(s),
+            2 => {
+                // 저격 표식: 행동 1 소모, 시야·사거리 내 적 표식 (아군 사격 조준+20, 치명+15%)
+                let Some(p) = target.filter(|&p| in_bounds(p)) else { return false };
+                let Some(t) = self.unit_at(p) else { return false };
+                if self.units[t].side != Side::Empire
+                    || !self.visible_to(Side::Brood, t)
+                    || dist(self.units[s].pos, p) > MARK_RANGE
+                    || !self.los(self.units[s].pos, p)
+                    || self.units[t].marked
+                {
+                    return false;
+                }
+                self.units[t].marked = true;
+                self.units[s].ap = self.units[s].ap.saturating_sub(1);
+                self.units[s].overwatch = false;
+                self.units[s].hunkered = false;
+                let (sn, tn) = (self.units[s].name(), self.units[t].name());
+                self.log.push(format!("{sn} → {tn} 표식 (조준 +20, 치명 +15%)"));
+                self.events.push(Event::Mark { unit: s, target: t });
+                true
+            }
+            3 => {
+                // 화력 제압: 남은 행동 전부 소모, 사선 내 적 제압 (조준 -30, 이동력 절반)
+                let Some(p) = target.filter(|&p| in_bounds(p)) else { return false };
+                let Some(t) = self.unit_at(p) else { return false };
+                if self.units[t].side != Side::Empire || self.shot(s, t).is_none() || self.units[t].suppressed {
+                    return false;
+                }
+                self.units[t].suppressed = true;
+                self.units[t].overwatch = false;
+                self.units[s].ap = 0;
+                self.units[s].burrowed = false;
+                self.units[s].overwatch = false;
+                self.units[s].hunkered = false;
+                let (sn, tn) = (self.units[s].name(), self.units[t].name());
+                self.log.push(format!("{sn} → {tn} 제압 사격 (조준 −30, 이동 저하)"));
+                self.events.push(Event::Suppress { unit: s, target: t });
+                true
+            }
+            4 => {
+                // 원형 응급 재생: 행동 1 + 충전 1 소모, 자신 또는 인접(거리 2 이내) 아군 체력 +2 회복
+                let p = target.unwrap_or(self.units[s].pos);
+                if !in_bounds(p) || dist(self.units[s].pos, p) > 2 {
+                    return false;
+                }
+                let Some(t) = self.unit_at(p) else { return false };
+                if self.units[t].side != Side::Brood
+                    || !self.units[t].alive()
+                    || self.units[t].hp >= self.units[t].max_hp
+                    || self.units[s].charges == 0
+                {
+                    return false;
+                }
+                let before = self.units[t].hp;
+                self.units[t].hp = (self.units[t].hp + REGEN_HEAL).min(self.units[t].max_hp);
+                let healed = self.units[t].hp - before;
+                self.units[s].charges -= 1;
+                self.units[s].ap = self.units[s].ap.saturating_sub(1);
+                self.units[s].overwatch = false;
+                self.units[s].hunkered = false;
+                let (sn, tn) = (self.units[s].name(), self.units[t].name());
+                self.log.push(format!("{sn} → {tn} 응급 재생 (+{healed})"));
+                self.events.push(Event::Regen { unit: s, target: t, amount: healed });
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// 플레이어 턴을 끝낸다. 합동 아군 AI → 제국 AI 순서로 움직이고 다음 라운드가 시작된다.
     pub fn end_turn(&mut self) {
         if self.outcome.is_some() {
@@ -1042,12 +1415,14 @@ impl Game {
     }
 
     /// 라운드를 넘긴다. 행동이 돌아오고 연막이 한 라운드만큼 걷힌다.
-    /// 아군의 경계·엄호 태세는 새 턴이 시작되며 해제되고, 제국의 경계는 이번 플레이어 턴 동안 유지된다.
+    /// 아군의 경계·엄호 태세와 표식·제압·매복 선제턴 보너스가 갱신된다.
     pub fn next_round(&mut self) {
         for u in &mut self.units {
             if u.alive() {
                 u.ap = AP_PER_TURN;
                 u.moved = false;
+                u.marked = false;
+                u.suppressed = false;
                 if u.side == Side::Brood {
                     u.overwatch = false;
                     u.hunkered = false;
@@ -1057,12 +1432,19 @@ impl Game {
         for s in &mut self.smoke {
             *s = s.saturating_sub(1);
         }
+        self.ambush_turn = false;
         self.round += 1;
         self.observe();
     }
 
     fn check_outcome(&mut self) {
         if !self.units.iter().any(|u| u.alive() && u.side == Side::Empire) {
+            self.outcome = Some(Side::Brood);
+            return;
+        }
+        if self.objective == BattleObjective::DestroyRelay
+            && !self.units.iter().any(|u| u.alive() && u.side == Side::Empire && u.class == Class::Relay)
+        {
             self.outcome = Some(Side::Brood);
             return;
         }
@@ -1075,11 +1457,12 @@ impl Game {
     }
 
     /// 사격. 보통은 그 유닛의 턴을 끝낸다. 화력 개조는 가까운 표적에 행동 1만 쓴다.
-    /// 숨어 있었으면 나온다.
+    /// 숨어 있었으면 나온다. 적중 시 치명타 확률을 굴려 추가 피해를 준다.
     pub(crate) fn fire(&mut self, s: usize, t: usize) {
         let Some(shot) = self.shot(s, t) else { return };
         let roll = self.rng.below(100) as i32;
         let hit = roll < shot.chance;
+        let crit = hit && shot.crit > 0 && (self.rng.below(100) as i32) < shot.crit;
         let close = dist(self.units[s].pos, self.units[t].pos) <= BURST_RANGE;
         if self.units[s].gene == Gene::Burst && close {
             self.units[s].ap -= 1;
@@ -1091,13 +1474,19 @@ impl Game {
         self.units[s].hunkered = false;
         let log_before = self.log.len();
         let (sn, tn) = (self.units[s].name(), self.units[t].name());
+        let dmg = if hit {
+            self.units[s].class.def().dmg + if crit { CRIT_BONUS_DMG } else { 0 }
+        } else {
+            0
+        };
         if hit {
-            let dmg = self.units[s].class.def().dmg;
             self.units[t].hp -= dmg;
+            let tag = if crit { "치명!" } else { "적중" };
             if self.units[t].alive() {
-                self.log.push(format!("{sn} → {tn}  {}%  적중, 피해 {dmg}", shot.chance));
+                self.log.push(format!("{sn} → {tn}  {}%  {tag}, 피해 {dmg}", shot.chance));
             } else {
-                self.log.push(format!("{sn} → {tn}  {}%  적중, 사망", shot.chance));
+                self.units[s].kills = self.units[s].kills.saturating_add(1);
+                self.log.push(format!("{sn} → {tn}  {}%  {tag}, 사망", shot.chance));
                 if self.units[t].class == Class::Relay && !self.network_up() {
                     self.log.push("중계 두절. 제국 분대가 각자 판단으로 전환.".to_string());
                 }
@@ -1112,7 +1501,8 @@ impl Game {
             shooter: s,
             target: t,
             hit,
-            dmg: if hit { self.units[s].class.def().dmg } else { 0 },
+            crit,
+            dmg,
             killed: !self.units[t].alive(),
             log_lines: self.log.len() - log_before,
         });
@@ -1128,7 +1518,10 @@ impl Game {
             h = h.wrapping_mul(0x100000001b3);
         };
         mix(self.rng.state());
-        mix(self.round as u64);
+        mix(self.round as u64 | ((self.ambush_turn as u64) << 32));
+        for &t in &self.tiles {
+            mix(t as u64);
+        }
         for u in &self.units {
             mix(u.hp as u64);
             mix(u.pos.0 as u64);
@@ -1139,7 +1532,11 @@ impl Game {
                     | (u.burrowed as u64) << 1
                     | (u.charges as u64) << 2
                     | (u.overwatch as u64) << 6
-                    | (u.hunkered as u64) << 7,
+                    | (u.hunkered as u64) << 7
+                    | (u.marked as u64) << 8
+                    | (u.suppressed as u64) << 9
+                    | (u.grenades as u64) << 10
+                    | (u.rank as u64) << 14,
             );
         }
         for m in &self.memory {
@@ -1293,12 +1690,14 @@ mod battle_biome_tests {
             let cfg = BattleConfig {
                 seed: 77,
                 special: vec![(0, Gene::Sniper, 5), (1, Gene::Burst, 5)],
+                member_meta: vec![],
                 allied_ai: 0,
                 empire: vec![Class::Trooper, Class::Shield],
                 ambush: false,
                 garrison: false,
                 relay_cut: false,
                 biome,
+                objective: BattleObjective::Eliminate,
                 title: "test".to_string(),
                 tags: vec![],
             };
@@ -1393,9 +1792,92 @@ mod battle_biome_tests {
         let after = g.shot(1, 0).unwrap();
         assert_eq!(after.cover, COVER_LOW + HUNKER_BONUS);
         assert_eq!(after.chance, (before.chance - HUNKER_BONUS).max(0));
+        assert_eq!(after.crit, 0, "엄호 중이면 치명타 면역");
 
         g.next_round();
         assert!(!g.units[0].hunkered);
+    }
+
+    #[test]
+    fn grenade_destroys_cover_and_damages_in_blast() {
+        let mut g = Game::with_units(31, &[Gene::Plain], &[Class::Trooper]);
+        g.tiles.fill(Tile::Floor);
+        g.units[0].pos = (5, 6);
+        g.units[1].pos = (10, 6);
+        g.tiles[idx((9, 6))] = Tile::Wall;
+        g.tiles[idx((10, 5))] = Tile::Low;
+
+        assert!(g.click((5, 6)));
+        assert!(g.can_grenade());
+        assert!(g.grenade((10, 6)));
+        assert_eq!(g.tile((9, 6)), Tile::Floor, "폭발 범위 벽 파괴");
+        assert_eq!(g.tile((10, 5)), Tile::Floor, "폭발 범위 낮은 엄폐 파괴");
+        assert_eq!(g.units[1].hp, Class::Trooper.def().hp - GRENADE_DMG);
+        assert_eq!(g.units[0].grenades, 0);
+        assert_eq!(g.units[0].ap, 0);
+        assert!(matches!(g.events.last(), Some(Event::Grenade { unit: 0, to: (10, 6), .. })));
+    }
+
+    #[test]
+    fn class_skills_mark_suppress_and_regen_work() {
+        let mut g = Game::with_units(41, &[Gene::Sniper, Gene::Burst, Gene::Plain], &[Class::Trooper]);
+        g.tiles.fill(Tile::Floor);
+        g.units[0].pos = (4, 6);
+        g.units[1].pos = (4, 8);
+        g.units[2].pos = (4, 10);
+        g.units[2].hp = 2;
+        g.units[3].pos = (10, 6);
+
+        // 1. 저격 표식 (AP 1 소모, 조준+20, 치명+15%)
+        assert!(g.click((4, 6)));
+        let base_shot = g.shot(1, 3).unwrap();
+        assert!(g.class_skill(Some((10, 6))));
+        assert!(g.units[3].marked);
+        assert_eq!(g.units[0].ap, 1);
+        let marked_shot = g.shot(1, 3).unwrap();
+        assert_eq!(marked_shot.aim, base_shot.aim + MARK_AIM);
+        assert_eq!(marked_shot.crit, (base_shot.crit + MARK_CRIT).min(100));
+
+        // 2. 화력 제압 (적 조준 -30, 이동력 절반)
+        assert!(g.click((4, 8)));
+        let enemy_before = g.shot(3, 1).unwrap();
+        assert!(g.class_skill(Some((10, 6))));
+        assert!(g.units[3].suppressed);
+        assert_eq!(g.units[3].effective_mv(), 3);
+        let enemy_after = g.shot(3, 1).unwrap();
+        assert_eq!(enemy_after.aim, enemy_before.aim - SUPPRESS_AIM_PENALTY);
+
+        // 3. 원형 응급 재생 (+2 HP)
+        assert!(g.click((4, 10)));
+        assert!(g.class_skill(Some((4, 10))));
+        assert_eq!(g.units[2].hp, 4);
+        assert_eq!(g.units[2].charges, 0);
+    }
+
+    #[test]
+    fn destroy_relay_objective_wins_immediately_when_relays_die() {
+        let cfg = BattleConfig {
+            seed: 55,
+            special: vec![(0, Gene::Sniper, 5)],
+            member_meta: vec![(3, 12, 7)],
+            allied_ai: 0,
+            empire: vec![Class::Relay, Class::Trooper],
+            ambush: true,
+            garrison: false,
+            relay_cut: false,
+            biome: BattleBiome::Outpost,
+            objective: BattleObjective::DestroyRelay,
+            title: "중계탑 습격".to_string(),
+            tags: vec![],
+        };
+        let mut g = Game::from_battle(&cfg);
+        assert_eq!(g.units[0].rank, 3);
+        assert_eq!(g.units[0].max_hp, 7);
+        assert!(g.ambush_turn);
+        let relay = g.units.iter().position(|u| u.class == Class::Relay).unwrap();
+        g.units[relay].hp = 0;
+        g.check_outcome();
+        assert_eq!(g.outcome, Some(Side::Brood), "중계기 파괴 목표 달성 시 보병이 남아도 즉시 승리");
     }
 }
 

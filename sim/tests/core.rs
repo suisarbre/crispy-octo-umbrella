@@ -141,12 +141,23 @@ fn events_replay_to_the_same_positions() {
                         hp[target] -= dmg;
                         assert_eq!(killed, hp[target] <= 0);
                     }
+                    Event::Grenade { hits, .. } => {
+                        for (t, dmg, killed) in hits {
+                            hp[t] -= dmg;
+                            assert_eq!(killed, hp[t] <= 0);
+                        }
+                    }
+                    Event::Regen { target, amount, .. } => {
+                        hp[target] += amount;
+                    }
                     Event::Burrow { .. }
                     | Event::Smoke { .. }
                     | Event::Retreat { .. }
                     | Event::Overwatch { .. }
                     | Event::OverwatchTrigger { .. }
-                    | Event::Hunker { .. } => {}
+                    | Event::Hunker { .. }
+                    | Event::Mark { .. }
+                    | Event::Suppress { .. } => {}
                 }
             }
             for (i, u) in g.units.iter().enumerate() {

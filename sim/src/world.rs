@@ -7,7 +7,10 @@ use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
 use crate::rng::Rng;
-use crate::{BattleBiome, BattleConfig, Class, Gene, Pos, Side};
+use crate::{
+    format_callsign, rank_aim_bonus, rank_from_service, rank_hp_bonus, rank_label, BattleBiome, BattleConfig,
+    BattleObjective, Class, Gene, Pos, Side,
+};
 
 /// 문명 5 보통(Standard) 크기 기준 80×52 육각 전구.
 pub const WW: i32 = 80;
@@ -245,7 +248,7 @@ pub enum StopReason {
     Alert,
 }
 
-/// 특수부대 대원 한 명. 판 전체를 살아남으며 개조와 체력이 이어진다.
+/// 특수부대 대원 한 명. 판 전체를 살아남으며 개조·체력·호출부호·전공(계급)이 이어진다.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Trooper {
     pub gene: Gene,
@@ -253,12 +256,45 @@ pub struct Trooper {
     pub max_hp: i32,
     /// 살아남은 전투 수.
     pub battles: u32,
+    /// 누적 적 처치 수.
+    pub kills: u32,
+    /// 결정론 호출부호 ID (`V-01`, `K-02` 등).
+    pub callsign_id: u16,
 }
 
 impl Trooper {
     pub fn new(gene: Gene) -> Trooper {
+        Self::with_callsign(gene, 0)
+    }
+
+    pub fn with_callsign(gene: Gene, callsign_id: u16) -> Trooper {
         let max_hp = Class::Proto.def().hp;
-        Trooper { gene, hp: max_hp, max_hp, battles: 0 }
+        Trooper { gene, hp: max_hp, max_hp, battles: 0, kills: 0, callsign_id }
+    }
+
+    pub fn rank(self) -> u8 {
+        rank_from_service(self.battles, self.kills)
+    }
+
+    pub fn rank_label(self) -> &'static str {
+        rank_label(self.rank())
+    }
+
+    pub fn callsign(self) -> String {
+        format_callsign(self.callsign_id)
+    }
+
+    pub fn aim_bonus(self) -> i32 {
+        rank_aim_bonus(self.rank())
+    }
+
+    pub fn sync_max_hp(&mut self) {
+        let target_max = Class::Proto.def().hp + rank_hp_bonus(self.rank());
+        if target_max > self.max_hp {
+            let delta = target_max - self.max_hp;
+            self.max_hp = target_max;
+            self.hp = (self.hp + delta).min(self.max_hp);
+        }
     }
 
     pub fn glyph(self) -> char {
@@ -278,6 +314,20 @@ impl Trooper {
             Gene::Plain => "원형",
         }
     }
+}
+
+/// 직전 전술 전투의 결과 브리핑 (월드 복귀 시 1장 요약 모달 표시용).
+#[derive(Clone, Debug)]
+pub struct BattleBriefing {
+    pub title: String,
+    pub objective: BattleObjective,
+    pub won: bool,
+    pub survivors: usize,
+    pub kia: usize,
+    pub empire_losses: u32,
+    pub biomass_gained: u32,
+    pub captured_site: Option<String>,
+    pub promotions: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -315,6 +365,12 @@ pub struct World {
     /// 자원 및 거시 지표.
     pub biomass: u32,
     pub research_pct: u32,
+    /// 캠페인 결산 및 직전 전투 브리핑 지표.
+    pub battles_fought: u32,
+    pub battles_won: u32,
+    pub total_kills: u32,
+    pub next_callsign: u16,
+    pub last_briefing: Option<BattleBriefing>,
     rng: Rng,
 }
 
@@ -626,14 +682,16 @@ impl World {
         let brood_hq = sites.iter().position(|s| s.kind == SiteKind::Hq(Side::Brood)).unwrap();
         let empire_hq = sites.iter().position(|s| s.kind == SiteKind::Hq(Side::Empire)).unwrap();
 
+        let base_cs = (seed % 80) as u16;
         let squad = vec![
-            Trooper::new(Gene::Sniper),
-            Trooper::new(Gene::Burst),
-            Trooper::new(Gene::Burst),
-            Trooper::new(Gene::Burrow),
-            Trooper::new(Gene::Burrow),
-            Trooper::new(Gene::Plain),
+            Trooper::with_callsign(Gene::Sniper, base_cs),
+            Trooper::with_callsign(Gene::Burst, base_cs + 1),
+            Trooper::with_callsign(Gene::Burst, base_cs + 2),
+            Trooper::with_callsign(Gene::Burrow, base_cs + 3),
+            Trooper::with_callsign(Gene::Burrow, base_cs + 4),
+            Trooper::with_callsign(Gene::Plain, base_cs + 5),
         ];
+        let next_callsign = base_cs + 6;
 
         // 0번: 플레이어 정예 특수부대
         forces.push(Force {
@@ -703,6 +761,11 @@ impl World {
             events: Vec::new(),
             biomass: 30,
             research_pct: 5,
+            battles_fought: 0,
+            battles_won: 0,
+            total_kills: 0,
+            next_callsign,
+            last_briefing: None,
             rng,
         };
         world.recompute_territory();
@@ -1465,12 +1528,14 @@ impl World {
             return false;
         }
         self.biomass -= RECRUIT_COST;
-        self.squad.push(Trooper::new(Gene::Plain));
+        let cs = self.next_callsign;
+        self.next_callsign = self.next_callsign.wrapping_add(1);
+        self.squad.push(Trooper::with_callsign(Gene::Plain, cs));
         self.forces[0].size = self.squad.len() as u32;
         true
     }
 
-    /// 현재 충돌(`clash`)을 실제 전술 전투 설정으로 변환한다 (헥스 지형·매복·주둔·중계·합동전 반영).
+    /// 현재 충돌(`clash`)을 실제 전술 전투 설정으로 변환한다 (헥스 지형·매복·주둔·중계·합동전·전투 목표·베테랑 계급 반영).
     pub fn battle_config(&self) -> Option<BattleConfig> {
         let (sp_idx, foe_idx) = self.clash?;
         let sp = &self.forces[sp_idx];
@@ -1482,9 +1547,18 @@ impl World {
         let sp_terrain = self.terrain_at(sp.pos);
         let ambush = sp.duty == Duty::Ambush || sp_terrain == Terrain::Forest;
         let garrison = (sp.duty == Duty::Garrison && self.site_index_at(sp.pos).is_some()) || sp_terrain == Terrain::Hill;
-        let relay_cut = !self.sites.iter().any(|s| {
-            s.kind == SiteKind::Relay && s.owner == Some(Side::Empire) && hex_dist(s.pos, foe.pos) <= 14
-        });
+        let site_kind = self.site_index_at(foe.pos).map(|si| self.sites[si].kind);
+        let objective = if site_kind == Some(SiteKind::Relay) {
+            BattleObjective::DestroyRelay
+        } else if foe.role == ForceRole::EmpireConvoy {
+            BattleObjective::AmbushConvoy
+        } else {
+            BattleObjective::Eliminate
+        };
+        let relay_cut = objective != BattleObjective::DestroyRelay
+            && !self.sites.iter().any(|s| {
+                s.kind == SiteKind::Relay && s.owner == Some(Side::Empire) && hex_dist(s.pos, foe.pos) <= 14
+            });
         let allied_total: u32 = self
             .forces
             .iter()
@@ -1518,7 +1592,10 @@ impl World {
                 }
             }
             _ => {
-                if !relay_cut {
+                if objective == BattleObjective::DestroyRelay || !relay_cut {
+                    empire.push(Class::Relay);
+                }
+                if objective == BattleObjective::DestroyRelay && target_n >= 5 {
                     empire.push(Class::Relay);
                 }
                 if target_n >= 4 {
@@ -1538,6 +1615,9 @@ impl World {
             None => format!("{} {} 교전", sector_code(foe.pos), self.terrain_at(foe.pos).label()),
         };
         let mut tags = Vec::new();
+        if objective != BattleObjective::Eliminate {
+            tags.push(format!("목표: {}", objective.label()));
+        }
         if sp.duty == Duty::Ambush {
             tags.push("매복 기습".to_string());
         } else if sp_terrain == Terrain::Forest {
@@ -1552,6 +1632,7 @@ impl World {
         if allied_ai > 0 { tags.push(format!("아군 일반군 +{allied_ai}")); }
 
         let special = self.squad.iter().enumerate().map(|(slot, t)| (slot, t.gene, t.hp)).collect();
+        let member_meta = self.squad.iter().map(|t| (t.rank(), t.callsign_id, t.max_hp)).collect();
         let terrain_biome = match self.terrain_at(foe.pos) {
             Terrain::Forest => BattleBiome::Forest,
             Terrain::Hill => BattleBiome::Hill,
@@ -1568,30 +1649,71 @@ impl World {
         Some(BattleConfig {
             seed: bseed,
             special,
+            member_meta,
             allied_ai,
             empire,
             ambush,
             garrison,
             relay_cut,
             biome,
+            objective,
             title,
             tags,
         })
     }
 
     pub fn resolve_battle(&mut self, won: bool, allied_losses: u32, empire_losses: u32, packed_hp: u32) -> bool {
+        self.resolve_battle_with_kills(won, allied_losses, empire_losses, packed_hp, 0)
+    }
+
+    pub fn resolve_battle_with_kills(
+        &mut self,
+        won: bool,
+        allied_losses: u32,
+        empire_losses: u32,
+        packed_hp: u32,
+        packed_kills: u32,
+    ) -> bool {
         let Some((sp_idx, foe_idx)) = self.clash.take() else { return false };
         let foe_pos = self.forces[foe_idx].pos;
         let foe_role = self.forces[foe_idx].role;
         let sp_pos = self.forces[sp_idx].pos;
+        let site_kind = self.site_index_at(foe_pos).map(|si| self.sites[si].kind);
+        let objective = if site_kind == Some(SiteKind::Relay) {
+            BattleObjective::DestroyRelay
+        } else if foe_role == ForceRole::EmpireConvoy {
+            BattleObjective::AmbushConvoy
+        } else {
+            BattleObjective::Eliminate
+        };
 
         let before = self.squad.len();
         let mut survivors = Vec::new();
+        let mut promotions = Vec::new();
         for (i, mut t) in self.squad.drain(..).enumerate() {
             let hp = ((packed_hp >> (i * 4)) & 0xf) as i32;
+            let k = (packed_kills >> (i * 4)) & 0xf;
             if hp > 0 {
+                let prev_rank = t.rank();
                 t.hp = hp.min(t.max_hp);
                 t.battles += 1;
+                t.kills += k;
+                let new_rank = t.rank();
+                t.sync_max_hp();
+                if new_rank > prev_rank {
+                    let hp_note = if rank_hp_bonus(new_rank) > rank_hp_bonus(prev_rank) {
+                        ", 최대체력 +1"
+                    } else {
+                        ""
+                    };
+                    promotions.push(format!(
+                        "{} {} → {} 진급 (조준 +{}{hp_note})",
+                        t.callsign(),
+                        t.name(),
+                        t.rank_label(),
+                        t.aim_bonus()
+                    ));
+                }
                 survivors.push(t);
             }
         }
@@ -1600,6 +1722,12 @@ impl World {
         self.forces[sp_idx].size = self.squad.len() as u32;
         self.forces[sp_idx].alive = !self.squad.is_empty();
         self.forces[sp_idx].order = Order::Hold;
+
+        self.battles_fought += 1;
+        if won {
+            self.battles_won += 1;
+        }
+        self.total_kills += empire_losses;
 
         if allied_losses > 0 {
             if let Some(ally) = self.forces.iter_mut().find(|f| {
@@ -1618,6 +1746,8 @@ impl World {
             Some(si) => format!("{} {}", self.sites[si].code, self.sites[si].kind.label()),
             None => sector_code(foe_pos),
         };
+        let mut captured_site = None;
+        let mut biomass_gained = 0;
 
         if won {
             let rem = self.forces[foe_idx].size.saturating_sub(empire_losses.max(8));
@@ -1630,6 +1760,7 @@ impl World {
                     if let Some(si) = self.site_index_at(foe_pos) {
                         let was_empire_hq = self.sites[si].kind == SiteKind::Hq(Side::Empire);
                         self.sites[si].owner = Some(Side::Brood);
+                        captured_site = Some(format!("{} {} 점령", self.sites[si].code, self.sites[si].kind.label()));
                         if was_empire_hq {
                             self.victory = Some(Side::Brood);
                         }
@@ -1638,7 +1769,12 @@ impl World {
             } else {
                 self.forces[foe_idx].size = rem;
             }
-            let reward = if foe_role == ForceRole::EmpireConvoy { 18 } else { 12 };
+            let reward = match objective {
+                BattleObjective::AmbushConvoy => 22,
+                BattleObjective::DestroyRelay => 16,
+                BattleObjective::Eliminate => 12,
+            };
+            biomass_gained = reward;
             self.biomass += reward;
             let kia_note = if kia > 0 { format!(" · 전사 {kia}") } else { String::new() };
             self.push_event(foe_pos, format!("{loc} 특수부대 승리 (+생체질 {reward}{kia_note})"), false);
@@ -1653,6 +1789,18 @@ impl World {
                 self.push_event(sp_pos, format!("{loc} 특수부대 후퇴 생환{kia_note}"), true);
             }
         }
+
+        self.last_briefing = Some(BattleBriefing {
+            title: loc,
+            objective,
+            won,
+            survivors: self.squad.len(),
+            kia,
+            empire_losses,
+            biomass_gained,
+            captured_site,
+            promotions,
+        });
 
         self.recompute_territory();
         self.recompute_supply();
@@ -1672,7 +1820,7 @@ impl World {
         mix(self.research_pct as u64);
         mix(self.squad.len() as u64);
         for t in &self.squad {
-            mix(t.hp as u64 | ((t.gene as u64) << 8) | ((t.battles as u64) << 16));
+            mix(t.hp as u64 | ((t.gene as u64) << 8) | ((t.battles as u64) << 16) | ((t.kills as u64) << 24));
         }
         for f in &self.forces {
             if !f.alive {

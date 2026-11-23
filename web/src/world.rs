@@ -10,7 +10,8 @@ use sim::{Gene, Pos, Side};
 /// 문구 구역 구분자.
 /// 0: 데스크탑 상단 바, 1: 모바일 상단 바, 2: 특수부대 요약,
 /// 3: 지휘망 제안 목록, 4: 전선 사건 로그, 5: 명령 메뉴 헤더, 6: 알림/충돌,
-/// 7: 특수부대 대원 명부(정비용), 8: 정비 상태 메타.
+/// 7: 특수부대 대원 명부(정비용), 8: 정비 상태 메타,
+/// 9: 직전 전투 결과 브리핑, 10: 캠페인 승/패 결산.
 const SEP: &str = "\u{1f}";
 
 /// 인원 표시 비트 배치:
@@ -34,7 +35,7 @@ struct State {
     popup: String,
     labels: Vec<u32>,
     routes: Vec<u32>,
-    last_battle: [u32; 4],
+    last_battle: [u32; 5],
     /// 선택 중 마우스 호버 또는 웨이포인트 드래그로 가리키는 헥스 (시뮬 상태에는 영향 없음).
     hover_hex: Option<Pos>,
     /// 드래그 중일 때는 기존 target보다 hover_hex 경로 미리보기를 우선 표시한다.
@@ -53,7 +54,7 @@ fn state() -> &'static mut State {
             popup: String::new(),
             labels: Vec::new(),
             routes: Vec::new(),
-            last_battle: [0; 4],
+            last_battle: [0; 5],
             hover_hex: None,
             hover_override: false,
         })
@@ -330,7 +331,18 @@ fn render(s: &mut State) {
         .map(|(i, t)| {
             let pips: String = (0..t.max_hp).map(|k| if k < t.hp { '●' } else { '○' }).collect();
             let gid = match t.gene { Gene::Plain => 0, Gene::Sniper => 1, Gene::Burst => 2, Gene::Burrow => 3 };
-            format!("{i}\t{}\t{}\t{pips}\t{}/{}\t{}\t{gid}", t.glyph(), t.name(), t.hp, t.max_hp, t.battles)
+            format!(
+                "{i}\t{}\t{}\t{pips}\t{}/{}\t{}\t{gid}\t{}\t{}\t{}\t{}",
+                t.glyph(),
+                t.name(),
+                t.hp,
+                t.max_hp,
+                t.battles,
+                t.callsign(),
+                t.rank_label(),
+                t.kills,
+                t.aim_bonus()
+            )
         })
         .collect::<Vec<_>>()
         .join("\n");
@@ -347,6 +359,59 @@ fn render(s: &mut State) {
         REGENE_COST
     );
 
+    let briefing_text = match &w.last_briefing {
+        Some(b) => {
+            let mut out = format!(
+                "{}|{}|{}|{}|{}|{}|{}|{}",
+                if b.won { 1 } else { 0 },
+                b.title,
+                b.objective.label(),
+                b.survivors,
+                b.kia,
+                b.empire_losses,
+                b.biomass_gained,
+                b.captured_site.as_deref().unwrap_or("")
+            );
+            for p in &b.promotions {
+                out.push('\n');
+                out.push_str(p);
+            }
+            out
+        }
+        None => String::new(),
+    };
+
+    let campaign_text = match w.victory {
+        Some(side) => {
+            let brood_sites = w.sites.iter().filter(|s| s.owner == Some(Side::Brood)).count();
+            let total_sites = w.sites.len();
+            let mut out = format!(
+                "{}|{}|{}|{}|{}|{brood_sites}|{total_sites}|{}",
+                if side == Side::Brood { 1 } else { 0 },
+                w.day(),
+                w.battles_won,
+                w.battles_fought,
+                w.total_kills,
+                w.biomass
+            );
+            for t in &w.squad {
+                out.push_str(&format!(
+                    "\n{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                    t.callsign(),
+                    t.rank_label(),
+                    t.glyph(),
+                    t.name(),
+                    t.battles,
+                    t.kills,
+                    t.hp,
+                    t.max_hp
+                ));
+            }
+            out
+        }
+        None => String::new(),
+    };
+
     s.text = [
         header_desktop,
         header_mobile,
@@ -357,6 +422,8 @@ fn render(s: &mut State) {
         notice,
         squad_rows,
         refit_meta,
+        briefing_text,
+        campaign_text,
     ]
     .join(SEP);
 }
@@ -602,12 +669,14 @@ pub extern "C" fn w_enter_battle() -> u32 {
 
 #[no_mangle]
 pub extern "C" fn w_finish_battle() -> u32 {
-    let Some((won, allied_losses, empire_losses, packed_hp)) = crate::extract_world_battle_result() else {
+    let Some((won, allied_losses, empire_losses, packed_hp, packed_kills)) = crate::extract_world_battle_result() else {
         return 0;
     };
     let s = state();
-    s.last_battle = [won as u32, allied_losses, empire_losses, packed_hp];
-    let ok = s.world.resolve_battle(won, allied_losses, empire_losses, packed_hp);
+    s.last_battle = [won as u32, allied_losses, empire_losses, packed_hp, packed_kills];
+    let ok = s
+        .world
+        .resolve_battle_with_kills(won, allied_losses, empire_losses, packed_hp, packed_kills);
     render(s);
     ok as u32
 }
@@ -623,6 +692,29 @@ pub extern "C" fn w_apply_battle(won: u32, allied_losses: u32, empire_losses: u3
     let ok = s.world.resolve_battle(won != 0, allied_losses, empire_losses, packed_hp);
     render(s);
     ok as u32
+}
+
+#[no_mangle]
+pub extern "C" fn w_apply_battle_ext(
+    won: u32,
+    allied_losses: u32,
+    empire_losses: u32,
+    packed_hp: u32,
+    packed_kills: u32,
+) -> u32 {
+    let s = state();
+    let ok = s
+        .world
+        .resolve_battle_with_kills(won != 0, allied_losses, empire_losses, packed_hp, packed_kills);
+    render(s);
+    ok as u32
+}
+
+#[no_mangle]
+pub extern "C" fn w_clear_briefing() {
+    let s = state();
+    s.world.last_briefing = None;
+    render(s);
 }
 
 #[no_mangle]
@@ -759,11 +851,15 @@ mod tests {
         assert_eq!(w_enter_battle(), 1);
 
         let packed = (3 << 4) | (5 << 8) | (5 << 12) | (5 << 16) | (5 << 20);
-        assert_eq!(w_apply_battle(1, 0, 5, packed), 1);
+        let kills = 2 << 4;
+        assert_eq!(w_apply_battle_ext(1, 0, 5, packed, kills), 1);
         assert_eq!(w_has_clash(), 0);
         assert_eq!(state().world.squad.len(), 5);
         assert_eq!(state().world.squad[0].hp, 3);
         assert_eq!(state().world.squad[0].battles, 1);
+        assert_eq!(state().world.squad[0].kills, 2);
+        assert_eq!(state().world.squad[0].rank(), 1);
+        assert!(state().world.last_briefing.is_some());
     }
 
     #[test]
@@ -771,12 +867,14 @@ mod tests {
         let cfg = sim::BattleConfig {
             seed: 42,
             special: vec![(0, Gene::Sniper, 4), (1, Gene::Burrow, 5)],
+            member_meta: vec![],
             allied_ai: 2,
             empire: vec![sim::Class::Trooper, sim::Class::Trooper, sim::Class::Relay],
             ambush: true,
             garrison: false,
             relay_cut: true,
             biome: sim::BattleBiome::Forest,
+            objective: sim::BattleObjective::Eliminate,
             title: "테스트 교전".to_string(),
             tags: vec!["기습".to_string()],
         };

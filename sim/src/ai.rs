@@ -232,7 +232,7 @@ impl<'a> Plan<'a> {
         }
         // 다음 턴: 여기서 쏘거나, 한 번 가서 쏘거나, 더 나은 자리로 간다. 그 끝에서 또 반격을 받는다.
         let step = self.doctrine().step_cost;
-        let mv = self.g.units[me].class.def().mv;
+        let mv = self.g.units[me].effective_mv();
         let mut next = self.best_shot(me, tile, When::NextTurn, false).map_or(0, |(_, v)| v);
         for a in self.g.flood_from(tile, mv, |p| self.blocked(p)) {
             let there = self.shot_after_move(me, a) + self.rest(me, a) - now - step;

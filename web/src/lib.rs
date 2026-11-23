@@ -9,7 +9,7 @@ pub mod world;
 
 use std::collections::VecDeque;
 
-use sim::{dist, BattleConfig, Class, Event, Game, Pos, Side, Tile, H, SIGHT, W};
+use sim::{dist, rank_label, BattleConfig, BattleObjective, Class, Event, Game, Pos, Side, Tile, H, SIGHT, W};
 
 /// 팔레트 번호. 실제 색은 www/main.js가 정한다.
 pub const BG: u32 = 0;
@@ -32,6 +32,10 @@ pub const BEAT_RETREAT: u32 = 8;
 pub const BEAT_OVERWATCH: u32 = 9;
 pub const BEAT_OW_TRIGGER: u32 = 10;
 pub const BEAT_HUNKER: u32 = 11;
+pub const BEAT_GRENADE: u32 = 12;
+pub const BEAT_MARK: u32 = 13;
+pub const BEAT_SUPPRESS: u32 = 14;
+pub const BEAT_REGEN: u32 = 15;
 
 const STEP_MS_BROOD: u32 = 55;
 const STEP_MS_EMPIRE: u32 = 90;
@@ -46,14 +50,19 @@ const RETREAT_MS: u32 = 160;
 const OVERWATCH_MS: u32 = 180;
 const OW_TRIGGER_MS: u32 = 560;
 const HUNKER_MS: u32 = 160;
+const GRENADE_MS: u32 = 360;
+const MARK_MS: u32 = 220;
+const SUPPRESS_MS: u32 = 260;
+const REGEN_MS: u32 = 240;
 /// 빗나간 탄이 표적을 지나 더 날아가는 칸 수.
 const OVERSHOOT: usize = 3;
 
 const CELLS: usize = (W * H) as usize;
 /// 문구 구역 구분자.
-/// 0: 상황, 1: 장부 내역, 2: 장부 결과, 3: 잠복 능력, 4: 분대원 목록,
+/// 0: 상황, 1: 장부 내역, 2: 장부 결과, 3: 병과 스킬명, 4: 분대원 목록,
 /// 5: 후퇴 가능, 6: 월드 전투 헤더, 7: 합동 아군 AI 요약, 8: 경계 가능,
-/// 9: 엄호 가능, 10: 사격 가능 적 목록, 11: 선택 분대원 요약.
+/// 9: 엄호 가능, 10: 사격 가능 적 목록, 11: 선택 분대원 요약,
+/// 12: 전투 목표/매복 배너, 13: 전투 종료 브리핑 요약.
 const SEP: &str = "\u{1f}";
 
 #[derive(Clone, Copy)]
@@ -64,6 +73,8 @@ struct ViewUnit {
     retreated: bool,
     overwatch: bool,
     hunkered: bool,
+    marked: bool,
+    suppressed: bool,
 }
 
 enum Fx {
@@ -71,7 +82,7 @@ enum Fx {
     /// 날아가는 탄. `color`는 쏜 쪽 색.
     Tracer { from: Pos, to: Pos, cells: Vec<Pos>, color: u32 },
     /// 맞은 순간. 표적 칸이 번쩍인다.
-    Hit { from: Pos, to: Pos, target: usize, dmg: i32, color: u32 },
+    Hit { from: Pos, to: Pos, target: usize, dmg: i32, crit: bool, color: u32 },
     /// 빗나간 탄의 자국.
     Miss { from: Pos, to: Pos, cells: Vec<Pos>, target: usize, color: u32 },
     Death { pos: Pos, was_relay: bool },
@@ -81,6 +92,10 @@ enum Fx {
     OverwatchSet { pos: Pos, color: u32 },
     OverwatchTrigger { from: Pos, to: Pos, color: u32 },
     Hunker { pos: Pos, color: u32 },
+    Grenade { from: Pos, to: Pos, destroyed: usize, hits: usize },
+    Mark { from: Pos, to: Pos },
+    Suppress { from: Pos, to: Pos },
+    Regen { from: Pos, to: Pos, target: usize, amount: i32 },
 }
 
 struct State {
@@ -92,6 +107,7 @@ struct State {
     /// bit 4: reachable | bit 5: in_path | bit 6: retreat_edge | bit 7: memory_ghost
     /// bits 8..16: cover_mask N(8..10), E(10..12), S(12..14), W(14..16) (0 none, 1 low, 2 wall)
     /// bits 16..20: path_step (1..=15)
+    /// bit 20: unit_marked | bit 21: unit_suppressed | bits 22..24: unit_rank (0..=3)
     b_meta: [u32; CELLS],
     /// 가시 생존 유닛 목록 (유닛당 2 word).
     b_units: Vec<u32>,
@@ -177,6 +193,8 @@ impl State {
                 retreated: u.retreated,
                 overwatch: u.overwatch,
                 hunkered: u.hunkered,
+                marked: u.marked,
+                suppressed: u.suppressed,
             })
             .collect();
         self.view_smoke = self.game.smoke.iter().map(|&s| s > 0).collect();
@@ -243,7 +261,7 @@ impl State {
                     }
                     return BEAT_STEP << 16 | if empire { STEP_MS_EMPIRE } else { STEP_MS_BROOD };
                 }
-                Event::Shot { shooter, target, hit, dmg, killed, log_lines } => {
+                Event::Shot { shooter, target, hit, crit, dmg, killed, log_lines } => {
                     let su = &self.game.units[shooter];
                     let empire = su.side == Side::Empire;
                     self.allied_ai_phase = !empire && su.ai_controlled;
@@ -272,7 +290,7 @@ impl State {
                             self.shot_stage = 2;
                             let ms = if self.slowmo_shot { IMPACT_SLOW_MS } else { IMPACT_MS };
                             if hit {
-                                self.fx = Fx::Hit { from: a, to: b, target, dmg, color };
+                                self.fx = Fx::Hit { from: a, to: b, target, dmg, crit, color };
                                 return BEAT_HIT << 16 | ms;
                             }
                             self.fx = Fx::Miss { from: a, to: b, cells: self.overshoot(a, b), target, color };
@@ -393,6 +411,54 @@ impl State {
                     };
                     self.fx = Fx::Hunker { pos, color };
                     return BEAT_HUNKER << 16 | HUNKER_MS;
+                }
+                Event::Grenade { unit, to, destroyed, hits } => {
+                    self.queue.pop_front();
+                    self.slowmo_shot = false;
+                    let from = self.view[unit].pos;
+                    self.view[unit].burrowed = false;
+                    self.view[unit].overwatch = false;
+                    self.view[unit].hunkered = false;
+                    let hit_count = hits.len();
+                    for (t, dmg, killed) in hits {
+                        self.view[t].hp -= dmg;
+                        self.view[t].hunkered = false;
+                        if killed && self.game.units[t].class == Class::Relay {
+                            self.relay_pulse = 2;
+                        }
+                    }
+                    self.fx = Fx::Grenade { from, to, destroyed: destroyed.len(), hits: hit_count };
+                    return BEAT_GRENADE << 16 | GRENADE_MS;
+                }
+                Event::Mark { unit, target } => {
+                    self.queue.pop_front();
+                    self.slowmo_shot = false;
+                    self.view[target].marked = true;
+                    self.fx = Fx::Mark { from: self.view[unit].pos, to: self.view[target].pos };
+                    return BEAT_MARK << 16 | MARK_MS;
+                }
+                Event::Suppress { unit, target } => {
+                    self.queue.pop_front();
+                    self.slowmo_shot = false;
+                    self.view[unit].burrowed = false;
+                    self.view[unit].overwatch = false;
+                    self.view[unit].hunkered = false;
+                    self.view[target].suppressed = true;
+                    self.view[target].overwatch = false;
+                    self.fx = Fx::Suppress { from: self.view[unit].pos, to: self.view[target].pos };
+                    return BEAT_SUPPRESS << 16 | SUPPRESS_MS;
+                }
+                Event::Regen { unit, target, amount } => {
+                    self.queue.pop_front();
+                    self.slowmo_shot = false;
+                    self.view[target].hp = (self.view[target].hp + amount).min(self.game.units[target].max_hp);
+                    self.fx = Fx::Regen {
+                        from: self.view[unit].pos,
+                        to: self.view[target].pos,
+                        target,
+                        amount,
+                    };
+                    return BEAT_REGEN << 16 | REGEN_MS;
                 }
             }
         }
@@ -547,8 +613,17 @@ fn render(s: &mut State) {
             }
             s.b_fx = [2, from.0 as u32, from.1 as u32, to.0 as u32, to.1 as u32, *color, slowmo, 0];
         }
-        Fx::Hit { from, to, dmg, color, .. } => {
-            s.b_fx = [3, from.0 as u32, from.1 as u32, to.0 as u32, to.1 as u32, *dmg as u32, *color, slowmo];
+        Fx::Hit { from, to, dmg, crit, color, .. } => {
+            s.b_fx = [
+                3,
+                from.0 as u32,
+                from.1 as u32,
+                to.0 as u32,
+                to.1 as u32,
+                *dmg as u32,
+                *color,
+                slowmo | ((*crit as u32) << 1),
+            ];
         }
         Fx::Miss { from, to, cells, color, .. } => {
             for &p in cells.iter().filter(|p| g.tile(**p) == Tile::Floor) {
@@ -587,6 +662,18 @@ fn render(s: &mut State) {
         }
         Fx::Hunker { pos, color } => {
             s.b_fx = [11, pos.0 as u32, pos.1 as u32, *color, 0, 0, 0, 0];
+        }
+        Fx::Grenade { from, to, destroyed, hits } => {
+            s.b_fx = [12, from.0 as u32, from.1 as u32, to.0 as u32, to.1 as u32, *destroyed as u32, *hits as u32, 0];
+        }
+        Fx::Mark { from, to } => {
+            s.b_fx = [13, from.0 as u32, from.1 as u32, to.0 as u32, to.1 as u32, 0, 0, 0];
+        }
+        Fx::Suppress { from, to } => {
+            s.b_fx = [14, from.0 as u32, from.1 as u32, to.0 as u32, to.1 as u32, 0, 0, 0];
+        }
+        Fx::Regen { from, to, amount, .. } => {
+            s.b_fx = [15, from.0 as u32, from.1 as u32, to.0 as u32, to.1 as u32, *amount as u32, 0, 0];
         }
         Fx::None => {
             // 조준 미리보기 (선택한 아군이 보이는 적을 가리킬 때)
@@ -660,7 +747,7 @@ fn render(s: &mut State) {
         if let Some(c) = shown {
             s.frame[idx(v.pos)] = c;
             let hp = (v.hp.clamp(0, 15)) as u32;
-            let max_hp = (u.class.def().hp.clamp(1, 15)) as u32;
+            let max_hp = (u.max_hp.clamp(1, 15)) as u32;
             let ap = if playing { 0 } else { (u.ap.min(3)) as u32 };
             let mut w0 = (v.pos.0 as u32)
                 | ((v.pos.1 as u32) << 8)
@@ -691,6 +778,12 @@ fn render(s: &mut State) {
             if v.hunkered { w1 |= 1 << 31; }
             s.b_units.push(w0);
             s.b_units.push(w1);
+
+            // 표식/제압/계급 상태는 b_meta 상위 비트(20..24)에 패킹한다.
+            let mi = idx(v.pos);
+            if v.marked { s.b_meta[mi] |= 1 << 20; }
+            if v.suppressed { s.b_meta[mi] |= 1 << 21; }
+            s.b_meta[mi] |= ((u.rank.min(3) as u32) & 0x3) << 22;
         }
     }
 
@@ -702,11 +795,17 @@ fn render(s: &mut State) {
         .enumerate()
         .filter(|(i, u)| u.side == Side::Brood && u.ai_controlled && s.view[*i].hp > 0)
         .count();
+    let skill_name = if can_act {
+        g.class_skill_info().map_or_else(String::new, |(_, name, _)| name.to_string())
+    } else {
+        String::new()
+    };
     let sections = [
         match (playing, g.outcome) {
             (true, _) if matches!(s.fx, Fx::OverwatchTrigger { .. }) => "경계 발동!".to_string(),
             (true, _) if s.allied_ai_phase => "아군 일반군 행동".to_string(),
             (true, _) if s.empire_phase => "제국 행동".to_string(),
+            (false, Some(Side::Brood)) if g.objective == BattleObjective::DestroyRelay => "중계기 파괴 완료".to_string(),
             (false, Some(Side::Brood)) => "제국 분대 전멸".to_string(),
             (false, Some(Side::Empire)) if retreated_any => "특수부대 후퇴 생환".to_string(),
             (false, Some(Side::Empire)) => "전원 사망".to_string(),
@@ -714,7 +813,7 @@ fn render(s: &mut State) {
         },
         ledger,
         result,
-        if can_act && g.can_burrow() { "잠복".to_string() } else { String::new() },
+        skill_name,
         roster_text(s),
         if can_act && g.can_retreat() { "후퇴".to_string() } else { String::new() },
         s.battle_header.clone(),
@@ -723,12 +822,76 @@ fn render(s: &mut State) {
         if can_act && g.can_hunker() { "엄호".to_string() } else { String::new() },
         if can_act { targets_text(s) } else { String::new() },
         selected_text(s, can_act),
+        objective_text(s),
+        if !playing && g.outcome.is_some() { battle_summary_text(s) } else { String::new() },
     ];
     s.text = sections.join(SEP);
 }
 
+fn objective_text(s: &State) -> String {
+    let g = &s.game;
+    let mut parts = Vec::new();
+    match g.objective {
+        BattleObjective::DestroyRelay => {
+            let left = g
+                .units
+                .iter()
+                .enumerate()
+                .filter(|(i, u)| u.side == Side::Empire && u.class == Class::Relay && s.view[*i].hp > 0)
+                .count();
+            parts.push(format!("목표: 중계기 파괴 (남은 {left})"));
+        }
+        BattleObjective::AmbushConvoy => {
+            parts.push("목표: 보급대 차단 (+보너스 생체질)".to_string());
+        }
+        BattleObjective::Eliminate => {}
+    }
+    if g.ambush_turn && g.outcome.is_none() {
+        parts.push("매복 기습 1턴! 조준+15 · 엄폐 무시".to_string());
+    }
+    parts.join(" · ")
+}
+
+fn battle_summary_text(s: &State) -> String {
+    let g = &s.game;
+    let won = if g.outcome == Some(Side::Brood) { 1 } else { 0 };
+    let player_units: Vec<&sim::Unit> = g
+        .units
+        .iter()
+        .filter(|u| u.side == Side::Brood && !u.ai_controlled)
+        .collect();
+    let survivors = player_units.iter().filter(|u| u.hp > 0).count();
+    let kia = player_units.len().saturating_sub(survivors);
+    let empire_kills = g.units.iter().filter(|u| u.side == Side::Empire && u.hp <= 0).count();
+    let mut out = format!(
+        "{won}|{}|{survivors}|{kia}|{empire_kills}|{}",
+        g.round,
+        g.objective.label()
+    );
+    for u in player_units {
+        let state_str = if u.hp <= 0 {
+            "전사"
+        } else if u.retreated {
+            "생환"
+        } else {
+            "생존"
+        };
+        out.push_str(&format!(
+            "\n{}\t{}\t{}\t{}\t{}\t{}\t{}\t{state_str}",
+            u.callsign(),
+            rank_label(u.rank),
+            u.glyph(),
+            u.name(),
+            u.hp.max(0),
+            u.max_hp,
+            u.kills
+        ));
+    }
+    out
+}
+
 /// 현재 선택 분대원이 제자리에서 쏠 수 있는 적 표적 목록 (XCOM 조준/하단 표적 칩용).
-/// 줄마다 x\ty\t글리프\t이름\t체력\t최대체력\t명중률\t조준\t엄폐\t거리감점.
+/// 줄마다 x\ty\t글리프\t이름\t체력\t최대체력\t명중률\t조준\t엄폐\t거리감점\t치명타\t표식\t제압.
 fn targets_text(s: &State) -> String {
     let g = &s.game;
     let Some(sel) = g.selected.filter(|&i| g.units[i].alive() && g.units[i].ap > 0) else {
@@ -747,17 +910,20 @@ fn targets_text(s: &State) -> String {
         .map(|(_, t, shot)| {
             let u = &g.units[t];
             format!(
-                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                 u.pos.0,
                 u.pos.1,
                 u.glyph(),
                 u.name(),
                 u.hp.max(0),
-                u.class.def().hp,
+                u.max_hp,
                 shot.chance,
                 shot.aim,
                 shot.cover,
-                shot.falloff
+                shot.falloff,
+                shot.crit,
+                u.marked as u8,
+                u.suppressed as u8
             )
         })
         .collect::<Vec<_>>()
@@ -765,7 +931,7 @@ fn targets_text(s: &State) -> String {
 }
 
 /// 현재 선택 분대원 요약 (하단 XCOM HUD 좌측 슬롯용).
-/// 형식: 글리프\t이름\t체력\t최대체력\t행동\t상태태그\tx\ty\t남은행동유닛수.
+/// 형식: 글리프\t이름\t체력\t최대체력\t행동\t상태태그\tx\ty\t남은행동유닛수\t파열탄수\t스킬코드\t스킬명\t호출부호\t계급.
 fn selected_text(s: &State, can_act: bool) -> String {
     let g = &s.game;
     let ready_count = g
@@ -774,7 +940,7 @@ fn selected_text(s: &State, can_act: bool) -> String {
         .filter(|u| u.side == Side::Brood && !u.ai_controlled && u.alive() && u.ap > 0)
         .count();
     let Some(i) = g.selected else {
-        return format!("\t\t0\t0\t0\t\t-1\t-1\t{ready_count}");
+        return format!("\t\t0\t0\t0\t\t-1\t-1\t{ready_count}\t0\t0\t\t\t");
     };
     let u = &g.units[i];
     let v = s.view[i];
@@ -792,18 +958,26 @@ fn selected_text(s: &State, can_act: bool) -> String {
     } else {
         ""
     };
+    let (sk_code, sk_name) = if can_act {
+        g.class_skill_info().map_or((0, ""), |(c, n, _)| (c, n))
+    } else {
+        (0, "")
+    };
     format!(
-        "{}\t{}\t{}\t{}\t{ap}\t{tag}\t{}\t{}\t{ready_count}",
+        "{}\t{}\t{}\t{}\t{ap}\t{tag}\t{}\t{}\t{ready_count}\t{}\t{sk_code}\t{sk_name}\t{}\t{}",
         u.glyph(),
         u.name(),
         v.hp.max(0),
-        u.class.def().hp,
+        u.max_hp,
         v.pos.0,
-        v.pos.1
+        v.pos.1,
+        u.grenades,
+        u.callsign(),
+        rank_label(u.rank)
     )
 }
 
-/// 분대원 목록(토글 창용). 줄마다 x\ty\t선택\t글리프\t이름\t체력핍\t행동\t상태.
+/// 분대원 목록(토글 창용). 줄마다 x\ty\t선택\t글리프\t이름\t체력핍\t행동\t상태\t호출부호\t계급.
 fn roster_text(s: &State) -> String {
     let g = &s.game;
     let playing = s.playing();
@@ -813,7 +987,7 @@ fn roster_text(s: &State) -> String {
         .filter(|(i, u)| u.side == Side::Brood && !u.ai_controlled && s.view[*i].hp > 0 && !s.view[*i].retreated)
         .map(|(i, u)| {
             let v = s.view[i];
-            let max = u.class.def().hp;
+            let max = u.max_hp;
             let hp = v.hp.max(0);
             let pips: String = (0..max).map(|k| if k < hp { '●' } else { '○' }).collect();
             let sel = if g.selected == Some(i) && !playing { 1 } else { 0 };
@@ -831,7 +1005,15 @@ fn roster_text(s: &State) -> String {
             } else {
                 ""
             };
-            format!("{}\t{}\t{sel}\t{}\t{}\t{pips}\t행동 {ap}\t{tag}", v.pos.0, v.pos.1, u.glyph(), u.name())
+            format!(
+                "{}\t{}\t{sel}\t{}\t{}\t{pips}\t행동 {ap}\t{tag}\t{}\t{}",
+                v.pos.0,
+                v.pos.1,
+                u.glyph(),
+                u.name(),
+                u.callsign(),
+                rank_label(u.rank)
+            )
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -844,9 +1026,17 @@ fn inspect_text(s: &State, p: Pos) -> String {
     if u.side == Side::Empire && !s.seen(p) {
         return String::new();
     }
-    let (hp, max) = (s.view[i].hp.max(0), u.class.def().hp);
+    let (hp, max) = (s.view[i].hp.max(0), u.max_hp);
     let pips: String = (0..max).map(|k| if k < hp { '●' } else { '○' }).collect();
-    let mut out = format!("{} {}\n체력 {pips} {hp}/{max}", u.glyph(), u.name());
+    let cs = u.callsign();
+    let head = if cs.is_empty() {
+        format!("{} {}", u.glyph(), u.name())
+    } else if u.rank > 0 {
+        format!("{} {} [{cs} · {}]", u.glyph(), u.name(), rank_label(u.rank))
+    } else {
+        format!("{} {} [{cs}]", u.glyph(), u.name())
+    };
+    let mut out = format!("{head}\n체력 {pips} {hp}/{max}");
     if u.side == Side::Brood {
         out.push_str(&format!("\n행동 {}", if s.playing() { 0 } else { u.ap }));
     }
@@ -857,7 +1047,13 @@ fn inspect_text(s: &State, p: Pos) -> String {
         out.push_str("\n경계 태세");
     }
     if s.view[i].hunkered {
-        out.push_str("\n엄호 중 (+30 방어)");
+        out.push_str("\n엄호 중 (+30 방어 · 치명 면역)");
+    }
+    if s.view[i].marked {
+        out.push_str("\n표식됨 (피격 조준+20 · 치명+15%)");
+    }
+    if s.view[i].suppressed {
+        out.push_str("\n제압됨 (조준 −30 · 이동 저하)");
     }
     out
 }
@@ -1010,6 +1206,27 @@ pub extern "C" fn retreat() -> u32 {
     changed as u32
 }
 
+/// 선택한 플레이어 유닛이 `(x, y)`에 파열탄(엄폐 파괴 수류탄)을 투척한다.
+#[no_mangle]
+pub extern "C" fn grenade(x: i32, y: i32) -> u32 {
+    let s = state();
+    let changed = s.game.grenade((x, y));
+    s.enqueue(false);
+    render(s);
+    changed as u32
+}
+
+/// 선택한 플레이어 유닛의 병과 고유 스킬을 실행한다 (`x < 0`이면 대상 없음/자기 자신).
+#[no_mangle]
+pub extern "C" fn class_skill(x: i32, y: i32) -> u32 {
+    let s = state();
+    let target = if x < 0 { None } else { Some((x, y)) };
+    let changed = s.game.class_skill(target);
+    s.enqueue(false);
+    render(s);
+    changed as u32
+}
+
 fn pack_selected(pos: Pos) -> u32 {
     (1 << 16) | (pos.0 as u32) | ((pos.1 as u32) << 8)
 }
@@ -1125,12 +1342,13 @@ pub(crate) fn start_world_battle(cfg: &BattleConfig) {
     render(s);
 }
 
-/// 끝난 월드 전투에서 `(won, allied_losses, empire_losses, packed_hp)`를 추출한다.
-pub(crate) fn extract_world_battle_result() -> Option<(bool, u32, u32, u32)> {
+/// 끝난 월드 전투에서 `(won, allied_losses, empire_losses, packed_hp, packed_kills)`를 추출한다.
+pub(crate) fn extract_world_battle_result() -> Option<(bool, u32, u32, u32, u32)> {
     let s = state();
     let outcome = s.game.outcome?;
     let won = outcome == Side::Brood;
     let mut packed_hp = 0u32;
+    let mut packed_kills = 0u32;
     let mut allied_losses = 0u32;
     let mut empire_losses = 0u32;
     for u in &s.game.units {
@@ -1138,7 +1356,9 @@ pub(crate) fn extract_world_battle_result() -> Option<(bool, u32, u32, u32)> {
             if slot < 8 && u.hp > 0 {
                 // 생존(전장 생존 또는 후퇴 생환)
                 let hp = (u.hp as u32).min(15);
+                let kills = (u.kills as u32).min(15);
                 packed_hp |= hp << (slot * 4);
+                packed_kills |= kills << (slot * 4);
             }
         } else if u.side == Side::Brood && u.ai_controlled && u.hp <= 0 {
             allied_losses += 1;
@@ -1146,7 +1366,7 @@ pub(crate) fn extract_world_battle_result() -> Option<(bool, u32, u32, u32)> {
             empire_losses += 1;
         }
     }
-    Some((won, allied_losses, empire_losses, packed_hp))
+    Some((won, allied_losses, empire_losses, packed_hp, packed_kills))
 }
 
 /// 다음 박자로 넘긴다. 종류<<16 | 길이(ms)를 돌려주고, 보여줄 게 없으면 0.
@@ -1209,8 +1429,12 @@ pub extern "C" fn popup_ptr() -> *const u8 {
 
 /// 빗나간 사격이면 `damage_float`의 이 비트가 켜진다.
 pub const FLOAT_MISS: u32 = 1 << 24;
+/// 치명타 적중이면 이 비트가 켜진다.
+pub const FLOAT_CRIT: u32 = 1 << 25;
+/// 회복(재생)이면 이 비트가 켜진다.
+pub const FLOAT_HEAL: u32 = 1 << 26;
 
-/// 지금 박자에 표적 위로 띄울 것. 없으면 0. 맞았으면 피해 | x<<8 | y<<16, 빗나갔으면 거기에 `FLOAT_MISS`.
+/// 지금 박자에 표적 위로 띄울 것. 없으면 0.
 #[no_mangle]
 pub extern "C" fn damage_float() -> u32 {
     let s = state();
@@ -1219,8 +1443,9 @@ pub extern "C" fn damage_float() -> u32 {
         (p.0 as u32) << 8 | (p.1 as u32) << 16
     };
     match &s.fx {
-        Fx::Hit { target, dmg, .. } => *dmg as u32 | at(*target),
+        Fx::Hit { target, dmg, crit, .. } => *dmg as u32 | at(*target) | if *crit { FLOAT_CRIT } else { 0 },
         Fx::Miss { target, .. } => FLOAT_MISS | at(*target),
+        Fx::Regen { target, amount, .. } => FLOAT_HEAL | (*amount as u32) | at(*target),
         _ => 0,
     }
 }
@@ -1285,15 +1510,16 @@ mod tests {
         init(3);
         assert!(state().frame.iter().all(|&c| c != 0));
         let parts: Vec<String> = state().text.split(SEP).map(String::from).collect();
-        assert_eq!(parts.len(), 12);
+        assert_eq!(parts.len(), 14);
         assert_eq!(parts[0], "라운드 1");
         assert_eq!(parts[4].lines().count(), 4);
 
-        // 선택은 보여줄 일이 없다. 길게 누르면 체력과 행동이 나온다.
+        // 선택은 보여줄 일이 없다. 길게 누르면 호출부호·체력·행동이 나온다.
         assert_eq!(click(1, 3), 1);
         assert_eq!(advance(), 0);
         assert!(inspect(1, 3) > 0);
-        assert_eq!(state().popup, "ψ 저격\n체력 ●●●●● 5/5\n행동 2");
+        assert!(state().popup.starts_with("ψ 저격 ["));
+        assert!(state().popup.contains("\n체력 ●●●●● 5/5\n행동 2"));
         assert_eq!(inspect(2, 3), 0);
         assert_eq!(inspect(W - 2, 5), 0, "안 보이는 적은 안 나온다");
         assert!(state().frame.iter().any(|&c| c == cell('·', BROOD, BG)));

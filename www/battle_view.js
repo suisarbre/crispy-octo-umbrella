@@ -1,5 +1,6 @@
 // 공유 전술 전투 렌더러 · 인터랙션 · FX 모듈 (단독 전투 main.js & 통합 전투 world.js 공용).
 // 6색 SF 감청 단말 팔레트(#0c0f11, #38454a, #cfcabb, #63d6ac, #e8823f, #37725e)를 엄격히 유지한다.
+import { sfx } from "./sfx.js";
 
 const PALETTE = ["#0c0f11", "#38454a", "#cfcabb", "#63d6ac", "#e8823f", "#37725e"];
 const FONT_FAMILY = 'ui-monospace, "Cascadia Mono", Menlo, Consolas, monospace';
@@ -15,10 +16,17 @@ const BEAT_RETREAT = 8;
 const BEAT_OVERWATCH = 9;
 const BEAT_OW_TRIGGER = 10;
 const BEAT_HUNKER = 11;
+const BEAT_GRENADE = 12;
+const BEAT_MARK = 13;
+const BEAT_SUPPRESS = 14;
+const BEAT_REGEN = 15;
 
 const SNAP = 0.95;
 const HOLD_MS = 350;
 const SENSOR_RADIUS = 6;
+const GRENADE_RANGE = 6;
+const GRENADE_RADIUS = 1;
+const MARK_RANGE = 14;
 const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -38,16 +46,22 @@ export function createBattleView(cfg) {
   let lastRosterRaw = "";
   let lastTargetsKey = "";
   let lastBadgeRaw = "";
+  let lastDebriefRaw = "";
+  let debriefDismissed = false;
   let holdTimer = 0;
   let holdStart = null;
   let swallowClick = false;
 
-  // XCOM 조준 모드 상태 (1번/공격 버튼 진입, Tab으로 표적 순환, 1/Enter/확정으로 발사)
+  // XCOM 조준 모드(1) 및 투척/병과스킬 표적 모드(4 파열탄 / 5 표식·제압·재생)
   let aimMode = false;
   let aimIndex = 0;
   let currentTargets = [];
+  let targetMode = null; // null | "grenade" | "skill"
+  let selectedSkillCode = 0;
+  let selectedSkillName = "";
+  let selectedGrenades = 0;
 
-  // 실시간 캔버스 애니메이션 FX (클릭 리액션, ⊘ 불가 흔들림, 트레이서/충격파/스파크, 중계 펄스, 경계 슬로모, 엄호)
+  // 실시간 캔버스 애니메이션 FX
   let fxList = [];
   let fxRaf = 0;
 
@@ -64,13 +78,17 @@ export function createBattleView(cfg) {
 
   function parseUnits() {
     const raw = unitsNow();
+    const meta = metaNow();
     const out = [];
     for (let i = 0; i + 1 < raw.length; i += 2) {
       const w0 = raw[i];
       const w1 = raw[i + 1];
+      const x = w0 & 0xff;
+      const y = (w0 >>> 8) & 0xff;
+      const m = meta[y * COLS + x] || 0;
       out.push({
-        x: w0 & 0xff,
-        y: (w0 >>> 8) & 0xff,
+        x,
+        y,
         hp: (w0 >>> 16) & 0xf,
         maxHp: (w0 >>> 20) & 0xf,
         ap: (w0 >>> 24) & 0x3,
@@ -89,6 +107,9 @@ export function createBattleView(cfg) {
         canRetreatHere: !!(w1 & (1 << 29)),
         isOverwatch: !!(w1 & (1 << 30)),
         isHunkered: !!(w1 & (1 << 31)),
+        isMarked: !!(m & (1 << 20)),
+        isSuppressed: !!(m & (1 << 21)),
+        rank: (m >>> 22) & 0x3,
       });
     }
     return out;
@@ -110,14 +131,14 @@ export function createBattleView(cfg) {
 
   function kick(kind) {
     if (reducedMotion.matches || !canvas.animate) return;
-    const d = kind === BEAT_KILL ? 3.5 : 2;
+    const d = kind === BEAT_KILL || kind === BEAT_GRENADE ? 4 : 2.2;
     canvas.animate(
       [
         { transform: `translate(${d}px, ${d - 1}px)` },
         { transform: `translate(${-d + 1}px, -1px)` },
         { transform: "none" },
       ],
-      { duration: kind === BEAT_KILL ? 150 : 95, easing: "ease-out" },
+      { duration: kind === BEAT_KILL || kind === BEAT_GRENADE ? 170 : 95, easing: "ease-out" },
     );
   }
 
@@ -153,8 +174,11 @@ export function createBattleView(cfg) {
       });
     }
 
-    if (kind === BEAT_TRACER && bfx[0] === 2) {
+    if (kind === BEAT_STEP) {
+      sfx.step(durMs >= 80);
+    } else if (kind === BEAT_TRACER && bfx[0] === 2) {
       const slow = !!bfx[6];
+      sfx.shot(slow);
       pushFx({
         kind: "tracer",
         fx: bfx[1],
@@ -166,22 +190,28 @@ export function createBattleView(cfg) {
         dur: Math.max(slow ? 230 : 115, durMs + 35),
       });
     } else if (kind === BEAT_HIT && bfx[0] === 3) {
+      const slow = !!(bfx[7] & 1);
+      const crit = !!(bfx[7] & 2);
+      sfx.hit(crit);
       const ang = Math.atan2(bfx[4] - bfx[2], bfx[3] - bfx[1]);
       const sparks = [];
-      for (let i = 0; i < 7; i++) {
-        const spread = (i - 3) * 0.28 + ((i % 2) * 0.12 - 0.06);
-        sparks.push({ ang: ang + spread, spd: 0.55 + (i % 3) * 0.25 });
+      const count = crit ? 12 : 7;
+      for (let i = 0; i < count; i++) {
+        const spread = (i - count / 2) * (crit ? 0.34 : 0.28) + ((i % 2) * 0.12 - 0.06);
+        sparks.push({ ang: ang + spread, spd: (crit ? 0.8 : 0.55) + (i % 3) * 0.25 });
       }
       pushFx({
         kind: "hit",
         x: bfx[3],
         y: bfx[4],
         dmg: bfx[5],
-        color: PALETTE[bfx[6]] || PALETTE[2],
+        crit,
+        color: crit ? PALETTE[4] : PALETTE[bfx[6]] || PALETTE[2],
         sparks,
-        dur: bfx[7] ? 340 : 280,
+        dur: slow || crit ? 360 : 280,
       });
     } else if (kind === BEAT_MISS && bfx[0] === 4) {
+      sfx.miss();
       const ang = Math.atan2(bfx[4] - bfx[2], bfx[3] - bfx[1]);
       const slow = !!(bfx[7] >>> 8);
       pushFx({
@@ -196,6 +226,7 @@ export function createBattleView(cfg) {
         dur: slow ? 320 : 260,
       });
     } else if (kind === BEAT_KILL && bfx[0] === 5) {
+      sfx.kill();
       const sparks = [];
       for (let i = 0; i < 10; i++) {
         sparks.push({ ang: (i / 10) * Math.PI * 2 + 0.2, spd: 0.7 + (i % 2) * 0.35 });
@@ -208,12 +239,16 @@ export function createBattleView(cfg) {
         dur: 340,
       });
     } else if (kind === BEAT_SMOKE && bfx[0] === 6) {
+      sfx.smoke();
       pushFx({ kind: "smoke_pop", x: bfx[1], y: bfx[2], dur: 320 });
     } else if (kind === BEAT_BURROW && bfx[0] === 7) {
+      sfx.burrow();
       pushFx({ kind: "burrow", x: bfx[1], y: bfx[2], dur: 240 });
     } else if (kind === BEAT_RETREAT && bfx[0] === 8) {
+      sfx.retreat();
       pushFx({ kind: "retreat", x: bfx[1], y: bfx[2], dur: 260 });
     } else if (kind === BEAT_OVERWATCH && bfx[0] === 9) {
+      sfx.overwatchSet();
       pushFx({
         kind: "overwatch_set",
         x: bfx[1],
@@ -222,6 +257,7 @@ export function createBattleView(cfg) {
         dur: 360,
       });
     } else if (kind === BEAT_OW_TRIGGER && bfx[0] === 10) {
+      sfx.overwatchTrigger();
       const col = PALETTE[bfx[5]] || PALETTE[4];
       // 슬로모 락온(560ms) + 이어지는 슬로모 사격(460ms) 동안 비네트와 레터박스가 부드럽게 이어진다.
       pushFx({
@@ -235,6 +271,7 @@ export function createBattleView(cfg) {
         dur: durMs + 460,
       });
     } else if (kind === BEAT_HUNKER && bfx[0] === 11) {
+      sfx.hunker();
       pushFx({
         kind: "hunker",
         x: bfx[1],
@@ -242,14 +279,42 @@ export function createBattleView(cfg) {
         color: PALETTE[bfx[3]] || PALETTE[2],
         dur: 340,
       });
+    } else if (kind === BEAT_GRENADE && bfx[0] === 12) {
+      sfx.grenade();
+      const debris = [];
+      for (let i = 0; i < 14; i++) {
+        debris.push({ ang: (i / 14) * Math.PI * 2 + (i % 3) * 0.14, spd: 0.75 + (i % 4) * 0.28 });
+      }
+      pushFx({
+        kind: "grenade_blast",
+        fx: bfx[1],
+        fy: bfx[2],
+        tx: bfx[3],
+        ty: bfx[4],
+        destroyed: bfx[5],
+        hits: bfx[6],
+        debris,
+        dur: 460,
+      });
+    } else if (kind === BEAT_MARK && bfx[0] === 13) {
+      sfx.mark();
+      pushFx({ kind: "mark_fx", fx: bfx[1], fy: bfx[2], tx: bfx[3], ty: bfx[4], dur: 360 });
+    } else if (kind === BEAT_SUPPRESS && bfx[0] === 14) {
+      sfx.suppress();
+      pushFx({ kind: "suppress_fx", fx: bfx[1], fy: bfx[2], tx: bfx[3], ty: bfx[4], dur: 380 });
+    } else if (kind === BEAT_REGEN && bfx[0] === 15) {
+      sfx.regen();
+      pushFx({ kind: "regen_fx", x: bfx[3], y: bfx[4], amount: bfx[5], dur: 380 });
     }
   }
 
   async function play() {
     if (playing) return;
+    const wasDone = !!wasm.battle_done();
     playing = true;
     skipRequested = false;
     aimMode = false;
+    targetMode = null;
     for (;;) {
       const beat = wasm.advance();
       if (!beat) break;
@@ -257,7 +322,7 @@ export function createBattleView(cfg) {
       const ms = beat & 0xffff;
       spawnBeatFx(kind, ms);
       draw();
-      if (kind === BEAT_HIT || kind === BEAT_KILL) kick(kind);
+      if (kind === BEAT_HIT || kind === BEAT_KILL || kind === BEAT_GRENADE) kick(kind);
       await sleep(ms);
       if (skipRequested) {
         wasm.skip();
@@ -265,11 +330,15 @@ export function createBattleView(cfg) {
       }
     }
     playing = false;
-    if (!wasm.battle_done()) {
+    const doneNow = wasm.battle_done();
+    if (!doneNow) {
       ensureSelected(true);
+    } else if (!wasDone) {
+      if (doneNow === 1) sfx.victory();
+      else sfx.defeat();
     }
     draw();
-    if (wasm.battle_done() && cfg.onDone) cfg.onDone();
+    if (doneNow && cfg.onDone) cfg.onDone();
   }
 
   function skipIfPlaying() {
@@ -704,9 +773,91 @@ export function createBattleView(cfg) {
       }
     }
 
-    // 7. 호버 타일 반응 테두리 (모든 호버에 즉각 반응)
+    // 7. 호버 타일 반응 테두리 + 파열탄(수류탄)/병과스킬 표적 모드 오버레이
     const activeTarget = pending || hoverCell;
-    if (activeTarget && !playing) {
+    if (targetMode === "grenade" && selUnit && !playing) {
+      // 투척 가능 범위(거리 1..=6) 음영
+      ctx.save();
+      for (let y = Math.max(0, selUnit.y - GRENADE_RANGE); y <= Math.min(ROWS - 1, selUnit.y + GRENADE_RANGE); y++) {
+        for (let x = Math.max(0, selUnit.x - GRENADE_RANGE); x <= Math.min(COLS - 1, selUnit.x + GRENADE_RANGE); x++) {
+          const d = Math.max(Math.abs(x - selUnit.x), Math.abs(y - selUnit.y));
+          if (d === 0 || d > GRENADE_RANGE) continue;
+          const [dx, dy] = toDisplay(x, y);
+          ctx.fillStyle = "rgba(232, 130, 63, 0.06)";
+          ctx.fillRect(dx * cw + 1, dy * ch + 1, cw - 2, ch - 2);
+        }
+      }
+      if (activeTarget) {
+        const [hx, hy] = activeTarget;
+        const d = Math.max(Math.abs(hx - selUnit.x), Math.abs(hy - selUnit.y));
+        if (hx >= 0 && hy >= 0 && hx < COLS && hy < ROWS && d > 0 && d <= GRENADE_RANGE) {
+          // 투척 포물선
+          const [sx, sy] = cellCenter(selUnit.x, selUnit.y);
+          const [tx, ty] = cellCenter(hx, hy);
+          ctx.strokeStyle = PALETTE[4];
+          ctx.lineWidth = 1.6;
+          ctx.setLineDash([5, 4]);
+          ctx.beginPath();
+          ctx.moveTo(sx, sy);
+          ctx.quadraticCurveTo((sx + tx) / 2, Math.min(sy, ty) - 24, tx, ty);
+          ctx.stroke();
+          ctx.setLineDash([]);
+          // 3×3 폭발 반경 + 파괴될 엄폐물 × 표시 + 피격 유닛 강조
+          for (let dy0 = -GRENADE_RADIUS; dy0 <= GRENADE_RADIUS; dy0++) {
+            for (let dx0 = -GRENADE_RADIUS; dx0 <= GRENADE_RADIUS; dx0++) {
+              const bx = hx + dx0;
+              const by = hy + dy0;
+              if (bx < 0 || by < 0 || bx >= COLS || by >= ROWS) continue;
+              const [bdx, bdy] = toDisplay(bx, by);
+              const bpx = bdx * cw;
+              const bpy = bdy * ch;
+              const bt = meta[by * COLS + bx] & 0x3;
+              ctx.fillStyle = bt !== 0 ? "rgba(232, 130, 63, 0.34)" : "rgba(232, 130, 63, 0.19)";
+              ctx.fillRect(bpx + 1, bpy + 1, cw - 2, ch - 2);
+              ctx.strokeStyle = "rgba(232, 130, 63, 0.85)";
+              ctx.lineWidth = dx0 === 0 && dy0 === 0 ? 1.8 : 1;
+              ctx.strokeRect(bpx + 1, bpy + 1, cw - 2, ch - 2);
+              if (bt !== 0) {
+                // 파괴될 엄폐물 표시 (×)
+                ctx.strokeStyle = PALETTE[2];
+                ctx.lineWidth = 1.6;
+                ctx.beginPath();
+                ctx.moveTo(bpx + 5, bpy + 5);
+                ctx.lineTo(bpx + cw - 5, bpy + ch - 5);
+                ctx.moveTo(bpx + cw - 5, bpy + 5);
+                ctx.lineTo(bpx + 5, bpy + ch - 5);
+                ctx.stroke();
+              }
+            }
+          }
+        }
+      }
+      ctx.restore();
+    } else if (targetMode === "skill" && selUnit && !playing) {
+      // 병과 고유 스킬 표적 강조 (표식: 시야 적 / 제압: 사선 적 / 재생: 거리 2 이내 부상 아군)
+      ctx.save();
+      for (const u of units) {
+        let valid = false;
+        let col = PALETTE[4];
+        if (selectedSkillCode === 2) {
+          const d = Math.max(Math.abs(u.x - selUnit.x), Math.abs(u.y - selUnit.y));
+          valid = u.isEmpire && !u.isMarked && d <= MARK_RANGE;
+          col = PALETTE[4];
+        } else if (selectedSkillCode === 3) {
+          valid = u.isEmpire && u.inFireLane && !u.isSuppressed;
+          col = PALETTE[4];
+        } else if (selectedSkillCode === 4) {
+          const d = Math.max(Math.abs(u.x - selUnit.x), Math.abs(u.y - selUnit.y));
+          valid = !u.isEmpire && u.hp < u.maxHp && d <= 2;
+          col = PALETTE[3];
+        }
+        if (valid) {
+          const [udx, udy] = toDisplay(u.x, u.y);
+          drawCornerBrackets(udx * cw, udy * ch, cw, ch, col, -1, 6, 2);
+        }
+      }
+      ctx.restore();
+    } else if (activeTarget && !playing) {
       const [hx, hy] = activeTarget;
       if (hx >= 0 && hy >= 0 && hx < COLS && hy < ROWS) {
         const hm = meta[hy * COLS + hx];
@@ -732,7 +883,7 @@ export function createBattleView(cfg) {
       }
     }
 
-    // 8. 유닛 카운터 + 인라인 체력 핍 + AP 점 + 경계/엄호 배지 + 방패병 90° 방패 호
+    // 8. 유닛 카운터 + 인라인 체력 핍 + AP 점 + 경계/엄호/표식/제압/계급 배지 + 방패병 90° 방패 호
     const lockedTarget = aimMode && !playing && currentTargets[aimIndex] ? currentTargets[aimIndex] : null;
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
@@ -864,7 +1015,7 @@ export function createBattleView(cfg) {
       if (u.maxHp > 0) {
         const maxP = u.maxHp;
         const gap = 1.2;
-        const pipW = Math.min(3.5, Math.max(1.8, (cw - 8 - gap * (maxP - 1)) / maxP));
+        const pipW = Math.min(3.5, Math.max(1.6, (cw - 8 - gap * (maxP - 1)) / maxP));
         const pipH = 2.4;
         const rowW = maxP * pipW + (maxP - 1) * gap;
         const sx = px + (cw - rowW) / 2;
@@ -882,6 +1033,18 @@ export function createBattleView(cfg) {
         for (let k = 0; k < maxP; k++) {
           ctx.fillStyle = k < u.hp ? fullCol : emptyCol;
           ctx.fillRect(sx + k * (pipW + gap), sy, pipW, pipH);
+        }
+      }
+
+      // 아군 베테랑 계급 셰브론(상단 중앙 점 1..3)
+      if (!u.isEmpire && !u.isAi && u.rank > 0) {
+        const rkCol = solid ? PALETTE[0] : PALETTE[2];
+        const rGap = 3.2;
+        const rStart = cx - ((u.rank - 1) * rGap) / 2;
+        const ry = py + pad + 2.4;
+        ctx.fillStyle = rkCol;
+        for (let k = 0; k < u.rank; k++) {
+          ctx.fillRect(rStart + k * rGap - 1, ry, 2, 2);
         }
       }
 
@@ -946,6 +1109,21 @@ export function createBattleView(cfg) {
         ctx.restore();
       }
 
+      // 표식(◎) 및 제압(▼) 상태 배지 (적 우상단)
+      if (u.isEmpire && (u.isMarked || u.isSuppressed)) {
+        const stCol = solid ? PALETTE[0] : PALETTE[2];
+        const sx0 = px + cw - pad - 4.5;
+        const sy0 = py + pad + 4.5;
+        ctx.save();
+        ctx.fillStyle = stCol;
+        ctx.font = `bold 9px ${FONT_FAMILY}`;
+        ctx.fillText(u.isMarked ? "◎" : "▼", sx0, sy0);
+        if (u.isMarked && u.isSuppressed) {
+          ctx.fillText("▼", sx0, sy0 + 7.5);
+        }
+        ctx.restore();
+      }
+
       // 방패병(H) 정면 90도 방패 호 (실제 `shield_cover` 각도)
       if (u.shieldDir > 0) {
         const ang = ((u.shieldDir - 1) * Math.PI) / 6 - (view.rot ? Math.PI / 2 : 0);
@@ -966,8 +1144,8 @@ export function createBattleView(cfg) {
       }
     }
 
-    // 9. 조준 미리보기 레이저 (b_fx[0] === 1)
-    if (bfx[0] === 1 && !playing) {
+    // 9. 조준 미리보기 레이저 (b_fx[0] === 1, 수류탄/스킬 모드가 아닐 때)
+    if (bfx[0] === 1 && !playing && !targetMode) {
       const [x1, y1] = cellCenter(bfx[1], bfx[2]);
       const [x2, y2] = cellCenter(bfx[3], bfx[4]);
       const chance = bfx[5];
@@ -1017,29 +1195,32 @@ export function createBattleView(cfg) {
       ctx.restore();
     }
 
-    // 10. 실시간 애니메이션 FX (경계 슬로모 비네트/락온, 트레이서, 충격파/스파크, 빗나감, 킬 버스트, 중계 펄스, 클릭/불가 리액션)
+    // 10. 실시간 애니메이션 FX
     if (reducedMotion.matches && bfx[0] === 10) {
       drawOverwatchSlowmoStatic(bfx[1], bfx[2], bfx[3], bfx[4], PALETTE[bfx[5]] || PALETTE[4], totalW, totalH);
     }
     drawActiveFx(totalW, totalH);
 
-    // 11. 피해/빗나감 팝업 텍스트 (wasm.damage_float, reduced-motion에서도 즉시 표시)
+    // 11. 피해/치명/회복/빗나감 팝업 텍스트 (wasm.damage_float)
     const fl = wasm.damage_float();
     if (fl) {
       const [dx, dy] = toDisplay((fl >>> 8) & 0xff, (fl >>> 16) & 0xff);
       const isMiss = !!(fl & (1 << 24));
-      const label = isMiss ? "빗나감" : `−${fl & 0xff}`;
+      const isCrit = !!(fl & (1 << 25));
+      const isHeal = !!(fl & (1 << 26));
+      const amt = fl & 0xff;
+      const label = isMiss ? "빗나감" : isHeal ? `+${amt}` : isCrit ? `치명 −${amt}!` : `−${amt}`;
       ctx.font = `bold ${Math.max(12, Math.round(view.font * 0.85))}px ${FONT_FAMILY}`;
       const w = Math.max(cw, ctx.measureText(label).width + 10);
       const h = Math.max(18, Math.round(ch * 0.68));
       const left = Math.min(Math.max(dx * cw + cw / 2 - w / 2, 2), totalW - w - 2);
       const top = dy > 0 ? dy * ch - h - 2 : (dy + 1) * ch + 2;
-      ctx.fillStyle = PALETTE[0];
+      ctx.fillStyle = isCrit ? PALETTE[4] : PALETTE[0];
       ctx.fillRect(left, top, w, h);
-      ctx.strokeStyle = isMiss ? PALETTE[1] : PALETTE[4];
-      ctx.lineWidth = 1.3;
+      ctx.strokeStyle = isMiss ? PALETTE[1] : isHeal ? PALETTE[3] : isCrit ? PALETTE[2] : PALETTE[4];
+      ctx.lineWidth = isCrit ? 1.8 : 1.3;
       ctx.strokeRect(left + 0.5, top + 0.5, w - 1, h - 1);
-      ctx.fillStyle = isMiss ? PALETTE[2] : PALETTE[4];
+      ctx.fillStyle = isMiss ? PALETTE[2] : isHeal ? PALETTE[3] : isCrit ? PALETTE[0] : PALETTE[4];
       ctx.textAlign = "center";
       ctx.textBaseline = "middle";
       ctx.fillText(label, left + w / 2, top + h / 2 + 0.5);
@@ -1396,6 +1577,109 @@ export function createBattleView(cfg) {
         ctx.textAlign = "center";
         ctx.textBaseline = "middle";
         ctx.fillText("엄호 +30", cx, cy - cellR - 6 - t * 8);
+      } else if (f.kind === "grenade_blast") {
+        // 생체 파열탄 투척 궤적 + 3×3 충격파 + 엄폐물 파편
+        const [sx, sy] = cellCenter(f.fx, f.fy);
+        const [cx, cy] = cellCenter(f.tx, f.ty);
+        if (t < 0.35) {
+          const p = t / 0.35;
+          const bx = sx + (cx - sx) * p;
+          const by = sy + (cy - sy) * p - Math.sin(p * Math.PI) * 26;
+          ctx.fillStyle = PALETTE[4];
+          ctx.beginPath();
+          ctx.arc(bx, by, 3.6, 0, Math.PI * 2);
+          ctx.fill();
+        } else {
+          const bt = (t - 0.35) / 0.65;
+          const rad = cellR * (0.6 + bt * 2.5);
+          ctx.fillStyle = `rgba(232, 130, 63, ${(1 - bt) * 0.36})`;
+          ctx.beginPath();
+          ctx.arc(cx, cy, rad, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.strokeStyle = PALETTE[4];
+          ctx.globalAlpha = 1 - bt;
+          ctx.lineWidth = 2.6 * (1 - bt * 0.5);
+          ctx.beginPath();
+          ctx.arc(cx, cy, rad, 0, Math.PI * 2);
+          ctx.stroke();
+          ctx.strokeStyle = PALETTE[2];
+          ctx.lineWidth = 1.6;
+          for (const d of f.debris) {
+            const r0 = cellR * (0.25 + bt * d.spd * 1.9);
+            const r1 = r0 + cellR * 0.42 * (1 - bt);
+            ctx.beginPath();
+            ctx.moveTo(cx + Math.cos(d.ang) * r0, cy + Math.sin(d.ang) * r0);
+            ctx.lineTo(cx + Math.cos(d.ang) * r1, cy + Math.sin(d.ang) * r1);
+            ctx.stroke();
+          }
+          ctx.fillStyle = PALETTE[2];
+          ctx.font = `bold 11px ${FONT_FAMILY}`;
+          ctx.textAlign = "center";
+          ctx.textBaseline = "middle";
+          const tag = f.destroyed > 0 ? `파열! 엄폐 −${f.destroyed}` : "파열 −2";
+          ctx.fillText(tag, cx, cy - cellR * 1.1 - bt * 10);
+        }
+      } else if (f.kind === "mark_fx") {
+        // 저격 표식: 수축하는 조준 마름모 + 연결선 + "표식 +20"
+        const [x1, y1] = cellCenter(f.fx, f.fy);
+        const [x2, y2] = cellCenter(f.tx, f.ty);
+        ctx.strokeStyle = PALETTE[4];
+        ctx.globalAlpha = (1 - t) * 0.7;
+        ctx.lineWidth = 1.4;
+        ctx.setLineDash([4, 3]);
+        ctx.beginPath();
+        ctx.moveTo(x1, y1);
+        ctx.lineTo(x2, y2);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        const rad = cellR * (1.4 - t * 0.7);
+        ctx.globalAlpha = 1 - t * 0.8;
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(x2, y2 - rad);
+        ctx.lineTo(x2 + rad, y2);
+        ctx.lineTo(x2, y2 + rad);
+        ctx.lineTo(x2 - rad, y2);
+        ctx.closePath();
+        ctx.stroke();
+        ctx.fillStyle = PALETTE[4];
+        ctx.font = `bold 10px ${FONT_FAMILY}`;
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        ctx.fillText("표식 +20", x2, y2 - cellR - 6 - t * 8);
+      } else if (f.kind === "suppress_fx") {
+        // 화력 제압: 3연속 점사 트레이서 + "제압"
+        const [x1, y1] = cellCenter(f.fx, f.fy);
+        const [x2, y2] = cellCenter(f.tx, f.ty);
+        ctx.strokeStyle = PALETTE[3];
+        ctx.globalAlpha = 1 - t;
+        ctx.lineWidth = 1.6;
+        for (let k = -1; k <= 1; k++) {
+          const off = k * 3.5;
+          ctx.beginPath();
+          ctx.moveTo(x1, y1);
+          ctx.lineTo(x2 + off, y2 + off * 0.6);
+          ctx.stroke();
+        }
+        ctx.fillStyle = PALETTE[4];
+        ctx.font = `bold 10px ${FONT_FAMILY}`;
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        ctx.fillText("제압 −30", x2, y2 - cellR - 6 - t * 8);
+      } else if (f.kind === "regen_fx") {
+        // 원형 응급 재생: 민트 파동 + 십자 마크 + "+2"
+        const [cx, cy] = cellCenter(f.x, f.y);
+        ctx.strokeStyle = PALETTE[3];
+        ctx.globalAlpha = 1 - t;
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.arc(cx, cy, cellR * (0.45 + t * 1.1), 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.fillStyle = PALETTE[3];
+        ctx.font = `bold 11px ${FONT_FAMILY}`;
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        ctx.fillText(`+${f.amount} 재생`, cx, cy - cellR - 6 - t * 10);
       } else if (f.kind === "relay_link") {
         // 제국 턴 개시 시 중계기(&)에서 제국 분대로 퍼지는 동기화 파동
         ctx.strokeStyle = PALETTE[4];
@@ -1477,7 +1761,7 @@ export function createBattleView(cfg) {
     const out = [];
     for (const line of raw.split("\n")) {
       if (!line) continue;
-      const [x, y, glyph, name, hp, maxHp, chance, aim, cover, falloff] = line.split("\t");
+      const [x, y, glyph, name, hp, maxHp, chance, aim, cover, falloff, crit, marked, suppressed] = line.split("\t");
       out.push({
         x: Number(x),
         y: Number(y),
@@ -1489,6 +1773,9 @@ export function createBattleView(cfg) {
         aim: Number(aim),
         cover: Number(cover),
         falloff: Number(falloff),
+        crit: Number(crit || 0),
+        marked: marked === "1",
+        suppressed: suppressed === "1",
       });
     }
     return out;
@@ -1497,8 +1784,10 @@ export function createBattleView(cfg) {
   function formatTargetReadout(t) {
     const cov = t.cover > 0 ? `−${t.cover}` : "0";
     const fall = t.falloff > 0 ? `−${t.falloff}` : "0";
-    const detail = `${t.glyph} ${t.name} ${hpPips(t.hp, t.maxHp)} ${t.hp}/${t.maxHp} │ 조준 ${t.aim} · 엄폐 ${cov} · 거리 ${fall}`;
-    const result = t.cover === 0 ? `명중 ${t.chance}% ◈ 측면` : `명중 ${t.chance}%`;
+    const flags = `${t.marked ? " ◎표식" : ""}${t.suppressed ? " ▼제압" : ""}`;
+    const detail = `${t.glyph} ${t.name} ${hpPips(t.hp, t.maxHp)} ${t.hp}/${t.maxHp}${flags} │ 조준 ${t.aim} · 엄폐 ${cov} · 거리 ${fall}`;
+    const critPart = t.crit > 0 ? ` · 치명 ${t.crit}%` : "";
+    const result = t.cover === 0 ? `명중 ${t.chance}%${critPart} ◈` : `명중 ${t.chance}%${critPart}`;
     return [detail, result];
   }
 
@@ -1530,8 +1819,9 @@ export function createBattleView(cfg) {
           btn.type = "button";
           btn.className = `tgt-chip${t.cover === 0 ? " flanked" : ""}`;
           btn.dataset.idx = String(idx);
-          btn.title = `${t.name} (체력 ${t.hp}/${t.maxHp}) · 클릭해 조준 / 재클릭 발사`;
-          btn.innerHTML = `<span>${t.glyph} ${t.name}</span><span class="tgt-hp">${hpPips(t.hp, t.maxHp)}</span><span class="tgt-pct">${t.chance}%</span>`;
+          btn.title = `${t.name} (체력 ${t.hp}/${t.maxHp}, 치명 ${t.crit}%) · 클릭해 조준 / 재클릭 발사`;
+          const st = `${t.marked ? "◎" : ""}${t.suppressed ? "▼" : ""}`;
+          btn.innerHTML = `<span>${t.glyph} ${t.name}${st ? ` ${st}` : ""}</span><span class="tgt-hp">${hpPips(t.hp, t.maxHp)}</span><span class="tgt-pct">${t.chance}%</span>`;
           btn.addEventListener("mouseenter", () => {
             if (playing || done) return;
             hoveredChipIndex = idx;
@@ -1551,6 +1841,10 @@ export function createBattleView(cfg) {
           btn.addEventListener("click", (ev) => {
             ev.currentTarget.blur();
             if (skipIfPlaying() || wasm.battle_done()) return;
+            if (targetMode === "skill" && (selectedSkillCode === 2 || selectedSkillCode === 3)) {
+              executeSkillAt(t.x, t.y);
+              return;
+            }
             if (aimMode && aimIndex === idx) {
               confirmFire();
             } else {
@@ -1562,7 +1856,6 @@ export function createBattleView(cfg) {
       }
     }
 
-    // DOM을 재생성하지 않고 잠금 상태(.active)만 부드럽게 갱신한다.
     const chips = els.targetList.querySelectorAll(".tgt-chip");
     chips.forEach((el, idx) => {
       el.classList.toggle("active", aimMode && idx === aimIndex);
@@ -1570,19 +1863,66 @@ export function createBattleView(cfg) {
   }
 
   function renderUnitBadge(raw) {
-    if (!els.unitBadge || raw === lastBadgeRaw) return 0;
+    const f = (raw || "").split("\t");
+    selectedGrenades = Number(f[9] || 0);
+    selectedSkillCode = Number(f[10] || 0);
+    selectedSkillName = f[11] || "";
+    const readyCount = Number(f[8] || 0);
+    if (!els.unitBadge || raw === lastBadgeRaw) return readyCount;
     lastBadgeRaw = raw;
-    const [glyph, name, hpStr, maxStr, apStr, tag, , , readyStr] = (raw || "").split("\t");
+    const [glyph, name, hpStr, maxStr, apStr, tag, , , , , , , callsign, rankLabel] = f;
     if (!glyph) {
       els.unitBadge.innerHTML = `<span class="u-ap">대기</span>`;
-      return Number(readyStr || 0);
+      return readyCount;
     }
     const hp = Number(hpStr || 0);
     const maxHp = Number(maxStr || 0);
     const ap = Number(apStr || 0);
+    const csHtml = callsign ? `<span class="u-cs">${callsign}</span>` : "";
+    const rkHtml = rankLabel && rankLabel !== "신병" ? `<span class="u-rk">${rankLabel}</span>` : "";
     const tagHtml = tag ? `<span class="u-tag">[${tag}]</span>` : "";
-    els.unitBadge.innerHTML = `<span class="u-g">${glyph}</span><span>${name}</span><span class="u-hp">${hpPips(hp, maxHp)}</span><span class="u-ap">AP ${ap}</span>${tagHtml}`;
-    return Number(readyStr || 0);
+    els.unitBadge.innerHTML = `<span class="u-g">${glyph}</span><span>${name}</span>${csHtml}${rkHtml}<span class="u-hp">${hpPips(hp, maxHp)}</span><span class="u-ap">AP ${ap}</span>${tagHtml}`;
+    return readyCount;
+  }
+
+  function renderDebrief(raw, done) {
+    if (!els.debriefModal || !els.debriefBody) return;
+    if (!done || !raw || debriefDismissed) {
+      els.debriefModal.hidden = true;
+      return;
+    }
+    els.debriefModal.hidden = false;
+    if (raw === lastDebriefRaw) return;
+    lastDebriefRaw = raw;
+    const lines = raw.split("\n");
+    const [wonStr, rounds, survivors, kia, kills, objLabel] = (lines[0] || "").split("|");
+    const won = wonStr === "1";
+    if (els.debriefTitle) {
+      els.debriefTitle.textContent = won ? `■ 작전 승리 — ${objLabel}` : `■ 교전 종료 — ${Number(survivors) > 0 ? "후퇴 생환" : "전원 전사"}`;
+      els.debriefTitle.className = won ? "debrief-win" : "debrief-loss";
+    }
+    const rows = lines
+      .slice(1)
+      .filter(Boolean)
+      .map((line) => {
+        const [cs, rk, g, name, hp, maxHp, k, st] = line.split("\t");
+        const dead = st === "전사";
+        return `<div class="debrief-row${dead ? " kia" : ""}">
+          <span class="debrief-g">${g}</span>
+          <span>${cs ? `${cs} ` : ""}${name} <small>${rk}</small></span>
+          <span class="debrief-k">처치 ${k}</span>
+          <span class="debrief-hp">${dead ? "전사" : `${hpPips(Number(hp), Number(maxHp))} ${hp}/${maxHp} (${st})`}</span>
+        </div>`;
+      })
+      .join("");
+    els.debriefBody.innerHTML = `
+      <div class="debrief-stats">
+        <span>경과 <b>${rounds}라운드</b></span>
+        <span>적 격파 <b>${kills}</b></span>
+        <span>생존 <b>${survivors}</b> / 전사 <b>${kia}</b></span>
+      </div>
+      <div class="debrief-list">${rows}</div>
+    `;
   }
 
   function draw() {
@@ -1590,7 +1930,10 @@ export function createBattleView(cfg) {
     const parts = new TextDecoder().decode(bytes).split("\u001f");
     const done = !!wasm.battle_done();
 
-    // 사선 내 표적 파싱 및 XCOM 조준 모드 동기화 (캔버스 그리기 전에 완료)
+    const selRaw = parts[11] ?? "";
+    const readyCount = renderUnitBadge(selRaw);
+
+    // 사선 내 표적 파싱 및 XCOM 조준/투척/스킬 모드 동기화
     const rawTargets = parts[10] ?? "";
     currentTargets = playing || done ? [] : parseTargets(rawTargets);
     if (playing || done || currentTargets.length === 0) {
@@ -1599,6 +1942,9 @@ export function createBattleView(cfg) {
     } else if (aimIndex >= currentTargets.length) {
       aimIndex = 0;
     }
+    if (playing || done) targetMode = null;
+    if (targetMode === "grenade" && selectedGrenades <= 0) targetMode = null;
+    if (targetMode === "skill" && selectedSkillCode < 2) targetMode = null;
 
     drawCanvasOnly();
 
@@ -1608,14 +1954,16 @@ export function createBattleView(cfg) {
     setText(els.status, parts[0] ?? "");
     setText(els.headerEl, parts[6] ?? "");
     setText(els.aiNoteEl, parts[7] ?? "");
+    const objText = parts[12] ?? "";
+    if (els.objectiveEl) {
+      els.objectiveEl.hidden = !objText;
+      setText(els.objectiveEl, objText);
+    }
     renderRoster(parts[4] ?? "");
     renderTargetChips(rawTargets, done);
+    renderDebrief(parts[13] ?? "", done);
 
-    const selRaw = parts[11] ?? "";
-    const readyCount = Number((selRaw.split("\t")[8]) || 0);
-    renderUnitBadge(selRaw);
-
-    // 상단 스트립 우측 명중률/체력 리드아웃 (단일 줄 컴팩트 요약)
+    // 상단 스트립 우측 리드아웃
     const activeChip =
       hoveredChipIndex >= 0 && currentTargets[hoveredChipIndex]
         ? currentTargets[hoveredChipIndex]
@@ -1624,7 +1972,15 @@ export function createBattleView(cfg) {
         : null;
     let detail = "";
     let result = "";
-    if (activeChip && !playing && !done) {
+    if (targetMode === "grenade") {
+      detail = "파열탄 투척: 사거리 6 내 지점 클릭 (3×3 엄폐 파괴 · 확정 피해 2)";
+      result = "Esc 취소";
+    } else if (targetMode === "skill") {
+      if (selectedSkillCode === 2) detail = "표식 대상 적 클릭 (행동 1 · 아군 조준+20 / 치명+15%)";
+      else if (selectedSkillCode === 3) detail = "제압할 사선 내 적 클릭 (적 조준−30 · 이동 절반)";
+      else if (selectedSkillCode === 4) detail = "재생할 자신 또는 거리 2 이내 부상 아군 클릭 (+2 체력)";
+      result = "Esc 취소";
+    } else if (activeChip && !playing && !done) {
       [detail, result] = formatTargetReadout(activeChip);
     } else if (parts[2] && !playing && !done) {
       const lines = (parts[1] ?? "")
@@ -1647,22 +2003,25 @@ export function createBattleView(cfg) {
     } else if (!playing) {
       detail =
         currentTargets.length > 0
-          ? "표적 클릭·[1] 조준 · [Tab] 전환"
-          : "이동 타일 클릭 · [Tab] 분대원 전환";
+          ? "표적 클릭·[1] 조준 · [4] 파열탄 · [Tab] 전환"
+          : "이동 타일 클릭 · [4] 파열탄 · [Tab] 분대원 전환";
     }
     setText(els.readoutDetail, detail);
     setText(els.readoutResult, result);
 
-    // XCOM 조준 모드 UI 상태
-    if (els.hudEl) els.hudEl.classList.toggle("aim-mode", aimMode);
+    // XCOM 조준/투척 모드 HUD 강조
+    if (els.hudEl) {
+      els.hudEl.classList.toggle("aim-mode", aimMode || !!targetMode);
+    }
     if (els.aimActions) els.aimActions.hidden = !aimMode || playing || done;
 
     // 액션 바 버튼 활성/비활성 및 표시 상태
     const canAttack = !playing && !done && currentTargets.length > 0;
     const canOverwatch = !playing && !done && !!(parts[8] ?? "");
     const canHunker = !playing && !done && !!(parts[9] ?? "");
-    const ability = parts[3] ?? "";
-    const canBurrow = !playing && !done && !!ability;
+    const selAp = Number((selRaw.split("\t")[4]) || 0);
+    const canGrenade = !playing && !done && selAp > 0 && selectedGrenades > 0;
+    const canSkill = !playing && !done && selectedSkillCode > 0;
     const canRetreat = !playing && !done && !!(parts[5] ?? "");
 
     if (els.attackBtn) {
@@ -1673,10 +2032,17 @@ export function createBattleView(cfg) {
     setText(els.attackCount, currentTargets.length > 0 ? `(${currentTargets.length})` : "");
     if (els.overwatchBtn) els.overwatchBtn.disabled = !canOverwatch;
     if (els.hunkerBtn) els.hunkerBtn.disabled = !canHunker;
-    const burrowBtn = els.burrowBtn || els.abilityBtn;
-    if (burrowBtn) {
-      burrowBtn.hidden = !ability;
-      burrowBtn.disabled = !canBurrow;
+    if (els.grenadeBtn) {
+      els.grenadeBtn.disabled = !canGrenade;
+      els.grenadeBtn.classList.toggle("active", targetMode === "grenade");
+    }
+    setText(els.grenadeCount, selectedGrenades > 0 ? `(${selectedGrenades})` : "");
+    const skillBtn = els.skillBtn || els.burrowBtn || els.abilityBtn;
+    if (skillBtn) {
+      skillBtn.hidden = false;
+      skillBtn.disabled = !canSkill;
+      skillBtn.classList.toggle("active", targetMode === "skill");
+      if (els.skillLabel) setText(els.skillLabel, selectedSkillName || "스킬");
     }
     if (els.retreatBtn) {
       els.retreatBtn.hidden = !(parts[5] ?? "");
@@ -1700,16 +2066,18 @@ export function createBattleView(cfg) {
     lastRosterRaw = raw;
     rosterList.innerHTML = "";
     for (const line of raw.split("\n").filter(Boolean)) {
-      const [x, y, sel, glyph, name, pips, ap, tag] = line.split("\t");
+      const [x, y, sel, glyph, name, pips, ap, tag, callsign, rankLabel] = line.split("\t");
       const btn = document.createElement("button");
       btn.type = "button";
       btn.className = sel === "1" ? "roster-row selected" : "roster-row";
-      btn.innerHTML = `<span class="roster-glyph">${glyph}</span><span>${name}</span><span class="roster-pips">${pips}</span><span class="roster-ap">${ap}</span><span class="roster-tag">${tag || ""}</span>`;
+      const meta = [callsign, rankLabel && rankLabel !== "신병" ? rankLabel : ""].filter(Boolean).join(" ");
+      btn.innerHTML = `<span class="roster-glyph">${glyph}</span><span>${name}${meta ? ` <small style="color:var(--dim)">${meta}</small>` : ""}</span><span class="roster-pips">${pips}</span><span class="roster-ap">${ap}</span><span class="roster-tag">${tag || ""}</span>`;
       btn.addEventListener("click", () => {
         if (rosterModal) rosterModal.hidden = true;
         if (skipIfPlaying()) return;
         clearPending();
         aimMode = false;
+        targetMode = null;
         act(Number(x), Number(y));
         draw();
       });
@@ -1773,12 +2141,14 @@ export function createBattleView(cfg) {
     if (skipIfPlaying() || wasm.battle_done()) return;
     clearPending();
     aimMode = false;
+    targetMode = null;
     hoveredChipIndex = -1;
     const res = wasm.select_next(dir >= 0 ? 1 : -1);
     if (res & (1 << 16)) {
       const x = res & 0xff;
       const y = (res >>> 8) & 0xff;
       if (cfg.onEvent) cfg.onEvent([x, y]);
+      sfx.select();
       pushFx({ kind: "pulse", x, y, color: PALETTE[3], dur: 260 });
     }
     draw();
@@ -1786,12 +2156,14 @@ export function createBattleView(cfg) {
 
   function selectAimTarget(idx) {
     if (playing || wasm.battle_done() || currentTargets.length === 0) return;
+    targetMode = null;
     const n = currentTargets.length;
     aimIndex = ((idx % n) + n) % n;
     aimMode = true;
     pending = null;
     const t = currentTargets[aimIndex];
     wasm.hover(t.x, t.y);
+    sfx.lock();
     pushFx({ kind: "pulse", x: t.x, y: t.y, color: PALETTE[4], dur: 240 });
     draw();
   }
@@ -1802,9 +2174,11 @@ export function createBattleView(cfg) {
   }
 
   function cancelAim() {
-    if (!aimMode) return;
+    if (!aimMode && !targetMode) return;
     aimMode = false;
+    targetMode = null;
     hoveredChipIndex = -1;
+    sfx.uiClick();
     if (hoverCell) wasm.hover(hoverCell[0], hoverCell[1]);
     else wasm.hover(-1, -1);
     draw();
@@ -1815,6 +2189,7 @@ export function createBattleView(cfg) {
     if (!aimMode || !currentTargets[aimIndex]) return;
     const t = currentTargets[aimIndex];
     aimMode = false;
+    targetMode = null;
     hoveredChipIndex = -1;
     pending = null;
     act(t.x, t.y);
@@ -1822,7 +2197,10 @@ export function createBattleView(cfg) {
 
   function pressAttack() {
     if (skipIfPlaying() || wasm.battle_done()) return;
-    if (currentTargets.length === 0) return;
+    if (currentTargets.length === 0) {
+      sfx.invalid();
+      return;
+    }
     if (aimMode) {
       confirmFire();
     } else {
@@ -1830,8 +2208,86 @@ export function createBattleView(cfg) {
     }
   }
 
+  function toggleGrenadeMode() {
+    if (skipIfPlaying() || wasm.battle_done()) return;
+    if (els.grenadeBtn && els.grenadeBtn.disabled) {
+      sfx.invalid();
+      return;
+    }
+    if (targetMode === "grenade") {
+      cancelAim();
+      return;
+    }
+    aimMode = false;
+    pending = null;
+    targetMode = "grenade";
+    sfx.lock();
+    draw();
+  }
+
+  function executeGrenadeAt(x, y) {
+    const ok = wasm.grenade(x, y);
+    if (!ok) {
+      sfx.invalid();
+      pushFx({ kind: "invalid", x, y, dur: 300 });
+      draw();
+      return;
+    }
+    targetMode = null;
+    if (cfg.onEvent) cfg.onEvent(["g", x, y]);
+    play();
+  }
+
+  function pressClassSkill() {
+    if (skipIfPlaying() || wasm.battle_done()) return;
+    if (selectedSkillCode <= 0) {
+      sfx.invalid();
+      return;
+    }
+    // 잠복(1)은 대상 지정 없이 즉시 실행
+    if (selectedSkillCode === 1) {
+      clearPending();
+      aimMode = false;
+      targetMode = null;
+      if (wasm.class_skill(-1, -1) && cfg.onEvent) cfg.onEvent(["k", -1, -1]);
+      play();
+      return;
+    }
+    if (targetMode === "skill") {
+      cancelAim();
+      return;
+    }
+    aimMode = false;
+    pending = null;
+    targetMode = "skill";
+    sfx.lock();
+    draw();
+  }
+
+  function executeSkillAt(x, y) {
+    const ok = wasm.class_skill(x, y);
+    if (!ok) {
+      sfx.invalid();
+      pushFx({ kind: "invalid", x, y, dur: 300 });
+      draw();
+      return;
+    }
+    targetMode = null;
+    if (cfg.onEvent) cfg.onEvent(["k", x, y]);
+    play();
+  }
+
   function act(x, y) {
     if (x < 0 || y < 0 || x >= COLS || y >= ROWS) return;
+    if (targetMode === "grenade") {
+      executeGrenadeAt(x, y);
+      return;
+    }
+    if (targetMode === "skill") {
+      executeSkillAt(x, y);
+      return;
+    }
+
     aimMode = false;
     hoveredChipIndex = -1;
     const units = parseUnits();
@@ -1843,16 +2299,20 @@ export function createBattleView(cfg) {
 
     // 항상 1명의 분대원 선택을 유지: 자기 자신·AI 아군·벽·이동불가·사선불가 적 클릭은 리액션만 주고 선택을 유지한다.
     if (sel && targetU && (targetU.isSelected || targetU.isAi)) {
+      sfx.uiClick();
       pushFx({ kind: "pulse", x, y, color: targetU.isAi ? PALETTE[5] : PALETTE[3], dur: 220 });
       draw();
       return;
     }
     if (sel && targetU && targetU.isEmpire && !targetU.inFireLane) {
+      sfx.invalid();
       pushFx({ kind: "invalid", x, y, dur: 320 });
       draw();
       return;
     }
     if (sel && !targetU && !reach) {
+      if (tile !== 0) sfx.invalid();
+      else sfx.uiClick();
       pushFx({ kind: tile !== 0 ? "invalid" : "pulse", x, y, color: PALETTE[1], dur: tile !== 0 ? 320 : 220 });
       draw();
       return;
@@ -1860,8 +2320,10 @@ export function createBattleView(cfg) {
 
     // 유효 클릭 즉각 리액션 (분대원 전환 펄스, 이동 펄스)
     if (targetU && !targetU.isEmpire) {
+      sfx.select();
       pushFx({ kind: "pulse", x, y, color: targetU.isAi ? PALETTE[5] : PALETTE[3], dur: 260 });
     } else if (sel && reach) {
+      sfx.uiClick();
       pushFx({ kind: "pulse", x, y, color: PALETTE[3], dur: 260 });
     }
 
@@ -1919,36 +2381,40 @@ export function createBattleView(cfg) {
     if (wasm.battle_done()) return;
     clearPending();
     aimMode = false;
+    targetMode = null;
     hoveredChipIndex = -1;
+    sfx.turnEnd();
     wasm.end_turn();
     if (cfg.onEvent) cfg.onEvent("e");
     play();
   }
 
   function useAbility() {
-    const btn = els.burrowBtn || els.abilityBtn;
-    if (btn && (btn.disabled || btn.hidden)) return;
-    if (skipIfPlaying() || wasm.battle_done()) return;
-    clearPending();
-    aimMode = false;
-    if (wasm.ability() && cfg.onEvent) cfg.onEvent("b");
-    play();
+    pressClassSkill();
   }
 
   function useOverwatch() {
-    if (els.overwatchBtn && els.overwatchBtn.disabled) return;
+    if (els.overwatchBtn && els.overwatchBtn.disabled) {
+      sfx.invalid();
+      return;
+    }
     if (skipIfPlaying() || wasm.battle_done()) return;
     clearPending();
     aimMode = false;
+    targetMode = null;
     if (wasm.overwatch() && cfg.onEvent) cfg.onEvent("o");
     play();
   }
 
   function useHunker() {
-    if (els.hunkerBtn && els.hunkerBtn.disabled) return;
+    if (els.hunkerBtn && els.hunkerBtn.disabled) {
+      sfx.invalid();
+      return;
+    }
     if (skipIfPlaying() || wasm.battle_done()) return;
     clearPending();
     aimMode = false;
+    targetMode = null;
     if (wasm.hunker() && cfg.onEvent) cfg.onEvent("h");
     play();
   }
@@ -1958,6 +2424,7 @@ export function createBattleView(cfg) {
     if (skipIfPlaying() || wasm.battle_done()) return;
     clearPending();
     aimMode = false;
+    targetMode = null;
     if (wasm.retreat() && cfg.onEvent) cfg.onEvent("r");
     play();
   }
@@ -1985,12 +2452,17 @@ export function createBattleView(cfg) {
       useHunker();
       return true;
     }
-    if (ev.code === "Digit4" || ev.code === "KeyB") {
+    if (ev.code === "Digit4" || ev.code === "KeyG") {
       ev.preventDefault();
-      useAbility();
+      toggleGrenadeMode();
       return true;
     }
-    if (ev.code === "Digit5" || ev.code === "KeyR") {
+    if (ev.code === "Digit5" || ev.code === "KeyF" || ev.code === "KeyB") {
+      ev.preventDefault();
+      pressClassSkill();
+      return true;
+    }
+    if (ev.code === "Digit6" || ev.code === "KeyR") {
       ev.preventDefault();
       useRetreat();
       return true;
@@ -2011,7 +2483,7 @@ export function createBattleView(cfg) {
       return false;
     }
     if (ev.code === "Escape") {
-      if (aimMode) {
+      if (aimMode || targetMode) {
         ev.preventDefault();
         cancelAim();
         return true;
@@ -2039,11 +2511,18 @@ export function createBattleView(cfg) {
     skipRequested = false;
     aimMode = false;
     aimIndex = 0;
+    targetMode = null;
+    selectedSkillCode = 0;
+    selectedSkillName = "";
+    selectedGrenades = 0;
     currentTargets = [];
     hoveredChipIndex = -1;
     lastRosterRaw = "";
     lastTargetsKey = "";
     lastBadgeRaw = "";
+    lastDebriefRaw = "";
+    debriefDismissed = false;
+    if (els.debriefModal) els.debriefModal.hidden = true;
     fxList = [];
   }
 
@@ -2066,7 +2545,7 @@ export function createBattleView(cfg) {
   canvas.addEventListener("pointercancel", hidePop);
   canvas.addEventListener("contextmenu", (ev) => {
     ev.preventDefault();
-    if (aimMode) cancelAim();
+    if (aimMode || targetMode) cancelAim();
   });
 
   canvas.addEventListener("click", (ev) => {
@@ -2077,7 +2556,7 @@ export function createBattleView(cfg) {
     if (skipIfPlaying()) return;
     if (wasm.battle_done()) return;
 
-    if (lastPointer === "mouse") {
+    if (lastPointer === "mouse" || targetMode) {
       const [x, y] = cellAt(ev, false);
       act(x, y);
       showPop(x, y, ev.clientX, ev.clientY);
@@ -2118,7 +2597,7 @@ export function createBattleView(cfg) {
       const hitIdx = currentTargets.findIndex((t) => t.x === x && t.y === y);
       if (hitIdx >= 0) wasm.hover(x, y);
       else wasm.hover(currentTargets[aimIndex].x, currentTargets[aimIndex].y);
-    } else {
+    } else if (!targetMode) {
       wasm.hover(x, y);
     }
     draw();
@@ -2151,9 +2630,14 @@ export function createBattleView(cfg) {
   bindBtn(els.cancelAimBtn, cancelAim);
   bindBtn(els.overwatchBtn, useOverwatch);
   bindBtn(els.hunkerBtn, useHunker);
-  bindBtn(els.burrowBtn || els.abilityBtn, useAbility);
+  bindBtn(els.grenadeBtn, toggleGrenadeMode);
+  bindBtn(els.skillBtn || els.burrowBtn || els.abilityBtn, pressClassSkill);
   bindBtn(els.retreatBtn, useRetreat);
   bindBtn(els.endBtn, endTurn);
+  bindBtn(els.debriefCloseBtn, () => {
+    debriefDismissed = true;
+    if (els.debriefModal) els.debriefModal.hidden = true;
+  });
   bindBtn(els.confirmBtn, () => {
     if (skipIfPlaying() || !pending) return;
     const [x, y] = pending;
@@ -2172,6 +2656,8 @@ export function createBattleView(cfg) {
     useAbility,
     useOverwatch,
     useHunker,
+    toggleGrenadeMode,
+    pressClassSkill,
     useRetreat,
     ensureSelected,
     cycleUnit,

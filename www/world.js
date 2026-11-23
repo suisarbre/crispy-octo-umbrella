@@ -2,6 +2,7 @@
 // 문명식 육각 지형·영토 경계·도로망(스크롤/다단계 줌/전체 보기/모바일 90도 회전),
 // 지휘망 1+2 제안, 보급권 정비/개조, 충돌 시 실제 전술 전투 진입과 복귀를 담당한다.
 import { createBattleView } from "./battle_view.js";
+import { sfx } from "./sfx.js";
 
 const PALETTE = ["#0c0f11", "#38454a", "#cfcabb", "#63d6ac", "#e8823f", "#37725e"];
 const SAVE_KEY = "crispy-octo-umbrella/world-hex-v1";
@@ -27,7 +28,29 @@ const canvasBox = $("canvas-box");
 const menu = $("menu");
 const pop = $("pop");
 const refitModal = $("refit-modal");
+const briefingModal = $("briefing-modal");
+const campaignModal = $("campaign-modal");
+const helpModal = $("help-modal");
 const stillness = window.matchMedia("(prefers-reduced-motion: reduce)");
+let campaignDismissed = false;
+let lastCampaignRaw = "";
+let lastBriefingRaw = "";
+
+function syncSfxBtns() {
+  const txt = sfx.isMuted() ? "음향 OFF" : "음향 ON";
+  if ($("btn-sfx")) $("btn-sfx").textContent = txt;
+  if ($("b-btn-sfx")) $("b-btn-sfx").textContent = txt;
+}
+syncSfxBtns();
+for (const id of ["btn-sfx", "b-btn-sfx"]) {
+  if ($(id)) {
+    $(id).addEventListener("click", (ev) => {
+      ev.currentTarget.blur();
+      sfx.toggleMute();
+      syncSfxBtns();
+    });
+  }
+}
 
 const { instance } = await WebAssembly.instantiateStreaming(fetch("game.wasm"));
 const wasm = instance.exports;
@@ -262,7 +285,7 @@ function drawMountainSymbol(cx, cy, R, verts) {
   ctx.restore();
 }
 
-// 숲: 은밀한 3그루 침엽수 클러스터 실루엣
+// 숲: 은밀한 3그루 침엽수 클러스터 실루엣 (올리브·이끼 톤으로 아군 민트 국경과 명확히 분리)
 function drawForestSymbol(cx, cy, R) {
   const s = R * 0.25;
   const pts = [
@@ -270,7 +293,7 @@ function drawForestSymbol(cx, cy, R) {
     [cx + s * 1.15, cy + s * 0.55],
     [cx, cy - s * 0.75],
   ];
-  ctx.fillStyle = "#2d5d4d";
+  ctx.fillStyle = "#526e3c";
   for (const [tx, ty] of pts) {
     ctx.beginPath();
     ctx.moveTo(tx, ty - s * 1.05);
@@ -379,11 +402,12 @@ function draw() {
         // 산맥: 전체 보기에서도 지형 벽이 확 드러나는 밝은 슬레이트 톤
         ctx.fillStyle = overview ? "#38464e" : "#243037";
       } else if (owner === 1) {
-        ctx.fillStyle = terr === 1 ? "#122921" : terr === 2 ? "#162925" : "#11231d";
+        // 아군 영토: 차가운 청록 틴트 (숲의 올리브 톤과 명확히 구분)
+        ctx.fillStyle = terr === 1 ? "#152a20" : terr === 2 ? "#122a2f" : "#0e2228";
       } else if (owner === 2) {
-        ctx.fillStyle = terr === 1 ? "#241913" : terr === 2 ? "#281c15" : "#221610";
+        ctx.fillStyle = terr === 1 ? "#251a12" : terr === 2 ? "#281c15" : "#221610";
       } else if (terr === 1) {
-        ctx.fillStyle = overview ? "#142921" : "#0e1f19"; // 숲
+        ctx.fillStyle = overview ? "#212e18" : "#151f11"; // 중립 숲 (올리브·이끼)
       } else if (terr === 2) {
         ctx.fillStyle = overview ? "#1f272d" : "#181f24"; // 고지
       } else {
@@ -437,9 +461,8 @@ function draw() {
     }
   }
 
-  // 패스 2: Civ식 영토 외곽 경계선 (border_mask)
+  // 패스 2: Civ식 영토 외곽 경계선 (아군: 선명한 민트-시안 이중선 / 제국: 주황선)
   ctx.lineCap = "round";
-  ctx.lineWidth = overview ? 1.6 : 2.2;
   for (let r = rMin; r <= rMax; r++) {
     for (let q = qMin; q <= qMax; q++) {
       const h = hexes[r * W_COLS + q];
@@ -449,7 +472,6 @@ function draw() {
       const [dx, dy] = hexCenterDisp(q, r);
       const cx = dx - camX;
       const cy = dy - camY;
-      ctx.strokeStyle = owner === 1 ? PALETTE[5] : PALETTE[4];
       ctx.beginPath();
       for (let d = 0; d < 6; d++) {
         if (!(bmask & (1 << d))) continue;
@@ -458,6 +480,13 @@ function draw() {
         ctx.moveTo(cx + v1[0], cy + v1[1]);
         ctx.lineTo(cx + v2[0], cy + v2[1]);
       }
+      if (!overview) {
+        ctx.strokeStyle = "rgba(12, 15, 17, 0.72)";
+        ctx.lineWidth = 4.2;
+        ctx.stroke();
+      }
+      ctx.strokeStyle = owner === 1 ? PALETTE[3] : PALETTE[4];
+      ctx.lineWidth = overview ? 1.8 : 2.4;
       ctx.stroke();
     }
   }
@@ -978,6 +1007,90 @@ function syncTextAndPanels() {
   });
 
   renderRefitModal(parts[7] ?? "", parts[8] ?? "");
+  renderBriefingModal(parts[9] ?? "");
+  renderCampaignModal(parts[10] ?? "");
+}
+
+function renderBriefingModal(raw) {
+  if (!briefingModal) return;
+  if (!raw || wasm.w_victory()) {
+    briefingModal.hidden = true;
+    lastBriefingRaw = "";
+    return;
+  }
+  briefingModal.hidden = false;
+  if (raw === lastBriefingRaw) return;
+  lastBriefingRaw = raw;
+  const lines = raw.split("\n");
+  const [wonStr, title, objLabel, survivors, kia, kills, bio, captured] = (lines[0] || "").split("|");
+  const won = wonStr === "1";
+  const tEl = $("brief-title");
+  tEl.textContent = won ? `■ 작전 승리 — ${title}` : `■ 교전 종료 — ${title}`;
+  tEl.className = won ? "brief-win" : "brief-loss";
+
+  const promos = lines.slice(1).filter(Boolean);
+  const promoHtml = promos.length
+    ? promos.map((p) => `<div class="brief-promo">▲ ${p}</div>`).join("")
+    : "";
+  const capHtml = captured ? `<div class="brief-cap">◆ ${captured}</div>` : "";
+  $("brief-content").innerHTML = `
+    <div class="brief-stats">
+      <span>목표<br><b>${objLabel}</b></span>
+      <span>적 격파<br><b>${kills}</b></span>
+      <span>생존 / 전사<br><b>${survivors} / ${kia}</b></span>
+      <span>획득 생체질<br><b>+${bio}</b></span>
+    </div>
+    <div class="brief-body">
+      ${capHtml}
+      ${promoHtml || `<span style="color:var(--dim);font-size:12px;">대원들이 전투 경험을 축적했습니다.</span>`}
+    </div>
+  `;
+}
+
+function renderCampaignModal(raw) {
+  if (!campaignModal) return;
+  if (!raw || campaignDismissed) {
+    campaignModal.hidden = true;
+    return;
+  }
+  campaignModal.hidden = false;
+  if (raw === lastCampaignRaw) return;
+  lastCampaignRaw = raw;
+  const lines = raw.split("\n");
+  const [wonStr, day, bWon, bFought, kills, bSites, tSites, bio] = (lines[0] || "").split("|");
+  const won = wonStr === "1";
+  const tEl = $("camp-title");
+  tEl.textContent = won ? "■ 전구 작전 승리 — 인류 본진 점령" : "■ 전구 작전 실패 — 특수부대 전멸";
+  tEl.className = won ? "brief-win" : "brief-loss";
+  if (won) sfx.victory();
+  else sfx.defeat();
+
+  const rosterHtml = lines
+    .slice(1)
+    .filter(Boolean)
+    .map((line) => {
+      const [cs, rk, g, name, b, k, hp, maxHp] = line.split("\t");
+      return `<div class="camp-row">
+        <span style="color:var(--brood);font-weight:bold;width:1.2em;text-align:center">${g}</span>
+        <span><b>${cs}</b> ${name} <span style="color:var(--fg)">[${rk}]</span></span>
+        <span style="margin-left:auto;color:var(--dim)">${b}전 · ${k}처치 · HP ${hp}/${maxHp}</span>
+      </div>`;
+    })
+    .join("");
+
+  $("camp-content").innerHTML = `
+    <div class="brief-stats">
+      <span>경과 일수<br><b>D+${day}</b></span>
+      <span>전술 승률<br><b>${bWon} / ${bFought}</b></span>
+      <span>총 적 격파<br><b>${kills}</b></span>
+      <span>점령 거점<br><b>${bSites} / ${tSites}</b></span>
+      <span>보유 생체질<br><b>${bio}</b></span>
+    </div>
+    <div class="brief-body">
+      <div style="color:var(--brood);font-weight:bold;font-size:12px;">■ 생존 특수부대 명부</div>
+      <div>${rosterHtml || `<span style="color:var(--empire);font-size:12px;">생존 대원 없음</span>`}</div>
+    </div>
+  `;
 }
 
 const GENE_LABELS = [
@@ -1000,16 +1113,17 @@ function renderRefitModal(rowsRaw, metaRaw) {
   const list = $("refit-list");
   list.innerHTML = "";
   for (const line of rowsRaw.split("\n").filter(Boolean)) {
-    const [slotStr, glyph, name, pips, hpStr, battles, gidStr] = line.split("\t");
+    const [slotStr, glyph, name, pips, hpStr, battles, gidStr, callsign, rankLabel, kills, aimBonus] = line.split("\t");
     const slot = Number(slotStr);
     const gid = Number(gidStr);
     const row = document.createElement("div");
     row.className = "tr-row";
+    const rkTag = rankLabel && rankLabel !== "신병" ? ` [${rankLabel}${Number(aimBonus) > 0 ? ` +${aimBonus}` : ""}]` : "";
     row.innerHTML = `
       <span class="tr-glyph">${glyph}</span>
-      <span>${name}</span>
+      <span><b>${callsign || ""}</b> ${name}<small style="color:var(--brood)">${rkTag}</small></span>
       <span>${pips}</span>
-      <span class="tr-meta">${hpStr} · ${battles}전</span>
+      <span class="tr-meta">${hpStr} · ${battles}전 · ${kills || 0}처치</span>
       <div class="tr-genes"></div>`;
     const gWrap = row.querySelector(".tr-genes");
     for (const g of GENE_LABELS) {
@@ -1024,6 +1138,7 @@ function renderRefitModal(rowsRaw, metaRaw) {
         b.disabled = !inSup || bio < (regeneCost || 4);
         b.addEventListener("click", () => {
           if (wasm.w_regene(slot, g.id)) {
+            sfx.uiClick();
             save.events.push(["g", [slot, g.id]]);
             persist();
             draw();
@@ -1037,16 +1152,51 @@ function renderRefitModal(rowsRaw, metaRaw) {
 }
 
 $("btn-refit").addEventListener("click", () => {
-  if (!playing && wasm.w_in_supply()) refitModal.hidden = false;
+  if (!playing && wasm.w_in_supply()) {
+    sfx.uiClick();
+    refitModal.hidden = false;
+  }
 });
 $("refit-close").addEventListener("click", () => { refitModal.hidden = true; });
 refitModal.addEventListener("click", (ev) => { if (ev.target === refitModal) refitModal.hidden = true; });
 $("btn-heal").addEventListener("click", () => {
-  if (wasm.w_heal_squad()) { save.events.push(["h", 0]); persist(); draw(); }
+  if (wasm.w_heal_squad()) { sfx.regen(); save.events.push(["h", 0]); persist(); draw(); }
 });
 $("btn-recruit").addEventListener("click", () => {
-  if (wasm.w_recruit()) { save.events.push(["r", 0]); persist(); draw(); }
+  if (wasm.w_recruit()) { sfx.select(); save.events.push(["r", 0]); persist(); draw(); }
 });
+
+function closeBriefing() {
+  briefingModal.hidden = true;
+  lastBriefingRaw = "";
+  wasm.w_clear_briefing();
+  lastTextRaw = "";
+  draw();
+}
+$("brief-close").addEventListener("click", closeBriefing);
+$("brief-ok").addEventListener("click", closeBriefing);
+briefingModal.addEventListener("click", (ev) => { if (ev.target === briefingModal) closeBriefing(); });
+
+$("camp-close").addEventListener("click", () => {
+  campaignDismissed = true;
+  campaignModal.hidden = true;
+});
+$("camp-new").addEventListener("click", () => {
+  sfx.uiClick();
+  newGame(crypto.getRandomValues(new Uint32Array(1))[0]);
+});
+
+for (const id of ["btn-help", "b-btn-help"]) {
+  if ($(id)) {
+    $(id).addEventListener("click", (ev) => {
+      ev.currentTarget.blur();
+      sfx.uiClick();
+      helpModal.hidden = !helpModal.hidden;
+    });
+  }
+}
+$("help-close").addEventListener("click", () => { helpModal.hidden = true; });
+helpModal.addEventListener("click", (ev) => { if (ev.target === helpModal) helpModal.hidden = true; });
 
 function placeMenu() {
   const m = playing || draggingTarget ? 0 : wasm.w_menu();
@@ -1080,6 +1230,7 @@ function placeMenu() {
 function giveCommand(kind) {
   const m = wasm.w_menu();
   if (playing || !wasm.w_command(kind)) return;
+  sfx.uiClick();
   save.events.push(["o", kind]);
   persist();
   hoverHex = null;
@@ -1108,6 +1259,7 @@ function noteTicks(done) {
 async function passDay() {
   if (playing || wasm.w_halted()) return;
   playing = true;
+  sfx.dayTick();
   const quick = stillness.matches;
   for (let left = wasm.w_ticks_left_today(); left > 0; left--) {
     const done = wasm.w_tick(1);
@@ -1117,6 +1269,7 @@ async function passDay() {
     if (!quick) await sleep(TICK_MS);
   }
   playing = false;
+  if (wasm.w_has_clash()) sfx.clashAlert();
   persist();
   draw();
 }
@@ -1124,6 +1277,7 @@ async function passDay() {
 async function passUntilEvent() {
   if (playing || wasm.w_halted()) return;
   playing = true;
+  sfx.dayTick();
   const quick = stillness.matches;
   for (let step = 0; step < 240; step++) {
     const done = wasm.w_tick(1);
@@ -1134,12 +1288,14 @@ async function passUntilEvent() {
     if (!quick) await sleep(18);
   }
   playing = false;
+  if (wasm.w_has_clash()) sfx.clashAlert();
   persist();
   draw();
 }
 
 function focusAndSelectSpecial() {
   if (playing) return;
+  sfx.select();
   if (wasm.w_select_special()) {
     save.events.push(["s", 0]);
     persist();
@@ -1159,6 +1315,12 @@ function newGame(seed) {
   hoverHex = null;
   inspectedHex = null;
   draggingTarget = false;
+  campaignDismissed = false;
+  lastCampaignRaw = "";
+  lastBriefingRaw = "";
+  briefingModal.hidden = true;
+  campaignModal.hidden = true;
+  lastTextRaw = "";
   const sp = wasm.w_special_pos();
   view.overview = false;
   layout();
@@ -1180,12 +1342,20 @@ function load(data) {
     else if (e[0] === "h") wasm.w_heal_squad();
     else if (e[0] === "g") wasm.w_regene(e[1][0] | 0, e[1][1] | 0);
     else if (e[0] === "r") wasm.w_recruit();
-    else if (e[0] === "b") wasm.w_apply_battle(e[1][0] | 0, e[1][1] | 0, e[1][2] | 0, e[1][3] >>> 0);
-    else wasm.w_click(e[0] | 0, e[1] | 0);
+    else if (e[0] === "b") {
+      wasm.w_apply_battle_ext(
+        e[1][0] | 0,
+        e[1][1] | 0,
+        e[1][2] | 0,
+        e[1][3] >>> 0,
+        (e[1][4] || 0) >>> 0,
+      );
+    } else wasm.w_click(e[0] | 0, e[1] | 0);
   }
   if (data.fp !== undefined && data.fp !== wasm.w_fingerprint_lo()) {
     throw new Error("다른 버전에서 만든 세이브라 재현이 안 됨");
   }
+  wasm.w_clear_briefing();
   save = { v: SAVE_VERSION, seed: data.seed, events: data.events };
 }
 
@@ -1391,6 +1561,7 @@ canvas.addEventListener("pointerup", (ev) => {
     }
     // 산맥·불모 해역 위에 놓으면 선택을 유지한 채 붉은 ⊘ 흔들림 리액션!
     if (isImpassableHex(q, r)) {
+      sfx.invalid();
       spawnFx("invalid", q, r, PALETTE[4], 380);
       draw();
       return;
@@ -1401,6 +1572,7 @@ canvas.addEventListener("pointerup", (ev) => {
         save.events.push([q, r]);
         persist();
       }
+      sfx.uiClick();
       spawnFx("pulse", q, r, PALETTE[3], 320);
       hidePop();
     }
@@ -1413,6 +1585,12 @@ canvas.addEventListener("pointerup", (ev) => {
     if (ev.pointerType !== "mouse") hidePop();
     return;
   }
+  // 우클릭(드래그 없이)은 특수부대 선택 해제 · 명령 메뉴 닫기
+  if (ev.button === 2) {
+    deselectSpecial();
+    return;
+  }
+  if (ev.button === 1) return;
   const [q, r] = hexAtClient(ev.clientX, ev.clientY);
   if (q < 0 || r < 0 || q >= W_COLS || r >= W_ROWS) return;
   if (view.overview) {
@@ -1421,18 +1599,38 @@ canvas.addEventListener("pointerup", (ev) => {
   }
   const changed = wasm.w_click(q, r);
   if (changed) {
+    sfx.select();
     save.events.push([q, r]);
     persist();
     inspectedHex = null;
     spawnFx("pulse", q, r, PALETTE[3], 360);
     hidePop();
   } else {
+    sfx.uiClick();
     inspectedHex = [q, r];
     spawnFx("pulse", q, r, PALETTE[2], 260);
     showPop(q, r, ev.clientX, ev.clientY);
   }
   draw();
 });
+
+function deselectSpecial() {
+  if (playing || inBattle) return false;
+  const sp = wasm.w_special_pos();
+  if (!(sp & (1 << 16))) return false;
+  const sq = sp & 0xff;
+  const sr = (sp >>> 8) & 0xff;
+  if (wasm.w_click(sq, sr)) {
+    save.events.push([sq, sr]);
+    persist();
+  }
+  hoverHex = null;
+  draggingTarget = false;
+  wasm.w_hover(-1, -1, 0);
+  sfx.uiClick();
+  draw();
+  return true;
+}
 
 canvas.addEventListener("pointercancel", (ev) => {
   clearTimeout(holdTimer);
@@ -1451,6 +1649,10 @@ canvas.addEventListener("pointerleave", (ev) => {
   }
 });
 canvas.addEventListener("contextmenu", (ev) => ev.preventDefault());
+menu.addEventListener("contextmenu", (ev) => {
+  ev.preventDefault();
+  deselectSpecial();
+});
 
 canvas.addEventListener(
   "wheel",
@@ -1533,6 +1735,7 @@ const battle = createBattleView({
   rosterList: $("b-roster-list"),
   els: {
     status: $("b-status"),
+    objectiveEl: $("b-objective-bar"),
     hudEl: $("b-hud"),
     targetList: $("b-target-list"),
     readoutDetail: $("b-readout-detail"),
@@ -1547,7 +1750,10 @@ const battle = createBattleView({
     attackCount: $("b-attack-count"),
     overwatchBtn: $("b-act-overwatch"),
     hunkerBtn: $("b-act-hunker"),
-    burrowBtn: $("b-act-burrow"),
+    grenadeBtn: $("b-act-grenade"),
+    grenadeCount: $("b-grenade-count"),
+    skillBtn: $("b-act-skill"),
+    skillLabel: $("b-skill-label"),
     retreatBtn: $("b-act-retreat"),
     confirmBtn: $("b-confirm"),
     endBtn: $("b-end"),
@@ -1569,8 +1775,11 @@ function battleDraw() {
 function enterBattle() {
   if (playing || inBattle || !wasm.w_has_clash()) return;
   if (!wasm.w_enter_battle()) return;
+  sfx.uiClick();
   hidePop();
   refitModal.hidden = true;
+  briefingModal.hidden = true;
+  helpModal.hidden = true;
   menu.hidden = true;
   inBattle = true;
   battle.reset();
@@ -1589,6 +1798,7 @@ function finishBattleAndReturn() {
     wasm.w_last_battle_word(1),
     wasm.w_last_battle_word(2),
     wasm.w_last_battle_word(3) >>> 0,
+    wasm.w_last_battle_word(4) >>> 0,
   ];
   save.events.push(["b", record]);
   persist();
@@ -1599,6 +1809,7 @@ function finishBattleAndReturn() {
   $("battle-app").hidden = true;
   $("app").hidden = false;
   lastTextRaw = "";
+  lastBriefingRaw = "";
   layout();
   const sp = wasm.w_special_pos();
   centerOn(sp & 0xff, (sp >>> 8) & 0xff);
@@ -1607,11 +1818,21 @@ function finishBattleAndReturn() {
 
 $("btn-enter-battle").addEventListener("click", enterBattle);
 $("b-return").addEventListener("click", finishBattleAndReturn);
-$("b-btn-roster").addEventListener("click", () => { bRosterModal.hidden = !bRosterModal.hidden; });
+$("b-btn-roster").addEventListener("click", (ev) => { ev.currentTarget.blur(); sfx.uiClick(); bRosterModal.hidden = !bRosterModal.hidden; });
 $("b-roster-close").addEventListener("click", () => { bRosterModal.hidden = true; });
 bRosterModal.addEventListener("click", (ev) => { if (ev.target === bRosterModal) bRosterModal.hidden = true; });
 
 document.addEventListener("keydown", (ev) => {
+  if (ev.key === "?" || (ev.code === "Slash" && ev.shiftKey)) {
+    ev.preventDefault();
+    helpModal.hidden = !helpModal.hidden;
+    return;
+  }
+  if (!helpModal.hidden) {
+    if (ev.code === "Escape") { helpModal.hidden = true; }
+    return;
+  }
+
   if (inBattle) {
     if (ev.code === "KeyU") { ev.preventDefault(); bRosterModal.hidden = !bRosterModal.hidden; return; }
     if (ev.code === "Escape" && !bRosterModal.hidden) { bRosterModal.hidden = true; return; }
@@ -1625,22 +1846,24 @@ document.addEventListener("keydown", (ev) => {
     return;
   }
 
+  if (!briefingModal.hidden) {
+    if (ev.code === "Escape" || ev.code === "Enter" || ev.code === "Space") {
+      ev.preventDefault();
+      closeBriefing();
+    }
+    return;
+  }
+  if (!campaignModal.hidden) {
+    if (ev.code === "Escape") {
+      campaignDismissed = true;
+      campaignModal.hidden = true;
+    }
+    return;
+  }
+
   if (ev.code === "Escape") {
     if (!refitModal.hidden) { refitModal.hidden = true; return; }
-    const sp = wasm.w_special_pos();
-    if (sp & (1 << 16)) {
-      const sq = sp & 0xff;
-      const sr = (sp >>> 8) & 0xff;
-      if (wasm.w_click(sq, sr)) {
-        save.events.push([sq, sr]);
-        persist();
-      }
-      hoverHex = null;
-      draggingTarget = false;
-      wasm.w_hover(-1, -1, 0);
-      draw();
-      return;
-    }
+    if (deselectSpecial()) return;
   }
   if (!refitModal.hidden) return;
   if (ev.target instanceof HTMLButtonElement && ev.code === "Space") return;
