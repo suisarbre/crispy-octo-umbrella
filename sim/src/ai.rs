@@ -422,7 +422,19 @@ fn apply(g: &mut Game, me: usize, act: Act) -> bool {
 
 /// `side`의 차례를 끝까지 둔다.
 pub fn run(g: &mut Game, side: Side) {
-    let mine = |g: &Game, i: usize| g.units[i].side == side && g.units[i].alive() && g.units[i].ap > 0;
+    run_inner(g, side, false);
+}
+
+/// 합동 전투에서 `ai_controlled == true`인 아군 일반군만 움직인다.
+pub fn run_allied_ai(g: &mut Game) {
+    run_inner(g, Side::Brood, true);
+}
+
+fn run_inner(g: &mut Game, side: Side, only_ai: bool) {
+    let mine = |g: &Game, i: usize| {
+        let u = &g.units[i];
+        u.side == side && u.alive() && u.ap > 0 && (!only_ai || u.ai_controlled)
+    };
     let n = g.units.len();
     let mut done = vec![false; n];
 

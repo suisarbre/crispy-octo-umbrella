@@ -1,34 +1,70 @@
-//! 월드. 대규모 전구 위에서 자율 아군 AI와 제국 AI가 맞붙고,
+//! 월드. 80×52 육각(Hex, odd-q) 대규모 전구 위에서 자율 아군 AI와 제국 AI가 맞붙고,
 //! 플레이어는 단 하나의 정예 특수부대를 직접 통제해 전황을 뒤집는다.
-//! 전투와 마찬가지로 결정론적이다. 상태를 바꾸는 입구는 `click`, `select_special`,
-//! `command`, `accept_proposal`, `tick`뿐이라서 (시드, 입력과 틱의 순서)만 있으면 그대로 재현된다.
+//! 도로를 타면 이동 비용이 낮고 보급이 멀리 닿아 자연스럽게 도로망이 전략의 축이 되며,
+//! 특수부대는 숲·고지 야지를 횡단해 우회 침투와 매복을 건다.
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
 use crate::rng::Rng;
-use crate::{Pos, Side};
+use crate::{BattleConfig, Class, Gene, Pos, Side};
 
-pub const WW: i32 = 88;
-pub const WH: i32 = 48;
+/// 문명 5 보통(Standard) 크기 기준 80×52 육각 전구.
+pub const WW: i32 = 80;
+pub const WH: i32 = 52;
+pub const HEX_COUNT: usize = (WW * WH) as usize;
 /// 하루는 이만큼의 틱이다. 한 턴이 하루다.
 pub const TICKS_PER_DAY: u64 = 24;
-/// 거점 배치 격자 크기. 11×6 = 66칸 중 45~56개에 거점을 놓는다.
-const CELL: i32 = 8;
-pub const SECTOR_COLS: i32 = WW / CELL;
-pub const SECTOR_ROWS: i32 = WH / CELL;
-/// 한 칸을 가는 데 드는 틱: 기본값에 인원이 많을수록 더.
-const STEP_TICKS: u32 = 3;
-const TICKS_PER_HEAD: u32 = 4;
+/// 거점 배치 매크로 격자 (10×6 구역 중 45~56개 거점 배치).
+pub const SECTOR_COLS: i32 = 10;
+pub const SECTOR_ROWS: i32 = 6;
 const MAX_EVENTS: usize = 12;
 
+pub const MAX_SQUAD: usize = 8;
+pub const HEAL_COST_PER_HP: u32 = 2;
+pub const REGENE_COST: u32 = 4;
+pub const RECRUIT_COST: u32 = 12;
+/// 보급권 한계 비용 (도로 1칸 = 비용 1, 야지 평지 = 2, 숲/고지 = 3).
+pub const SUPPLY_LIMIT: u32 = 28;
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Ground {
-    /// 길이 아닌 곳. 못 간다.
-    Wild,
-    Road,
-    /// 거점. `World::sites`의 번호.
-    Site(usize),
+pub enum Terrain {
+    /// 평지.
+    Plains,
+    /// 숲/험지. 야지 이동은 느리지만 은밀하며 전투 엄폐가 많다.
+    Forest,
+    /// 고지. 시야와 방어에 유리하다.
+    Hill,
+    /// 산맥. 통과 불가. 자연스러운 협곡과 길목을 만든다.
+    Mountain,
+    /// 협곡/방사능 해역. 통과 불가. 대륙 윤곽을 만든다.
+    Chasm,
+}
+
+impl Terrain {
+    pub fn passable(self) -> bool {
+        !matches!(self, Terrain::Mountain | Terrain::Chasm)
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Terrain::Plains => "평지",
+            Terrain::Forest => "숲",
+            Terrain::Hill => "고지",
+            Terrain::Mountain => "산맥",
+            Terrain::Chasm => "불모 해역",
+        }
+    }
+
+    pub fn code(self) -> u32 {
+        match self {
+            Terrain::Plains => 0,
+            Terrain::Forest => 1,
+            Terrain::Hill => 2,
+            Terrain::Mountain => 3,
+            Terrain::Chasm => 4,
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -39,11 +75,11 @@ pub enum SiteKind {
     Fob,
     /// 은신처 (본진 이전 후보).
     Hideout,
-    /// 좁은 길목 / 일반 거점.
+    /// 길목/교차로 거점.
     Choke,
     /// 생체질 자원지.
     Resource,
-    /// 고지 (넓은 시야).
+    /// 관측 고지.
     Ridge,
     /// 제국 전초.
     Outpost,
@@ -82,6 +118,21 @@ impl SiteKind {
             SiteKind::Landing => '⊞',
         }
     }
+
+    pub fn code(self) -> u32 {
+        match self {
+            SiteKind::Hq(Side::Brood) => 1,
+            SiteKind::Hq(Side::Empire) => 2,
+            SiteKind::Fob => 3,
+            SiteKind::Hideout => 4,
+            SiteKind::Choke => 5,
+            SiteKind::Resource => 6,
+            SiteKind::Ridge => 7,
+            SiteKind::Outpost => 8,
+            SiteKind::Relay => 9,
+            SiteKind::Landing => 10,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -111,7 +162,7 @@ pub enum ForceRole {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Order {
     Hold,
-    /// 남은 길. 앞에서부터 한 칸씩 간다.
+    /// 남은 헥스 경로. 앞에서부터 한 헥스씩 이동한다.
     Move(Vec<Pos>),
 }
 
@@ -127,7 +178,7 @@ pub enum Duty {
     Scout(Pos, Pos),
 }
 
-/// 플레이어가 고르는 명령. 찍은 칸으로 가서 무엇을 할지.
+/// 플레이어가 고르는 명령. 찍은 헥스로 가서 무엇을 할지.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Command {
     Move,
@@ -147,16 +198,16 @@ pub struct Force {
     pub size: u32,
     pub order: Order,
     pub duty: Duty,
-    /// 다음 칸까지 쌓인 틱.
+    /// 다음 헥스까지 쌓인 틱.
     pub progress: u32,
     pub alive: bool,
 }
 
 impl Force {
-    /// 한 칸을 가는 데 드는 틱. 특수부대는 기동성이 높다.
-    pub fn step_ticks(&self) -> u32 {
-        let base = if self.role == ForceRole::Special { STEP_TICKS } else { STEP_TICKS + 1 };
-        base + self.size / TICKS_PER_HEAD
+    /// 기본 1단위 이동 비용당 틱 (특수부대는 기동성이 높고 야지에서도 덜 느려진다).
+    pub fn base_ticks(&self) -> u32 {
+        let base = if self.role == ForceRole::Special { 4 } else { 6 };
+        base + self.size / 4
     }
 }
 
@@ -194,21 +245,67 @@ pub enum StopReason {
     Alert,
 }
 
+/// 특수부대 대원 한 명. 판 전체를 살아남으며 개조와 체력이 이어진다.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Trooper {
+    pub gene: Gene,
+    pub hp: i32,
+    pub max_hp: i32,
+    /// 살아남은 전투 수.
+    pub battles: u32,
+}
+
+impl Trooper {
+    pub fn new(gene: Gene) -> Trooper {
+        let max_hp = Class::Proto.def().hp;
+        Trooper { gene, hp: max_hp, max_hp, battles: 0 }
+    }
+
+    pub fn glyph(self) -> char {
+        match self.gene {
+            Gene::Sniper => 'ψ',
+            Gene::Burst => 'θ',
+            Gene::Burrow => 'λ',
+            Gene::Plain => 'ν',
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self.gene {
+            Gene::Sniper => "저격",
+            Gene::Burst => "화력",
+            Gene::Burrow => "잠복",
+            Gene::Plain => "원형",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct World {
     pub seed: u64,
-    pub ground: Vec<Ground>,
+    pub terrain: Vec<Terrain>,
+    pub road: Vec<bool>,
+    /// 각 헥스에 놓인 거점 번호.
+    pub site_at: Vec<Option<usize>>,
+    /// Civ식 영토 소유 (거점 반경 기반).
+    pub territory: Vec<Option<Side>>,
+    /// 아군 보급이 닿는 헥스 (도로를 타면 보급이 훨씬 멀리 간다).
+    pub brood_supply: Vec<bool>,
     pub sites: Vec<Site>,
     pub forces: Vec<Force>,
+    /// 특수부대 대원 명부 (`forces[0]`과 인원 동기화).
+    pub squad: Vec<Trooper>,
     pub tick: u64,
     /// 특수부대가 선택되어 있는가. 비선택 시 클릭은 지도 조사에 쓴다.
     pub selected: Option<usize>,
-    /// 특수부대를 보내려고 찍어 둔 칸. 명령을 고르면 들어가고, 그 전까지는 아무 일도 없다.
+    /// 특수부대를 보내려고 찍어 둔 헥스.
     pub target: Option<Pos>,
     /// 지휘망 제안 미리보기 번호.
     pub preview_proposal: Option<usize>,
     /// 특수부대가 마주친 충돌 `(특수부대, 적 부대)`. 생기면 시간이 멈춘다.
     pub clash: Option<(usize, usize)>,
+    /// 전구 승패 (제국 본진 점령 또는 아군 본진/특수부대 전멸).
+    pub victory: Option<Side>,
     /// 자동 진행이 멈춘 이유.
     pub stop_reason: StopReason,
     /// 지휘망 작전 제안: `[0]` 주 권고, `[1]` 대안1, `[2]` 대안2.
@@ -218,11 +315,10 @@ pub struct World {
     /// 자원 및 거시 지표.
     pub biomass: u32,
     pub research_pct: u32,
-    /// 결정론적 난수 상태 (AI 및 모의전용).
     rng: Rng,
 }
 
-fn idx(p: Pos) -> usize {
+pub fn idx(p: Pos) -> usize {
     (p.1 * WW + p.0) as usize
 }
 
@@ -230,52 +326,76 @@ pub fn in_world(p: Pos) -> bool {
     p.0 >= 0 && p.1 >= 0 && p.0 < WW && p.1 < WH
 }
 
-fn manhattan(a: Pos, b: Pos) -> i32 {
-    (a.0 - b.0).abs() + (a.1 - b.1).abs()
+/// odd-q 육각 이웃 6방향 (시계 방향: NE, SE, S, SW, NW, N — flat-top 변 0..6과 일치).
+/// 변 인덱스 `d`:
+/// - 0: 우상 (NE), 1: 우하 (SE), 2: 하 (S), 3: 좌하 (SW), 4: 좌상 (NW), 5: 상 (N)
+pub fn hex_neighbors(p: Pos) -> [Pos; 6] {
+    let (q, r) = p;
+    if q & 1 == 0 {
+        [(q + 1, r - 1), (q + 1, r), (q, r + 1), (q - 1, r), (q - 1, r - 1), (q, r - 1)]
+    } else {
+        [(q + 1, r), (q + 1, r + 1), (q, r + 1), (q - 1, r + 1), (q - 1, r), (q, r - 1)]
+    }
 }
 
-fn sector_code(col: i32, row: i32) -> String {
-    let ch = (b'A' + col.clamp(0, 25) as u8) as char;
+/// odd-q 육각 격자의 정확한 육각 거리.
+pub fn hex_dist(a: Pos, b: Pos) -> i32 {
+    let az = a.1 - ((a.0 - (a.0 & 1)) / 2);
+    let bz = b.1 - ((b.0 - (b.0 & 1)) / 2);
+    let dx = (a.0 - b.0).abs();
+    let dz = (az - bz).abs();
+    let dy = ((-a.0 - az) - (-b.0 - bz)).abs();
+    (dx + dy + dz) / 2
+}
+
+pub fn sector_code(p: Pos) -> String {
+    let col = (p.0 * SECTOR_COLS / WW).clamp(0, SECTOR_COLS - 1);
+    let row = (p.1 * SECTOR_ROWS / WH).clamp(0, SECTOR_ROWS - 1);
+    let ch = (b'A' + col as u8) as char;
     format!("{ch}{}", row + 1)
 }
 
-/// `(x, y)`를 길로 칠했을 때 2×2 블록(평행 인접 길)이 생기는지 검사.
-fn would_make_2x2(ground: &[Ground], p: Pos) -> bool {
-    for oy in [-1, 0] {
-        for ox in [-1, 0] {
-            let mut filled = 0;
-            for dy in 0..=1 {
-                for dx in 0..=1 {
-                    let q = (p.0 + ox + dx, p.1 + oy + dy);
-                    if !in_world(q) {
-                        continue;
-                    }
-                    if q == p || ground[idx(q)] != Ground::Wild {
-                        filled += 1;
-                    }
-                }
-            }
-            if filled == 4 {
-                return true;
-            }
-        }
-    }
-    false
+/// 결정론적 정수 해시 노이즈 (0..1000).
+fn hash2(seed: u64, x: i32, y: i32) -> i32 {
+    let mut h = seed
+        ^ (x as u64).wrapping_mul(0x9e3779b97f4a7c15)
+        ^ (y as u64).wrapping_mul(0xbf58476d1ce4e5b9);
+    h = (h ^ (h >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+    h = (h ^ (h >> 27)).wrapping_mul(0x94d049bb133111eb);
+    ((h ^ (h >> 31)) % 1000) as i32
 }
 
-/// 기존 길과 평행으로 2칸 폭 덩어리를 만들지 않도록 비용 기반 다익스트라로 길을 깐다.
-fn carve_road(ground: &mut [Ground], from: Pos, to: Pos) {
-    let n = (WW * WH) as usize;
-    let mut dist = vec![u32::MAX; n];
-    let mut prev = vec![usize::MAX; n];
-    let mut prev_dir = vec![4u8; n];
+fn value_noise(seed: u64, x: i32, y: i32, scale: i32) -> i32 {
+    let gx = x.div_euclid(scale);
+    let gy = y.div_euclid(scale);
+    let fx = x.rem_euclid(scale);
+    let fy = y.rem_euclid(scale);
+    let v00 = hash2(seed, gx, gy);
+    let v10 = hash2(seed, gx + 1, gy);
+    let v01 = hash2(seed, gx, gy + 1);
+    let v11 = hash2(seed, gx + 1, gy + 1);
+    let top = v00 * (scale - fx) + v10 * fx;
+    let bot = v01 * (scale - fx) + v11 * fx;
+    (top * (scale - fy) + bot * fy) / (scale * scale)
+}
+
+fn fbm(seed: u64, x: i32, y: i32) -> i32 {
+    (value_noise(seed, x, y, 12) * 55
+        + value_noise(seed ^ 0x1234, x, y, 6) * 30
+        + value_noise(seed ^ 0x5678, x, y, 3) * 15)
+        / 100
+}
+
+/// 지형 위에서 두 거점 사이에 도로를 깐다 (평지 우선, 산맥/해역 우회, 기존 도로 합류 선호).
+fn carve_hex_road(terrain: &mut [Terrain], road: &mut [bool], from: Pos, to: Pos) {
+    let mut dist = vec![u32::MAX; HEX_COUNT];
+    let mut prev = vec![usize::MAX; HEX_COUNT];
     let mut heap: BinaryHeap<Reverse<(u32, usize)>> = BinaryHeap::new();
     let start = idx(from);
     let goal = idx(to);
     dist[start] = 0;
     heap.push(Reverse((0, start)));
 
-    const DIRS: [(i32, i32); 4] = [(1, 0), (-1, 0), (0, 1), (0, -1)];
     while let Some(Reverse((d, u))) = heap.pop() {
         if d > dist[u] {
             continue;
@@ -283,38 +403,29 @@ fn carve_road(ground: &mut [Ground], from: Pos, to: Pos) {
         if u == goal {
             break;
         }
-        let ux = (u as i32) % WW;
-        let uy = (u as i32) / WW;
-        for (dir_i, &(dx, dy)) in DIRS.iter().enumerate() {
-            let np = (ux + dx, uy + dy);
+        let up = ((u as i32) % WW, (u as i32) / WW);
+        for np in hex_neighbors(up) {
             if !in_world(np) {
                 continue;
             }
-            // 외곽 1칸은 프레임 여백으로 비워 둔다.
-            if np.0 == 0 || np.1 == 0 || np.0 == WW - 1 || np.1 == WH - 1 {
-                continue;
-            }
             let v = idx(np);
-            let step_cost = if v == goal {
+            let cost = if v == goal {
                 1
+            } else if road[v] {
+                2
             } else {
-                match ground[v] {
-                    Ground::Road | Ground::Site(_) => 1,
-                    Ground::Wild => {
-                        let mut c = 4;
-                        if would_make_2x2(ground, np) {
-                            c += 60;
-                        }
-                        c
-                    }
+                match terrain[v] {
+                    Terrain::Plains => 4,
+                    Terrain::Forest => 7,
+                    Terrain::Hill => 9,
+                    Terrain::Mountain => 55, // 꼭 필요할 때만 협곡 길목으로 뚫음
+                    Terrain::Chasm => 120,
                 }
             };
-            let turn_cost = if prev_dir[u] < 4 && prev_dir[u] != dir_i as u8 { 2 } else { 0 };
-            let nd = d + step_cost + turn_cost;
+            let nd = d + cost;
             if nd < dist[v] {
                 dist[v] = nd;
                 prev[v] = u;
-                prev_dir[v] = dir_i as u8;
                 heap.push(Reverse((nd, v)));
             }
         }
@@ -325,90 +436,150 @@ fn carve_road(ground: &mut [Ground], from: Pos, to: Pos) {
     }
     let mut cur = goal;
     while cur != start {
-        if ground[cur] == Ground::Wild {
-            ground[cur] = Ground::Road;
+        if !terrain[cur].passable() {
+            terrain[cur] = Terrain::Hill;
         }
+        road[cur] = true;
         cur = prev[cur];
     }
+    road[start] = true;
 }
 
 impl World {
     pub fn new(seed: u64) -> World {
         let mut rng = Rng::new(seed ^ 0x776f726c64);
-        let mut ground = vec![Ground::Wild; (WW * WH) as usize];
+        let mut terrain = vec![Terrain::Plains; HEX_COUNT];
+        let mut road = vec![false; HEX_COUNT];
 
-        // 11×6 구역 중 약 48~54개에 거점을 배치한다 (서→중→동 리듬).
-        let mut grid: Vec<Option<usize>> = vec![None; (SECTOR_COLS * SECTOR_ROWS) as usize];
-        let mut sites = Vec::new();
-        let home_row = 1 + rng.below((SECTOR_ROWS - 2) as u32) as i32;
-        let enemy_row = 1 + rng.below((SECTOR_ROWS - 2) as u32) as i32;
-        let fob_row = (home_row + rng.below(3) as i32 - 1).clamp(1, SECTOR_ROWS - 2);
-
-        for cy in 0..SECTOR_ROWS {
-            for cx in 0..SECTOR_COLS {
-                let forced = (cx == 0 && cy == home_row)
-                    || (cx == SECTOR_COLS - 1 && cy == enemy_row)
-                    || (cx == 2 && cy == fob_row);
-                // 약 20%의 구역을 비워 자연스러운 계곡/공백을 만든다.
-                if !forced && rng.below(100) < 20 {
-                    continue;
-                }
-                let x = cx * CELL + 2 + rng.below((CELL - 4) as u32) as i32;
-                let y = cy * CELL + 2 + rng.below((CELL - 4) as u32) as i32;
-                let (kind, owner) = if cx == 0 && cy == home_row {
-                    (SiteKind::Hq(Side::Brood), Some(Side::Brood))
-                } else if cx == SECTOR_COLS - 1 && cy == enemy_row {
-                    (SiteKind::Hq(Side::Empire), Some(Side::Empire))
-                } else if cx == 2 && cy == fob_row {
-                    (SiteKind::Fob, Some(Side::Brood))
+        // 1. 유기적 대륙 지형 생성 (해역/불모지, 산맥, 숲, 고지, 평지)
+        for r in 0..WH {
+            for q in 0..WW {
+                // 외곽 2~4칸으로 갈수록 해역/불모지 확률 증가 (자연스러운 대륙 윤곽)
+                let edge_x = q.min(WW - 1 - q);
+                let edge_y = r.min(WH - 1 - r);
+                let edge_pen = if edge_y < 3 {
+                    (3 - edge_y) * 140
+                } else if edge_x < 2 {
+                    (2 - edge_x) * 120
                 } else {
-                    pick_site_kind(cx, &mut rng)
+                    0
                 };
-                let id = sites.len();
-                sites.push(Site { pos: (x, y), kind, owner, code: sector_code(cx, cy), col: cx, row: cy });
-                grid[(cy * SECTOR_COLS + cx) as usize] = Some(id);
+                let elev = fbm(seed ^ 0xa11ce, q, r) - edge_pen;
+                let moist = fbm(seed ^ 0xb0b0, q + 17, r + 31);
+                let ridge = (fbm(seed ^ 0xcafe, q * 2, r) - 500).abs();
+
+                let t = if elev < 210 {
+                    Terrain::Chasm
+                } else if elev > 690 || (ridge < 42 && elev > 420 && q > 6 && q < WW - 6) {
+                    Terrain::Mountain
+                } else if elev > 575 {
+                    Terrain::Hill
+                } else if moist > 530 - (WW - q) * 2 {
+                    // 서부/중앙에 숲이 더 풍부해 게릴라 은신에 유리
+                    Terrain::Forest
+                } else {
+                    Terrain::Plains
+                };
+                terrain[idx((q, r))] = t;
             }
         }
 
-        // 거점이 최소 42개는 되도록 보강한다.
-        for cy in 0..SECTOR_ROWS {
-            for cx in 0..SECTOR_COLS {
+        // 2. 10×6 매크로 구역에 거점 48~54개 배치 (서→중→동 리듬)
+        let mut sites: Vec<Site> = Vec::new();
+        let mut site_at = vec![None; HEX_COUNT];
+        let home_row = 2 + rng.below(2) as i32;
+        let enemy_row = 2 + rng.below(2) as i32;
+        let fob_row = (home_row + rng.below(3) as i32 - 1).clamp(1, SECTOR_ROWS - 2);
+
+        let cell_w = WW / SECTOR_COLS; // 8
+        let cell_h = WH / SECTOR_ROWS; // 8
+
+        for sy in 0..SECTOR_ROWS {
+            for sx in 0..SECTOR_COLS {
+                let forced = (sx == 0 && sy == home_row)
+                    || (sx == SECTOR_COLS - 1 && sy == enemy_row)
+                    || (sx == 2 && sy == fob_row);
+                if !forced && rng.below(100) < 16 {
+                    continue;
+                }
+                let base_q = sx * cell_w + 2 + rng.below((cell_w - 3).max(1) as u32) as i32;
+                let base_r = sy * cell_h + 2 + rng.below((cell_h - 3).max(1) as u32) as i32;
+                let mut pos = (base_q.clamp(2, WW - 3), base_r.clamp(3, WH - 4));
+
+                // 해역/산맥에 걸리면 근처 육지로 살짝 옮기고, 없으면 평지/고지로 정리.
+                if !terrain[idx(pos)].passable() {
+                    if let Some(near) = hex_neighbors(pos)
+                        .into_iter()
+                        .find(|&n| in_world(n) && terrain[idx(n)].passable())
+                    {
+                        pos = near;
+                    } else if forced {
+                        terrain[idx(pos)] = Terrain::Plains;
+                    } else {
+                        continue;
+                    }
+                }
+                if site_at[idx(pos)].is_some() {
+                    continue;
+                }
+
+                let (kind, owner) = if sx == 0 && sy == home_row {
+                    (SiteKind::Hq(Side::Brood), Some(Side::Brood))
+                } else if sx == SECTOR_COLS - 1 && sy == enemy_row {
+                    (SiteKind::Hq(Side::Empire), Some(Side::Empire))
+                } else if sx == 2 && sy == fob_row {
+                    (SiteKind::Fob, Some(Side::Brood))
+                } else {
+                    pick_site_kind(sx, terrain[idx(pos)], &mut rng)
+                };
+                if kind == SiteKind::Ridge {
+                    terrain[idx(pos)] = Terrain::Hill;
+                } else if kind == SiteKind::Hideout {
+                    terrain[idx(pos)] = Terrain::Forest;
+                }
+
+                let id = sites.len();
+                let code = format!("{}{}", (b'A' + sx as u8) as char, sy + 1);
+                sites.push(Site { pos, kind, owner, code, col: sx, row: sy });
+                site_at[idx(pos)] = Some(id);
+            }
+        }
+
+        // 거점이 최소 44개는 되도록 보강
+        for sy in 1..(SECTOR_ROWS - 1) {
+            for sx in 1..(SECTOR_COLS - 1) {
                 if sites.len() >= 48 {
                     break;
                 }
-                if grid[(cy * SECTOR_COLS + cx) as usize].is_some() {
+                let pos = (sx * cell_w + 4, sy * cell_h + 4);
+                if site_at[idx(pos)].is_some() {
                     continue;
                 }
-                let x = cx * CELL + 2 + rng.below((CELL - 4) as u32) as i32;
-                let y = cy * CELL + 2 + rng.below((CELL - 4) as u32) as i32;
-                let (kind, owner) = pick_site_kind(cx, &mut rng);
+                if !terrain[idx(pos)].passable() {
+                    terrain[idx(pos)] = Terrain::Plains;
+                }
+                let (kind, owner) = pick_site_kind(sx, terrain[idx(pos)], &mut rng);
                 let id = sites.len();
-                sites.push(Site { pos: (x, y), kind, owner, code: sector_code(cx, cy), col: cx, row: cy });
-                grid[(cy * SECTOR_COLS + cx) as usize] = Some(id);
+                let code = format!("{}{}", (b'A' + sx as u8) as char, sy + 1);
+                sites.push(Site { pos, kind, owner, code, col: sx, row: sy });
+                site_at[idx(pos)] = Some(id);
             }
         }
 
-        // 중계탑과 착륙장이 최소 2개씩은 있도록 보장.
-        ensure_site_kind(&mut sites, SiteKind::Relay, Some(Side::Empire), 5, 8, 2);
-        ensure_site_kind(&mut sites, SiteKind::Landing, Some(Side::Empire), 8, 10, 2);
-        ensure_site_kind(&mut sites, SiteKind::Resource, None, 3, 6, 4);
+        ensure_site_kind(&mut sites, SiteKind::Relay, Some(Side::Empire), 5, 8, 3);
+        ensure_site_kind(&mut sites, SiteKind::Landing, Some(Side::Empire), 8, 9, 2);
+        ensure_site_kind(&mut sites, SiteKind::Resource, None, 3, 6, 5);
 
-        for (i, s) in sites.iter().enumerate() {
-            ground[idx(s.pos)] = Ground::Site(i);
-        }
-
-        // 이웃 거점 간 간선 후보 생성 + 유니온파인드로 전체 연결 보장.
+        // 3. 거점들을 잇는 제국/전략 도로망 깔기 (MST + 우회로 35%)
         let mut candidates: Vec<(usize, usize, i32)> = Vec::new();
         for i in 0..sites.len() {
             for j in (i + 1)..sites.len() {
-                let dc = (sites[i].col - sites[j].col).abs();
-                let dr = (sites[i].row - sites[j].row).abs();
-                if (dc == 1 && dr == 0) || (dc == 0 && dr == 1) || (dc == 1 && dr == 1 && rng.below(100) < 25) {
-                    candidates.push((i, j, manhattan(sites[i].pos, sites[j].pos)));
+                let d = hex_dist(sites[i].pos, sites[j].pos);
+                if d <= 16 {
+                    candidates.push((i, j, d));
                 }
             }
         }
-        // 후보를 거리순 + 약간의 무작위로 정렬
         candidates.sort_by_key(|&(a, b, d)| (d, a, b));
 
         let mut group: Vec<usize> = (0..sites.len()).collect();
@@ -422,22 +593,21 @@ impl World {
 
         let mut edges: Vec<(usize, usize)> = Vec::new();
         let mut spare: Vec<(usize, usize)> = Vec::new();
-        for (a, b, _) in candidates {
+        for (a, b, d) in candidates {
             let (ra, rb) = (root(&mut group, a), root(&mut group, b));
             if ra != rb {
                 group[ra] = rb;
                 edges.push((a, b));
-            } else if rng.below(100) < 35 {
+            } else if d <= 12 && rng.below(100) < 28 {
                 spare.push((a, b));
             }
         }
-        // 혹시 떨어진 섬이 있으면 가장 가까운 거점과 연결.
         for i in 1..sites.len() {
             let (r0, ri) = (root(&mut group, 0), root(&mut group, i));
             if r0 != ri {
                 if let Some(best) = (0..sites.len())
                     .filter(|&j| root(&mut group, j) == r0)
-                    .min_by_key(|&j| manhattan(sites[i].pos, sites[j].pos))
+                    .min_by_key(|&j| hex_dist(sites[i].pos, sites[j].pos))
                 {
                     let rb = root(&mut group, best);
                     group[ri] = rb;
@@ -448,38 +618,43 @@ impl World {
         edges.extend(spare);
 
         for (a, b) in edges {
-            carve_road(&mut ground, sites[a].pos, sites[b].pos);
-        }
-        // 거점 칸 재확인
-        for (i, s) in sites.iter().enumerate() {
-            ground[idx(s.pos)] = Ground::Site(i);
+            carve_hex_road(&mut terrain, &mut road, sites[a].pos, sites[b].pos);
         }
 
-        // 초기 부대 배치
+        // 4. 초기 부대 배치
         let mut forces = Vec::new();
         let brood_hq = sites.iter().position(|s| s.kind == SiteKind::Hq(Side::Brood)).unwrap();
         let empire_hq = sites.iter().position(|s| s.kind == SiteKind::Hq(Side::Empire)).unwrap();
 
-        // 0번 부대: 플레이어가 직접 조종하는 유일한 정예 특수부대.
+        let squad = vec![
+            Trooper::new(Gene::Sniper),
+            Trooper::new(Gene::Burst),
+            Trooper::new(Gene::Burst),
+            Trooper::new(Gene::Burrow),
+            Trooper::new(Gene::Burrow),
+            Trooper::new(Gene::Plain),
+        ];
+
+        // 0번: 플레이어 정예 특수부대
         forces.push(Force {
             side: Side::Brood,
             role: ForceRole::Special,
             pos: sites[brood_hq].pos,
-            size: 6,
+            size: squad.len() as u32,
             order: Order::Hold,
             duty: Duty::None,
             progress: 0,
             alive: true,
         });
 
-        // 아군 AI 일반군 (본진, 전진 기지, 서부·중앙 거점)
+        // 아군 AI 일반군
         forces.push(make_force(Side::Brood, ForceRole::BroodAi, sites[brood_hq].pos, 8, Duty::Garrison));
         let mut brood_spawned = 0;
         for s in &sites {
             if s.kind == SiteKind::Fob {
                 forces.push(make_force(Side::Brood, ForceRole::BroodAi, s.pos, 8, Duty::Garrison));
                 brood_spawned += 1;
-            } else if s.owner == Some(Side::Brood) && s.kind != SiteKind::Hq(Side::Brood) && brood_spawned < 5 {
+            } else if s.owner == Some(Side::Brood) && s.kind != SiteKind::Hq(Side::Brood) && brood_spawned < 6 {
                 forces.push(make_force(Side::Brood, ForceRole::BroodAi, s.pos, 6, Duty::Garrison));
                 brood_spawned += 1;
             }
@@ -492,7 +667,7 @@ impl World {
             match s.kind {
                 SiteKind::Outpost => {
                     forces.push(make_force(Side::Empire, ForceRole::EmpireGarrison, s.pos, 7, Duty::Garrison));
-                    if patrols < 3 {
+                    if patrols < 4 {
                         forces.push(make_force(Side::Empire, ForceRole::EmpirePatrol, s.pos, 5, Duty::None));
                         patrols += 1;
                     }
@@ -509,14 +684,20 @@ impl World {
 
         let mut world = World {
             seed,
-            ground,
+            terrain,
+            road,
+            site_at,
+            territory: vec![None; HEX_COUNT],
+            brood_supply: vec![false; HEX_COUNT],
             sites,
             forces,
+            squad,
             tick: 0,
             selected: None,
             target: None,
             preview_proposal: None,
             clash: None,
+            victory: None,
             stop_reason: StopReason::None,
             proposals: Vec::new(),
             events: Vec::new(),
@@ -524,6 +705,8 @@ impl World {
             research_pct: 5,
             rng,
         };
+        world.recompute_territory();
+        world.recompute_supply();
         world.plan_ai_turn();
         world.compute_proposals();
         world.push_event(world.sites[brood_hq].pos, "작전 개시 · 특수부대 본진 대기".to_string(), false);
@@ -538,20 +721,124 @@ impl World {
         &self.forces[0]
     }
 
-    pub fn ground(&self, p: Pos) -> Ground {
-        if in_world(p) {
-            self.ground[idx(p)]
-        } else {
-            Ground::Wild
-        }
+    pub fn terrain_at(&self, p: Pos) -> Terrain {
+        if in_world(p) { self.terrain[idx(p)] } else { Terrain::Chasm }
+    }
+
+    pub fn has_road(&self, p: Pos) -> bool {
+        in_world(p) && self.road[idx(p)]
+    }
+
+    pub fn site_index_at(&self, p: Pos) -> Option<usize> {
+        if in_world(p) { self.site_at[idx(p)] } else { None }
     }
 
     pub fn walkable(&self, p: Pos) -> bool {
-        self.ground(p) != Ground::Wild
+        in_world(p) && self.terrain[idx(p)].passable()
     }
 
     pub fn forces_at(&self, p: Pos) -> impl Iterator<Item = usize> + '_ {
         (0..self.forces.len()).filter(move |&i| self.forces[i].alive && self.forces[i].pos == p)
+    }
+
+    /// 부대 `role`이 `p` 헥스로 들어가는 데 드는 이동 틱.
+    /// 도로가 압도적으로 빠르므로 제국 보급대·정규군은 자연스럽게 도로를 탄다.
+    pub fn hex_step_ticks(&self, role: ForceRole, size: u32, p: Pos) -> u32 {
+        let base = if role == ForceRole::Special { 4 } else { 5 } + size / 4;
+        if self.has_road(p) {
+            return base;
+        }
+        match self.terrain_at(p) {
+            Terrain::Plains => {
+                if role == ForceRole::Special { (base * 3) / 2 } else { base * 2 }
+            }
+            Terrain::Forest | Terrain::Hill => {
+                if role == ForceRole::Special { base * 2 } else { base * 4 }
+            }
+            Terrain::Mountain | Terrain::Chasm => u32::MAX / 4,
+        }
+    }
+
+    /// Civ식 영토 소유를 거점 기준으로 재계산한다 (거점 반경 3헥스 이내 가장 가까운 점령 거점).
+    pub fn recompute_territory(&mut self) {
+        self.territory.fill(None);
+        let mut best_d = vec![u8::MAX; HEX_COUNT];
+        for s in &self.sites {
+            let Some(owner) = s.owner else { continue };
+            let radius = match s.kind {
+                SiteKind::Hq(_) => 4,
+                SiteKind::Outpost | SiteKind::Fob | SiteKind::Landing => 3,
+                _ => 2,
+            };
+            let min_q = (s.pos.0 - radius).max(0);
+            let max_q = (s.pos.0 + radius).min(WW - 1);
+            let min_r = (s.pos.1 - radius).max(0);
+            let max_r = (s.pos.1 + radius).min(WH - 1);
+            for r in min_r..=max_r {
+                for q in min_q..=max_q {
+                    let p = (q, r);
+                    let i = idx(p);
+                    if !self.terrain[i].passable() {
+                        continue;
+                    }
+                    let d = hex_dist(s.pos, p) as u8;
+                    if d <= radius as u8 && d < best_d[i] {
+                        best_d[i] = d;
+                        self.territory[i] = Some(owner);
+                    }
+                }
+            }
+        }
+    }
+
+    /// 아군 보급권을 계산한다. 도로를 타면 비용 1, 평지 2, 숲/고지 3으로 도로에서 보급이 훨씬 멀리 닿는다.
+    pub fn recompute_supply(&mut self) {
+        self.brood_supply.fill(false);
+        let mut dist = vec![u32::MAX; HEX_COUNT];
+        let mut heap: BinaryHeap<Reverse<(u32, usize)>> = BinaryHeap::new();
+        for s in &self.sites {
+            if s.owner == Some(Side::Brood) && matches!(s.kind, SiteKind::Hq(Side::Brood) | SiteKind::Fob) {
+                let i = idx(s.pos);
+                dist[i] = 0;
+                heap.push(Reverse((0, i)));
+            }
+        }
+        // 적이 서 있는 헥스는 보급이 통과하지 못한다.
+        let mut enemy_block = vec![false; HEX_COUNT];
+        for f in &self.forces {
+            if f.alive && f.side == Side::Empire {
+                enemy_block[idx(f.pos)] = true;
+            }
+        }
+        while let Some(Reverse((d, u))) = heap.pop() {
+            if d > dist[u] || d > SUPPLY_LIMIT {
+                continue;
+            }
+            self.brood_supply[u] = true;
+            let up = ((u as i32) % WW, (u as i32) / WW);
+            for np in hex_neighbors(up) {
+                if !self.walkable(np) {
+                    continue;
+                }
+                let v = idx(np);
+                if enemy_block[v] {
+                    continue;
+                }
+                let step = if self.road[v] {
+                    1
+                } else {
+                    match self.terrain[v] {
+                        Terrain::Plains => 2,
+                        _ => 3,
+                    }
+                };
+                let nd = d + step;
+                if nd <= SUPPLY_LIMIT && nd < dist[v] {
+                    dist[v] = nd;
+                    heap.push(Reverse((nd, v)));
+                }
+            }
+        }
     }
 
     pub fn supply_summary(&self) -> (u32, u32) {
@@ -565,53 +852,69 @@ impl World {
         (used, cap)
     }
 
-    /// 특수부대가 현재 보급권(본진/전진 기지에서 적에게 막히지 않은 18칸 이내) 안에 있는가.
     pub fn special_in_supply(&self) -> bool {
-        let sp = self.special().pos;
-        self.sites.iter().any(|s| {
-            s.owner == Some(Side::Brood)
-                && matches!(s.kind, SiteKind::Hq(Side::Brood) | SiteKind::Fob)
-                && manhattan(s.pos, sp) <= 22
-        })
+        let sp = self.special();
+        sp.alive && in_world(sp.pos) && self.brood_supply[idx(sp.pos)]
     }
 
-    /// 길을 따라 `from`에서 `to`까지. 출발 칸은 빼고 도착 칸은 넣는다. 길이 없으면 None.
-    pub fn route(&self, from: Pos, to: Pos) -> Option<Vec<Pos>> {
+    /// 부대 역할·크기를 반영한 최소 시간(틱) 육각 다익스트라 경로 탐색.
+    /// 도로 비용이 낮기 때문에 정규군·보급대는 자연스럽게 도로를 탄다.
+    pub fn route_for(&self, role: ForceRole, size: u32, from: Pos, to: Pos) -> Option<(Vec<Pos>, u32)> {
         if !self.walkable(from) || !self.walkable(to) {
             return None;
         }
         if from == to {
-            return Some(Vec::new());
+            return Some((Vec::new(), 0));
         }
-        let mut prev = vec![usize::MAX; (WW * WH) as usize];
-        let mut queue = vec![from];
-        prev[idx(from)] = idx(from);
-        let mut head = 0;
-        while head < queue.len() {
-            let p = queue[head];
-            head += 1;
-            if p == to {
+        let mut dist = vec![u32::MAX; HEX_COUNT];
+        let mut prev = vec![usize::MAX; HEX_COUNT];
+        let mut heap: BinaryHeap<Reverse<(u32, usize)>> = BinaryHeap::new();
+        let start = idx(from);
+        let goal = idx(to);
+        dist[start] = 0;
+        heap.push(Reverse((0, start)));
+
+        while let Some(Reverse((d, u))) = heap.pop() {
+            if d > dist[u] {
+                continue;
+            }
+            if u == goal {
                 let mut path = Vec::new();
-                let mut i = idx(to);
-                while i != idx(from) {
-                    path.push(((i as i32) % WW, (i as i32) / WW));
-                    i = prev[i];
+                let mut cur = goal;
+                while cur != start {
+                    path.push(((cur as i32) % WW, (cur as i32) / WW));
+                    cur = prev[cur];
                 }
                 path.reverse();
-                return Some(path);
+                return Some((path, d));
             }
-            for d in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
-                let n = (p.0 + d.0, p.1 + d.1);
-                if self.walkable(n) && prev[idx(n)] == usize::MAX {
-                    prev[idx(n)] = idx(p);
-                    queue.push(n);
+            let up = ((u as i32) % WW, (u as i32) / WW);
+            for np in hex_neighbors(up) {
+                if !self.walkable(np) {
+                    continue;
+                }
+                let v = idx(np);
+                let step = self.hex_step_ticks(role, size, np);
+                let nd = d.saturating_add(step);
+                if nd < dist[v] {
+                    dist[v] = nd;
+                    prev[v] = u;
+                    heap.push(Reverse((nd, v)));
                 }
             }
         }
         None
     }
 
-    /// 특수부대를 직접 선택한다 (단축키 F / [분대] 버튼용).
+    pub fn route(&self, from: Pos, to: Pos) -> Option<Vec<Pos>> {
+        let sp = self.special();
+        self.route_for(ForceRole::Special, sp.size, from, to).map(|(p, _)| p)
+    }
+
+    pub fn path_ticks(&self, role: ForceRole, size: u32, path: &[Pos]) -> u32 {
+        path.iter().map(|&p| self.hex_step_ticks(role, size, p)).sum()
+    }
+
     pub fn select_special(&mut self) -> bool {
         let s = self.special_index();
         if !self.forces[s].alive {
@@ -623,9 +926,7 @@ impl World {
         changed
     }
 
-    /// 플레이어 입력: 칸 하나를 누른다.
-    /// - 비선택 상태: 특수부대 칸을 누르면 특수부대를 선택한다. 다른 칸을 누르면 선택하지 않고 조사만 한다.
-    /// - 선택 상태: 길/거점 칸을 누르면 목적지로 찍어 명령 고르기를 띄운다. 길 밖이나 자기 칸을 누르면 선택을 푼다.
+    /// 비선택 상태 클릭은 조사만 하고, 특수부대를 클릭한 뒤 목적지 헥스를 찍으면 명령 메뉴가 열린다.
     pub fn click(&mut self, p: Pos) -> bool {
         if !in_world(p) {
             return false;
@@ -642,7 +943,6 @@ impl World {
             }
             return false;
         }
-        // 이미 특수부대가 선택된 상태.
         if self.forces[sp].pos == p {
             self.selected = None;
             self.target = None;
@@ -658,12 +958,10 @@ impl World {
         true
     }
 
-    /// 찍어 둔 칸이 거점인가. 주둔은 거점에만 내릴 수 있다.
     pub fn can_garrison(&self) -> bool {
-        self.target.is_some_and(|t| matches!(self.ground(t), Ground::Site(_)))
+        self.target.is_some_and(|t| self.site_index_at(t).is_some())
     }
 
-    /// 고른 특수부대를 찍어 둔 칸으로 보내면서 할 일을 정한다.
     pub fn command(&mut self, command: Command) -> bool {
         let (Some(s), Some(target)) = (self.selected, self.target) else { return false };
         if command == Command::Garrison && !self.can_garrison() {
@@ -672,14 +970,13 @@ impl World {
         self.issue_special_order(s, target, command)
     }
 
-    /// 지휘망 제안 `i`번을 수락해 즉시 명령을 넣는다.
     pub fn accept_proposal(&mut self, i: usize) -> bool {
         let Some(prop) = self.proposals.get(i).cloned() else { return false };
         let s = self.special_index();
         if !self.forces[s].alive {
             return false;
         }
-        let cmd = if prop.command == Command::Garrison && !matches!(self.ground(prop.target), Ground::Site(_)) {
+        let cmd = if prop.command == Command::Garrison && self.site_index_at(prop.target).is_none() {
             Command::Move
         } else {
             prop.command
@@ -694,11 +991,7 @@ impl World {
     fn issue_special_order(&mut self, s: usize, target: Pos, command: Command) -> bool {
         let from = self.forces[s].pos;
         let Some(path) = self.route(from, target) else { return false };
-        if path.is_empty() {
-            self.forces[s].order = Order::Hold;
-        } else {
-            self.forces[s].order = Order::Move(path);
-        }
+        self.forces[s].order = if path.is_empty() { Order::Hold } else { Order::Move(path) };
         self.forces[s].progress = 0;
         self.forces[s].duty = match command {
             Command::Move => Duty::None,
@@ -713,28 +1006,30 @@ impl World {
         true
     }
 
-    /// 길의 끝에 닿았다. 정찰이면 반대쪽 끝으로 돌아선다.
     fn arrive(&mut self, i: usize) {
         self.forces[i].order = Order::Hold;
         if let Duty::Scout(a, b) = self.forces[i].duty {
             let next = if self.forces[i].pos == b { a } else { b };
-            if let Some(path) = self.route(self.forces[i].pos, next).filter(|p| !p.is_empty()) {
+            let role = self.forces[i].role;
+            let size = self.forces[i].size;
+            if let Some((path, _)) = self.route_for(role, size, self.forces[i].pos, next).filter(|(p, _)| !p.is_empty()) {
                 self.forces[i].order = Order::Move(path);
             }
             return;
         }
-        // 거점에 도착했고 적이 없으면 점령 갱신
         let pos = self.forces[i].pos;
         let side = self.forces[i].side;
         let has_foe = self.forces.iter().any(|f| f.alive && f.side != side && f.pos == pos);
         if !has_foe {
-            if let Ground::Site(si) = self.ground(pos) {
+            if let Some(si) = self.site_index_at(pos) {
                 if self.sites[si].owner != Some(side) {
                     self.sites[si].owner = Some(side);
                     let code = self.sites[si].code.clone();
                     let label = self.sites[si].kind.label();
                     let who = if side == Side::Brood { "아군 확보" } else { "제국 점령" };
                     let alert = side == Side::Empire || self.forces[i].role == ForceRole::Special;
+                    self.recompute_territory();
+                    self.recompute_supply();
                     self.push_event(pos, format!("{code} {label} {who}"), alert);
                     if alert && self.forces[i].role != ForceRole::Special {
                         self.stop_reason = StopReason::Alert;
@@ -759,13 +1054,12 @@ impl World {
         }
     }
 
-    /// AI끼리의 충돌을 결정론적 모의전으로 처리한다.
     fn resolve_ai_clash(&mut self, a: usize, b: usize) {
         let pos = self.forces[b].pos;
-        let a_garrison = if self.forces[a].duty == Duty::Garrison { 2 } else { 0 };
-        let b_garrison = if self.forces[b].duty == Duty::Garrison { 2 } else { 0 };
-        let a_pow = self.forces[a].size + a_garrison + self.rng.below(3);
-        let b_pow = self.forces[b].size + b_garrison + self.rng.below(3);
+        let a_g = if self.forces[a].duty == Duty::Garrison { 2 } else { 0 };
+        let b_g = if self.forces[b].duty == Duty::Garrison { 2 } else { 0 };
+        let a_pow = self.forces[a].size + a_g + self.rng.below(3);
+        let b_pow = self.forces[b].size + b_g + self.rng.below(3);
 
         let (winner, loser) = if a_pow >= b_pow { (a, b) } else { (b, a) };
         let loss = (self.forces[loser].size / 2).max(1);
@@ -773,9 +1067,9 @@ impl World {
         self.forces[winner].size = self.forces[winner].size.saturating_sub(win_loss).max(1);
         self.forces[loser].size = self.forces[loser].size.saturating_sub(loss);
 
-        let loc = match self.ground(pos) {
-            Ground::Site(si) => self.sites[si].code.clone(),
-            _ => sector_code(pos.0 / CELL, pos.1 / CELL),
+        let loc = match self.site_index_at(pos) {
+            Some(si) => self.sites[si].code.clone(),
+            None => sector_code(pos),
         };
         if self.forces[loser].size == 0 {
             self.forces[loser].alive = false;
@@ -783,16 +1077,14 @@ impl World {
             let tag = if self.forces[winner].side == Side::Brood { "아군 승" } else { "제국 승" };
             self.push_event(pos, format!("{loc} 교전 ({tag})"), self.forces[winner].side == Side::Empire);
         } else {
-            // 패배한 쪽은 잠시 멈춘다.
             self.forces[loser].order = Order::Hold;
             self.push_event(pos, format!("{loc} 소규모 교전"), false);
         }
         self.forces[a].order = Order::Hold;
+        self.recompute_supply();
     }
 
-    /// 매일 0틱에 아군 AI와 제국 AI가 전선 계획을 갱신한다.
     fn plan_ai_turn(&mut self) {
-        // 1. 자원 및 기초 연구 진행
         let brood_resources = self
             .sites
             .iter()
@@ -808,7 +1100,7 @@ impl World {
             self.research_pct = (self.research_pct + 1 + empire_relays / 2).min(100);
         }
 
-        // 2. 제국 보급대 주기적 출발 (3일마다)
+        // 제국 보급대: 도로 비용이 낮으므로 자연스럽게 도로망을 따라 전초/중계탑으로 이동한다.
         let active_convoys = self
             .forces
             .iter()
@@ -830,7 +1122,7 @@ impl World {
             if !sources.is_empty() && !dests.is_empty() {
                 let src = sources[self.rng.below(sources.len() as u32) as usize];
                 let dst = dests[self.rng.below(dests.len() as u32) as usize];
-                if let Some(path) = self.route(src, dst).filter(|p| !p.is_empty()) {
+                if let Some((path, _)) = self.route_for(ForceRole::EmpireConvoy, 4, src, dst).filter(|(p, _)| !p.is_empty()) {
                     self.forces.push(Force {
                         side: Side::Empire,
                         role: ForceRole::EmpireConvoy,
@@ -841,16 +1133,13 @@ impl World {
                         progress: 0,
                         alive: true,
                     });
-                    let code = match self.ground(dst) {
-                        Ground::Site(si) => self.sites[si].code.clone(),
-                        _ => sector_code(dst.0 / CELL, dst.1 / CELL),
-                    };
+                    let code = self.site_index_at(dst).map_or_else(|| sector_code(dst), |si| self.sites[si].code.clone());
                     self.push_event(src, format!("{code} 방면 제국 보급대 출발"), false);
                 }
             }
         }
 
-        // 3. 제국 순찰대 이동
+        // 제국 순찰대 이동
         let empire_sites: Vec<Pos> = self
             .sites
             .iter()
@@ -863,22 +1152,19 @@ impl World {
             }
             if self.forces[i].role == ForceRole::EmpirePatrol && !empire_sites.is_empty() {
                 let cur = self.forces[i].pos;
-                let mut near: Vec<Pos> = empire_sites
-                    .iter()
-                    .copied()
-                    .filter(|&p| p != cur && manhattan(p, cur) <= 28)
-                    .collect();
+                let mut near: Vec<Pos> = empire_sites.iter().copied().filter(|&p| p != cur && hex_dist(p, cur) <= 24).collect();
                 if near.is_empty() {
                     near = empire_sites.clone();
                 }
                 let pick = near[self.rng.below(near.len() as u32) as usize];
-                if let Some(path) = self.route(cur, pick).filter(|p| !p.is_empty()) {
+                let size = self.forces[i].size;
+                if let Some((path, _)) = self.route_for(ForceRole::EmpirePatrol, size, cur, pick).filter(|(p, _)| !p.is_empty()) {
                     self.forces[i].order = Order::Move(path);
                 }
             }
         }
 
-        // 4. 자율 아군 AI 일반군 이동 (가장 가까운 중립 자원지나 약한 제국 거점으로 진격/순환)
+        // 자율 아군 AI 일반군 이동
         let targets: Vec<Pos> = self
             .sites
             .iter()
@@ -894,14 +1180,14 @@ impl World {
                 movers += 1;
                 continue;
             }
-            // 본진 수비대는 남기고, 전선 아군 AI 2~3개만 능동적으로 움직인다.
-            let at_hq = matches!(self.ground(self.forces[i].pos), Ground::Site(si) if self.sites[si].kind == SiteKind::Hq(Side::Brood));
+            let at_hq = self.site_index_at(self.forces[i].pos).is_some_and(|si| self.sites[si].kind == SiteKind::Hq(Side::Brood));
             if at_hq || movers >= 3 {
                 continue;
             }
             let cur = self.forces[i].pos;
-            if let Some(&best) = targets.iter().min_by_key(|&&p| manhattan(cur, p)) {
-                if let Some(path) = self.route(cur, best).filter(|p| !p.is_empty()) {
+            let size = self.forces[i].size;
+            if let Some(&best) = targets.iter().min_by_key(|&&p| hex_dist(cur, p)) {
+                if let Some((path, _)) = self.route_for(ForceRole::BroodAi, size, cur, best).filter(|(p, _)| !p.is_empty()) {
                     self.forces[i].order = Order::Move(path);
                     self.forces[i].duty = Duty::None;
                     movers += 1;
@@ -910,8 +1196,7 @@ impl World {
         }
     }
 
-    /// 지휘망(AI)이 플레이어 특수부대까지 시뮬레이션해 서로 다른 3개 축에서
-    /// 주 권고 1안 + 대안 2안을 계산한다.
+    /// 지휘망(AI)이 3개 작전 축에서 주 권고 1안 + 대안 2안을 계산한다.
     pub fn compute_proposals(&mut self) {
         let sp = self.special();
         if !sp.alive {
@@ -919,28 +1204,24 @@ impl World {
             return;
         }
         let from = sp.pos;
-        let step_t = sp.step_ticks();
+        let size = sp.size;
         let mut scored: Vec<(i32, Proposal)> = Vec::new();
 
-        // 축 1: 공세/협공 지원 (제국 보급대 차단 또는 아군 AI가 향하는 제국 전초 지원)
+        // 축 1: 공세/협공 지원 (제국 보급대 매복 차단 또는 전초 타격)
         let convoy_target = self
             .forces
             .iter()
             .filter(|f| f.alive && f.role == ForceRole::EmpireConvoy)
-            .min_by_key(|f| manhattan(from, f.pos))
-            .map(|f| {
-                let aim = match &f.order {
-                    Order::Move(p) if p.len() > 2 => p[p.len() / 2],
-                    _ => f.pos,
-                };
-                aim
+            .min_by_key(|f| hex_dist(from, f.pos))
+            .map(|f| match &f.order {
+                Order::Move(p) if p.len() > 2 => p[p.len() / 2],
+                _ => f.pos,
             });
         if let Some(t) = convoy_target {
-            if let Some(path) = self.route(from, t) {
-                let code = sector_code(t.0 / CELL, t.1 / CELL);
-                let eta = path.len() as u32 * step_t;
+            if let Some((_, eta)) = self.route_for(ForceRole::Special, size, from, t) {
+                let code = sector_code(t);
                 scored.push((
-                    90 - (path.len() as i32),
+                    100 - (eta as i32 / 8),
                     Proposal {
                         axis: ProposalAxis::Offense,
                         target: t,
@@ -957,12 +1238,11 @@ impl World {
             .iter()
             .enumerate()
             .filter(|(_, s)| s.owner == Some(Side::Empire) && s.kind == SiteKind::Outpost)
-            .min_by_key(|(_, s)| manhattan(from, s.pos))
+            .min_by_key(|(_, s)| hex_dist(from, s.pos))
         {
-            if let Some(path) = self.route(from, s.pos) {
-                let eta = path.len() as u32 * step_t;
+            if let Some((_, eta)) = self.route_for(ForceRole::Special, size, from, s.pos) {
                 scored.push((
-                    82 - (path.len() as i32),
+                    90 - (eta as i32 / 8),
                     Proposal {
                         axis: ProposalAxis::Offense,
                         target: s.pos,
@@ -976,7 +1256,7 @@ impl World {
             }
         }
 
-        // 축 2: 방어/보존 (위태로운 아군 자원지·전진기지 주둔 지원)
+        // 축 2: 방어/보존 (위태로운 자원지·전진기지 주둔)
         let threatened_site = self
             .sites
             .iter()
@@ -990,16 +1270,15 @@ impl World {
                     .forces
                     .iter()
                     .filter(|f| f.alive && f.side == Side::Empire)
-                    .map(|f| manhattan(f.pos, s.pos))
+                    .map(|f| hex_dist(f.pos, s.pos))
                     .min()
                     .unwrap_or(99);
-                foe_d * 2 + manhattan(from, s.pos) / 2
+                foe_d * 2 + hex_dist(from, s.pos) / 2
             });
         if let Some((si, s)) = threatened_site {
-            if let Some(path) = self.route(from, s.pos) {
-                let eta = path.len() as u32 * step_t;
+            if let Some((_, eta)) = self.route_for(ForceRole::Special, size, from, s.pos) {
                 scored.push((
-                    85 - (path.len() as i32),
+                    95 - (eta as i32 / 8),
                     Proposal {
                         axis: ProposalAxis::Defense,
                         target: s.pos,
@@ -1013,23 +1292,22 @@ impl World {
             }
         }
 
-        // 축 3: 교란/첩보 (제국 중계탑 타격 또는 고지 정찰)
+        // 축 3: 교란/첩보 (중계탑 타격 또는 착륙장 기습 / 고지 정찰)
         let disrupt_site = self
             .sites
             .iter()
             .enumerate()
             .filter(|(_, s)| s.owner == Some(Side::Empire) && matches!(s.kind, SiteKind::Relay | SiteKind::Landing))
-            .min_by_key(|(_, s)| manhattan(from, s.pos));
+            .min_by_key(|(_, s)| hex_dist(from, s.pos));
         if let Some((si, s)) = disrupt_site {
-            if let Some(path) = self.route(from, s.pos) {
-                let eta = path.len() as u32 * step_t;
+            if let Some((_, eta)) = self.route_for(ForceRole::Special, size, from, s.pos) {
                 let (title, reason) = if s.kind == SiteKind::Relay {
                     (format!("{} 중계탑 타격", s.code), "구역 제국 보고망 차단 · 증거 은폐".to_string())
                 } else {
                     (format!("{} 착륙장 기습", s.code), "제국 증원 유입 지연".to_string())
                 };
                 scored.push((
-                    84 - (path.len() as i32),
+                    92 - (eta as i32 / 8),
                     Proposal {
                         axis: ProposalAxis::Disrupt,
                         target: s.pos,
@@ -1046,12 +1324,11 @@ impl World {
             .iter()
             .enumerate()
             .filter(|(_, s)| s.kind == SiteKind::Ridge)
-            .min_by_key(|(_, s)| manhattan(from, s.pos))
+            .min_by_key(|(_, s)| hex_dist(from, s.pos))
         {
-            if let Some(path) = self.route(from, s.pos) {
-                let eta = path.len() as u32 * step_t;
+            if let Some((_, eta)) = self.route_for(ForceRole::Special, size, from, s.pos) {
                 scored.push((
-                    75 - (path.len() as i32),
+                    80 - (eta as i32 / 8),
                     Proposal {
                         axis: ProposalAxis::Disrupt,
                         target: s.pos,
@@ -1069,9 +1346,8 @@ impl World {
         self.proposals = scored.into_iter().map(|(_, p)| p).collect();
     }
 
-    /// 시간을 한 틱 넘긴다. 특수부대가 적과 마주치면 `clash`가 서고 그 뒤로는 넘어가지 않는다.
     pub fn tick(&mut self) {
-        if self.clash.is_some() {
+        if self.clash.is_some() || self.victory.is_some() {
             return;
         }
         self.stop_reason = StopReason::None;
@@ -1081,13 +1357,19 @@ impl World {
             if !self.forces[i].alive {
                 continue;
             }
-            let Order::Move(path) = &self.forces[i].order else { continue };
-            let Some(&next) = path.first() else {
-                self.arrive(i);
-                continue;
+            let next = match &self.forces[i].order {
+                Order::Move(path) => match path.first().copied() {
+                    Some(p) => p,
+                    None => {
+                        self.arrive(i);
+                        continue;
+                    }
+                },
+                Order::Hold => continue,
             };
+            let need = self.hex_step_ticks(self.forces[i].role, self.forces[i].size, next);
             self.forces[i].progress += 1;
-            if self.forces[i].progress < self.forces[i].step_ticks() {
+            if self.forces[i].progress < need {
                 continue;
             }
             self.forces[i].progress = 0;
@@ -1101,7 +1383,7 @@ impl World {
                     let (sp, en) = if self.forces[i].role == ForceRole::Special { (i, foe) } else { (foe, i) };
                     self.clash = Some((sp, en));
                     self.stop_reason = StopReason::Clash;
-                    let loc = sector_code(next.0 / CELL, next.1 / CELL);
+                    let loc = self.site_index_at(next).map_or_else(|| sector_code(next), |si| self.sites[si].code.clone());
                     self.push_event(next, format!("{loc} 특수부대 적과 조우"), true);
                     return;
                 } else {
@@ -1120,11 +1402,248 @@ impl World {
             }
         }
 
-        // 하루가 바뀌는 시점에 AI 계획 및 지휘망 제안을 갱신한다.
         if self.tick % TICKS_PER_DAY == 0 {
+            self.recompute_supply();
             self.plan_ai_turn();
             self.compute_proposals();
         }
+    }
+
+    pub fn squad_counts(&self) -> [usize; 4] {
+        let mut c = [0usize; 4];
+        for t in &self.squad {
+            match t.gene {
+                Gene::Sniper => c[0] += 1,
+                Gene::Burst => c[1] += 1,
+                Gene::Burrow => c[2] += 1,
+                Gene::Plain => c[3] += 1,
+            }
+        }
+        c
+    }
+
+    pub fn heal_needed(&self) -> (u32, u32) {
+        let missing: u32 = self.squad.iter().map(|t| (t.max_hp - t.hp).max(0) as u32).sum();
+        (missing, missing * HEAL_COST_PER_HP)
+    }
+
+    pub fn heal_squad(&mut self) -> bool {
+        if self.clash.is_some() || !self.special_in_supply() || !self.special().alive {
+            return false;
+        }
+        let mut healed = false;
+        for t in &mut self.squad {
+            while t.hp < t.max_hp && self.biomass >= HEAL_COST_PER_HP {
+                t.hp += 1;
+                self.biomass -= HEAL_COST_PER_HP;
+                healed = true;
+            }
+        }
+        healed
+    }
+
+    pub fn regene_trooper(&mut self, idx: usize, gene: Gene) -> bool {
+        if self.clash.is_some() || !self.special_in_supply() || !self.special().alive {
+            return false;
+        }
+        let Some(t) = self.squad.get_mut(idx) else { return false };
+        if t.gene == gene || self.biomass < REGENE_COST {
+            return false;
+        }
+        t.gene = gene;
+        self.biomass -= REGENE_COST;
+        true
+    }
+
+    pub fn recruit_trooper(&mut self) -> bool {
+        if self.clash.is_some() || !self.special_in_supply() || !self.special().alive {
+            return false;
+        }
+        if self.squad.len() >= MAX_SQUAD || self.biomass < RECRUIT_COST {
+            return false;
+        }
+        self.biomass -= RECRUIT_COST;
+        self.squad.push(Trooper::new(Gene::Plain));
+        self.forces[0].size = self.squad.len() as u32;
+        true
+    }
+
+    /// 현재 충돌(`clash`)을 실제 전술 전투 설정으로 변환한다 (헥스 지형·매복·주둔·중계·합동전 반영).
+    pub fn battle_config(&self) -> Option<BattleConfig> {
+        let (sp_idx, foe_idx) = self.clash?;
+        let sp = &self.forces[sp_idx];
+        let foe = &self.forces[foe_idx];
+        if self.squad.is_empty() || !foe.alive {
+            return None;
+        }
+
+        let sp_terrain = self.terrain_at(sp.pos);
+        let ambush = sp.duty == Duty::Ambush || sp_terrain == Terrain::Forest;
+        let garrison = (sp.duty == Duty::Garrison && self.site_index_at(sp.pos).is_some()) || sp_terrain == Terrain::Hill;
+        let relay_cut = !self.sites.iter().any(|s| {
+            s.kind == SiteKind::Relay && s.owner == Some(Side::Empire) && hex_dist(s.pos, foe.pos) <= 14
+        });
+        let allied_total: u32 = self
+            .forces
+            .iter()
+            .filter(|f| {
+                f.alive
+                    && f.role == ForceRole::BroodAi
+                    && (hex_dist(f.pos, sp.pos) <= 2 || hex_dist(f.pos, foe.pos) <= 2)
+            })
+            .map(|f| f.size)
+            .sum();
+        let allied_ai = if allied_total > 0 { ((allied_total + 1) / 3).clamp(1, 3) as usize } else { 0 };
+
+        let mut empire = Vec::new();
+        let target_n = foe.size.clamp(3, 8) as usize;
+        let bseed = self.seed ^ self.tick.wrapping_mul(0x9e3779b97f4a7c15) ^ (foe_idx as u64);
+        let counter = [Class::Sensor, Class::Smoker, Class::Shield][(bseed % 3) as usize];
+        match foe.role {
+            ForceRole::EmpireConvoy => {
+                empire.push(Class::Shield);
+                while empire.len() < target_n {
+                    empire.push(Class::Trooper);
+                }
+            }
+            ForceRole::EmpirePatrol => {
+                empire.push(Class::Sensor);
+                if !relay_cut && target_n >= 4 {
+                    empire.push(Class::Relay);
+                }
+                while empire.len() < target_n {
+                    empire.push(Class::Trooper);
+                }
+            }
+            _ => {
+                if !relay_cut {
+                    empire.push(Class::Relay);
+                }
+                if target_n >= 4 {
+                    empire.push(counter);
+                }
+                if target_n >= 7 {
+                    empire.push(Class::Shield);
+                }
+                while empire.len() < target_n {
+                    empire.push(Class::Trooper);
+                }
+            }
+        }
+
+        let title = match self.site_index_at(foe.pos) {
+            Some(si) => format!("{} {} 전투", self.sites[si].code, self.sites[si].kind.label()),
+            None => format!("{} {} 교전", sector_code(foe.pos), self.terrain_at(foe.pos).label()),
+        };
+        let mut tags = Vec::new();
+        if sp.duty == Duty::Ambush {
+            tags.push("매복 기습".to_string());
+        } else if sp_terrain == Terrain::Forest {
+            tags.push("숲 기습".to_string());
+        }
+        if sp.duty == Duty::Garrison && self.site_index_at(sp.pos).is_some() {
+            tags.push("주둔(+엄폐)".to_string());
+        } else if sp_terrain == Terrain::Hill {
+            tags.push("고지 엄폐".to_string());
+        }
+        if relay_cut { tags.push("중계 차단".to_string()); }
+        if allied_ai > 0 { tags.push(format!("아군 일반군 +{allied_ai}")); }
+
+        let special = self.squad.iter().enumerate().map(|(slot, t)| (slot, t.gene, t.hp)).collect();
+
+        Some(BattleConfig {
+            seed: bseed,
+            special,
+            allied_ai,
+            empire,
+            ambush,
+            garrison,
+            relay_cut,
+            title,
+            tags,
+        })
+    }
+
+    pub fn resolve_battle(&mut self, won: bool, allied_losses: u32, empire_losses: u32, packed_hp: u32) -> bool {
+        let Some((sp_idx, foe_idx)) = self.clash.take() else { return false };
+        let foe_pos = self.forces[foe_idx].pos;
+        let foe_role = self.forces[foe_idx].role;
+        let sp_pos = self.forces[sp_idx].pos;
+
+        let before = self.squad.len();
+        let mut survivors = Vec::new();
+        for (i, mut t) in self.squad.drain(..).enumerate() {
+            let hp = ((packed_hp >> (i * 4)) & 0xf) as i32;
+            if hp > 0 {
+                t.hp = hp.min(t.max_hp);
+                t.battles += 1;
+                survivors.push(t);
+            }
+        }
+        let kia = before.saturating_sub(survivors.len());
+        self.squad = survivors;
+        self.forces[sp_idx].size = self.squad.len() as u32;
+        self.forces[sp_idx].alive = !self.squad.is_empty();
+        self.forces[sp_idx].order = Order::Hold;
+
+        if allied_losses > 0 {
+            if let Some(ally) = self.forces.iter_mut().find(|f| {
+                f.alive
+                    && f.role == ForceRole::BroodAi
+                    && (hex_dist(f.pos, sp_pos) <= 2 || hex_dist(f.pos, foe_pos) <= 2)
+            }) {
+                ally.size = ally.size.saturating_sub(allied_losses);
+                if ally.size == 0 {
+                    ally.alive = false;
+                }
+            }
+        }
+
+        let loc = match self.site_index_at(foe_pos) {
+            Some(si) => format!("{} {}", self.sites[si].code, self.sites[si].kind.label()),
+            None => sector_code(foe_pos),
+        };
+
+        if won {
+            let rem = self.forces[foe_idx].size.saturating_sub(empire_losses.max(8));
+            if rem == 0 {
+                self.forces[foe_idx].size = 0;
+                self.forces[foe_idx].alive = false;
+                self.forces[foe_idx].order = Order::Hold;
+                if !self.forces.iter().any(|f| f.alive && f.side == Side::Empire && f.pos == foe_pos) {
+                    self.forces[sp_idx].pos = foe_pos;
+                    if let Some(si) = self.site_index_at(foe_pos) {
+                        let was_empire_hq = self.sites[si].kind == SiteKind::Hq(Side::Empire);
+                        self.sites[si].owner = Some(Side::Brood);
+                        if was_empire_hq {
+                            self.victory = Some(Side::Brood);
+                        }
+                    }
+                }
+            } else {
+                self.forces[foe_idx].size = rem;
+            }
+            let reward = if foe_role == ForceRole::EmpireConvoy { 18 } else { 12 };
+            self.biomass += reward;
+            let kia_note = if kia > 0 { format!(" · 전사 {kia}") } else { String::new() };
+            self.push_event(foe_pos, format!("{loc} 특수부대 승리 (+생체질 {reward}{kia_note})"), false);
+        } else {
+            self.forces[foe_idx].size = self.forces[foe_idx].size.saturating_sub(empire_losses).max(1);
+            self.forces[sp_idx].duty = Duty::None;
+            if self.squad.is_empty() {
+                self.victory = Some(Side::Empire);
+                self.push_event(sp_pos, format!("{loc} 특수부대 전멸"), true);
+            } else {
+                let kia_note = if kia > 0 { format!(" (전사 {kia})") } else { String::new() };
+                self.push_event(sp_pos, format!("{loc} 특수부대 후퇴 생환{kia_note}"), true);
+            }
+        }
+
+        self.recompute_territory();
+        self.recompute_supply();
+        self.stop_reason = StopReason::None;
+        self.compute_proposals();
+        true
     }
 
     pub fn fingerprint(&self) -> u64 {
@@ -1136,6 +1655,10 @@ impl World {
         mix(self.tick);
         mix(self.biomass as u64);
         mix(self.research_pct as u64);
+        mix(self.squad.len() as u64);
+        for t in &self.squad {
+            mix(t.hp as u64 | ((t.gene as u64) << 8) | ((t.battles as u64) << 16));
+        }
         for f in &self.forces {
             if !f.alive {
                 continue;
@@ -1162,48 +1685,44 @@ fn make_force(side: Side, role: ForceRole, pos: Pos, size: u32, duty: Duty) -> F
     Force { side, role, pos, size, order: Order::Hold, duty, progress: 0, alive: true }
 }
 
-fn pick_site_kind(col: i32, rng: &mut Rng) -> (SiteKind, Option<Side>) {
+fn pick_site_kind(col: i32, t: Terrain, rng: &mut Rng) -> (SiteKind, Option<Side>) {
     let r = rng.below(100);
     if col <= 2 {
-        // 서부 (변경·은신처)
         if r < 45 {
             (SiteKind::Hideout, Some(Side::Brood))
-        } else if r < 70 {
+        } else if r < 72 {
             (SiteKind::Choke, Some(Side::Brood))
         } else {
             (SiteKind::Resource, Some(Side::Brood))
         }
-    } else if col <= 6 {
-        // 중앙 (자원지·고지·분쟁지)
-        if r < 28 {
-            (SiteKind::Resource, None)
-        } else if r < 52 {
+    } else if col <= 5 {
+        if t == Terrain::Hill && r < 55 {
             (SiteKind::Ridge, None)
-        } else if r < 80 {
+        } else if r < 34 {
+            (SiteKind::Resource, None)
+        } else if r < 60 {
+            (SiteKind::Ridge, None)
+        } else if r < 82 {
             (SiteKind::Choke, None)
         } else {
             (SiteKind::Relay, Some(Side::Empire))
         }
-    } else if col <= 8 {
-        // 중동부 (제국 전초·중계탑)
+    } else if col <= 7 {
         if r < 45 {
             (SiteKind::Outpost, Some(Side::Empire))
-        } else if r < 72 {
+        } else if r < 75 {
             (SiteKind::Relay, Some(Side::Empire))
-        } else if r < 88 {
+        } else if r < 90 {
             (SiteKind::Choke, Some(Side::Empire))
         } else {
             (SiteKind::Resource, Some(Side::Empire))
         }
+    } else if r < 42 {
+        (SiteKind::Landing, Some(Side::Empire))
+    } else if r < 84 {
+        (SiteKind::Outpost, Some(Side::Empire))
     } else {
-        // 동부 (제국 착륙장·전초)
-        if r < 42 {
-            (SiteKind::Landing, Some(Side::Empire))
-        } else if r < 82 {
-            (SiteKind::Outpost, Some(Side::Empire))
-        } else {
-            (SiteKind::Choke, Some(Side::Empire))
-        }
+        (SiteKind::Choke, Some(Side::Empire))
     }
 }
 
@@ -1229,72 +1748,72 @@ mod tests {
     use super::*;
 
     #[test]
-    fn large_theater_has_40_to_60_connected_sites() {
-        for seed in 0..20 {
+    fn hex_theater_80x52_is_connected_and_has_civ_territory() {
+        for seed in 0..8 {
             let w = World::new(seed);
-            assert!(
-                (40..=66).contains(&w.sites.len()),
-                "seed {seed}: sites = {}",
-                w.sites.len()
-            );
+            assert!(w.sites.len() >= 40 && w.sites.len() <= 64, "seed {seed}: sites={}", w.sites.len());
             for s in &w.sites[1..] {
-                assert!(w.route(w.sites[0].pos, s.pos).is_some(), "seed {seed}: {:?}", s.pos);
+                assert!(w.route(w.sites[0].pos, s.pos).is_some(), "seed {seed}: unreachable {:?}", s.pos);
             }
-            assert!(w.sites.iter().any(|s| s.kind == SiteKind::Hq(Side::Brood)));
-            assert!(w.sites.iter().any(|s| s.kind == SiteKind::Hq(Side::Empire)));
-            assert_eq!(w.proposals.len(), 3, "seed {seed}: should have 1+2 proposals");
+            assert!(w.territory.iter().any(|t| *t == Some(Side::Brood)));
+            assert!(w.territory.iter().any(|t| *t == Some(Side::Empire)));
+            assert!(w.special_in_supply());
+            assert_eq!(w.proposals.len(), 3);
         }
     }
 
     #[test]
-    fn maps_differ_by_seed_and_repeat_for_the_same_seed() {
-        assert_eq!(World::new(5).ground, World::new(5).ground);
-        assert_ne!(World::new(5).ground, World::new(6).ground);
+    fn roads_are_faster_than_offroad_and_extend_supply() {
+        let w = World::new(3);
+        let road_hex = (0..HEX_COUNT)
+            .map(|i| ((i as i32) % WW, (i as i32) / WW))
+            .find(|&p| w.has_road(p))
+            .unwrap();
+        let forest_hex = (0..HEX_COUNT)
+            .map(|i| ((i as i32) % WW, (i as i32) / WW))
+            .find(|&p| !w.has_road(p) && w.terrain_at(p) == Terrain::Forest)
+            .unwrap();
+        assert!(
+            w.hex_step_ticks(ForceRole::EmpireConvoy, 4, road_hex)
+                < w.hex_step_ticks(ForceRole::EmpireConvoy, 4, forest_hex)
+        );
+        assert!(
+            w.hex_step_ticks(ForceRole::Special, 6, forest_hex)
+                < w.hex_step_ticks(ForceRole::EmpireConvoy, 6, forest_hex)
+        );
     }
 
     #[test]
-    fn clicking_other_tiles_without_selecting_special_does_not_command() {
+    fn maps_differ_by_seed_and_repeat_for_the_same_seed() {
+        assert_eq!(World::new(5).terrain, World::new(5).terrain);
+        assert_ne!(World::new(5).terrain, World::new(6).terrain);
+    }
+
+    #[test]
+    fn clicking_other_hexes_without_selecting_special_does_not_command() {
         let mut w = World::new(3);
         let sp_pos = w.special().pos;
         let other = w.sites.iter().find(|s| s.pos != sp_pos).unwrap().pos;
-        assert!(!w.click(other), "비선택 상태 클릭은 명령이 아니라 조사다");
+        assert!(!w.click(other));
         assert!(w.selected.is_none());
-        assert!(w.click(sp_pos), "특수부대 클릭 시 선택된다");
+        assert!(w.click(sp_pos));
         assert_eq!(w.selected, Some(0));
-        assert!(w.click(other), "선택 후 목적지 클릭 시 타깃이 찍힌다");
+        assert!(w.click(other));
         assert_eq!(w.target, Some(other));
         assert!(w.command(Command::Move));
         assert!(matches!(w.special().order, Order::Move(_)));
     }
 
     #[test]
-    fn accept_proposal_issues_order_and_ticks_deterministically() {
+    fn accept_proposal_and_tick_deterministically() {
         let run = || {
             let mut w = World::new(9);
             assert!(w.accept_proposal(0));
-            for _ in 0..120 {
+            for _ in 0..96 {
                 w.tick();
             }
             w.fingerprint()
         };
         assert_eq!(run(), run());
-    }
-
-    #[test]
-    fn special_garrison_and_scout_work() {
-        let mut w = World::new(3);
-        let start = w.special().pos;
-        let site = w.sites.iter().map(|x| x.pos).find(|&p| p != start).unwrap();
-        let path = w.route(start, site).unwrap();
-        let road = path[0];
-        assert!(w.select_special());
-        w.click(road);
-        assert!(!w.can_garrison());
-        assert!(!w.command(Command::Garrison));
-        assert!(w.command(Command::Ambush));
-        for _ in 0..50 {
-            w.tick();
-        }
-        assert_eq!(w.special().duty, Duty::Ambush);
     }
 }

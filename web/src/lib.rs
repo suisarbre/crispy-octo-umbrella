@@ -9,7 +9,7 @@ pub mod world;
 
 use std::collections::VecDeque;
 
-use sim::{dist, Event, Game, Pos, Side, Tile, H, SIGHT, W};
+use sim::{dist, BattleConfig, Event, Game, Pos, Side, Tile, H, SIGHT, W};
 
 /// 팔레트 번호. 실제 색은 www/main.js가 정한다.
 pub const BG: u32 = 0;
@@ -17,7 +17,7 @@ pub const DIM: u32 = 1;
 pub const FG: u32 = 2;
 pub const BROOD: u32 = 3;
 pub const EMPIRE: u32 = 4;
-/// 아군 색을 흐리게 한 것. 월드에서 고르지 않은 부대의 길에만 쓴다.
+/// 아군 색을 흐리게 한 것. 월드 아군 일반군·비선택 경로, 전투 합동 아군 AI에 쓴다.
 pub const BROOD_DIM: u32 = 5;
 
 /// `advance`가 돌려주는 박자 종류. 상위 16비트에 종류, 하위 16비트에 길이(ms).
@@ -28,6 +28,7 @@ pub const BEAT_MISS: u32 = 4;
 pub const BEAT_KILL: u32 = 5;
 pub const BEAT_BURROW: u32 = 6;
 pub const BEAT_SMOKE: u32 = 7;
+pub const BEAT_RETREAT: u32 = 8;
 
 const STEP_MS_BROOD: u32 = 55;
 const STEP_MS_EMPIRE: u32 = 90;
@@ -36,11 +37,14 @@ const IMPACT_MS: u32 = 170;
 const KILL_MS: u32 = 240;
 const BURROW_MS: u32 = 160;
 const SMOKE_MS: u32 = 240;
+const RETREAT_MS: u32 = 160;
 /// 빗나간 탄이 표적을 지나 더 날아가는 칸 수.
 const OVERSHOOT: usize = 3;
 
 const CELLS: usize = (W * H) as usize;
-/// 문구 구역 구분자. 순서: 상황, 중계 링크, 장부 내역, 장부 결과, 쓸 수 있는 능력.
+/// 문구 구역 구분자.
+/// 0: 상황, 1: 장부 내역, 2: 장부 결과, 3: 잠복 능력, 4: 분대원 목록,
+/// 5: 후퇴 가능, 6: 월드 전투 헤더, 7: 합동 아군 AI 요약.
 const SEP: &str = "\u{1f}";
 
 #[derive(Clone, Copy)]
@@ -48,6 +52,7 @@ struct ViewUnit {
     pos: Pos,
     hp: i32,
     burrowed: bool,
+    retreated: bool,
 }
 
 enum Fx {
@@ -77,12 +82,19 @@ struct State {
     fx: Fx,
     log_shown: usize,
     empire_phase: bool,
+    allied_ai_phase: bool,
+    /// 월드에서 진입한 전투의 제목/조건 태그.
+    battle_header: String,
 }
 
 impl State {
     fn new(seed: u64) -> State {
+        Self::from_game(Game::new(seed), String::new())
+    }
+
+    fn from_game(game: Game, battle_header: String) -> State {
         let mut s = State {
-            game: Game::new(seed),
+            game,
             hover: None,
             frame: [0; CELLS],
             text: String::new(),
@@ -94,6 +106,8 @@ impl State {
             fx: Fx::None,
             log_shown: 0,
             empire_phase: false,
+            allied_ai_phase: false,
+            battle_header,
         };
         s.sync();
         s
@@ -110,7 +124,13 @@ impl State {
         self.shot_stage = 0;
         self.fx = Fx::None;
         self.empire_phase = false;
-        self.view = self.game.units.iter().map(|u| ViewUnit { pos: u.pos, hp: u.hp, burrowed: u.burrowed }).collect();
+        self.allied_ai_phase = false;
+        self.view = self
+            .game
+            .units
+            .iter()
+            .map(|u| ViewUnit { pos: u.pos, hp: u.hp, burrowed: u.burrowed, retreated: u.retreated })
+            .collect();
         self.view_smoke = self.game.smoke.iter().map(|&s| s > 0).collect();
         self.log_shown = self.game.log.len();
     }
@@ -129,12 +149,12 @@ impl State {
     /// 보여주는 중인 위치 기준으로 아군이 `p`를 보고 있는가.
     fn seen(&self, p: Pos) -> bool {
         self.view.iter().zip(&self.game.units).any(|(v, u)| {
-            u.side == Side::Brood && v.hp > 0 && dist(v.pos, p) <= SIGHT && self.game.los(v.pos, p)
+            u.side == Side::Brood && v.hp > 0 && !v.retreated && dist(v.pos, p) <= SIGHT && self.game.los(v.pos, p)
         })
     }
 
     fn view_unit_at(&self, p: Pos) -> Option<usize> {
-        self.view.iter().position(|v| v.hp > 0 && v.pos == p)
+        self.view.iter().position(|v| v.hp > 0 && !v.retreated && v.pos == p)
     }
 
     /// 다음 박자를 화면에 반영한다. 돌려주는 값은 종류<<16 | 길이(ms). 끝났으면 0.
@@ -148,7 +168,9 @@ impl State {
             match event {
                 Event::Step { unit, from, to } => {
                     self.queue.pop_front();
-                    let empire = self.game.units[unit].side == Side::Empire;
+                    let u = &self.game.units[unit];
+                    let empire = u.side == Side::Empire;
+                    self.allied_ai_phase = !empire && u.ai_controlled;
                     let before = empire && self.seen(from);
                     self.view[unit].pos = to;
                     self.view[unit].burrowed = false;
@@ -159,10 +181,16 @@ impl State {
                     return BEAT_STEP << 16 | if empire { STEP_MS_EMPIRE } else { STEP_MS_BROOD };
                 }
                 Event::Shot { shooter, target, hit, dmg, killed, log_lines } => {
+                    let su = &self.game.units[shooter];
+                    self.allied_ai_phase = su.side == Side::Brood && su.ai_controlled;
                     let (a, b) = (self.view[shooter].pos, self.view[target].pos);
                     match self.shot_stage {
                         0 => {
-                            let color = if self.game.units[shooter].side == Side::Brood { BROOD } else { EMPIRE };
+                            let color = if su.side == Side::Brood {
+                                if su.ai_controlled { BROOD_DIM } else { BROOD }
+                            } else {
+                                EMPIRE
+                            };
                             self.view[shooter].burrowed = false;
                             self.fx = Fx::Tracer { cells: Game::line(a, b), color };
                             self.shot_stage = 1;
@@ -196,6 +224,7 @@ impl State {
                 }
                 Event::Smoke { center, .. } => {
                     self.queue.pop_front();
+                    self.allied_ai_phase = false;
                     for y in center.1 - 1..=center.1 + 1 {
                         for x in center.0 - 1..=center.0 + 1 {
                             if in_frame((x, y)) && self.game.tile((x, y)) != Tile::Wall {
@@ -204,6 +233,11 @@ impl State {
                         }
                     }
                     return BEAT_SMOKE << 16 | SMOKE_MS;
+                }
+                Event::Retreat { unit } => {
+                    self.queue.pop_front();
+                    self.view[unit].retreated = true;
+                    return BEAT_RETREAT << 16 | RETREAT_MS;
                 }
             }
         }
@@ -252,6 +286,7 @@ fn render(s: &mut State) {
         for x in 0..W {
             s.frame[idx((x, y))] = match g.tile((x, y)) {
                 Tile::Floor if s.view_smoke[idx((x, y))] => cell('≈', DIM, BG),
+                Tile::Floor if x == 0 && y % 2 == 1 => cell('◁', DIM, BG),
                 Tile::Floor => cell('·', DIM, BG),
                 Tile::Low => cell('▄', DIM, BG),
                 Tile::Wall => cell('█', DIM, BG),
@@ -263,7 +298,8 @@ fn render(s: &mut State) {
     if let (Some(sel), true) = (g.selected, can_act) {
         if g.units[sel].ap > 0 {
             for p in g.reachable(sel) {
-                s.frame[idx(p)] = cell('·', BROOD, BG);
+                let ch = if p.0 == 0 && p.1 % 2 == 1 { '◁' } else { '·' };
+                s.frame[idx(p)] = cell(ch, BROOD, BG);
             }
             // 가리킨 칸까지 실제로 걸어갈 길.
             if let Some(path) = s.hover.and_then(|h| g.path_to(sel, h)) {
@@ -296,13 +332,18 @@ fn render(s: &mut State) {
 
     for (i, u) in g.units.iter().enumerate() {
         let v = s.view[i];
-        if v.hp <= 0 {
+        if v.hp <= 0 || v.retreated {
             continue;
         }
         // 땅에 숨은 아군은 흙더미로 보인다.
         let glyph = if v.burrowed { '∩' } else { u.glyph() };
         let struck = matches!(s.fx, Fx::Hit { target, .. } if target == i);
         let shown = match u.side {
+            Side::Brood if u.ai_controlled => Some(if struck {
+                cell(glyph, BG, FG)
+            } else {
+                cell(glyph, BROOD_DIM, BG)
+            }),
             Side::Brood => Some(if struck {
                 cell(glyph, BG, FG)
             } else if g.selected == Some(i) && can_act {
@@ -328,10 +369,19 @@ fn render(s: &mut State) {
     }
 
     let (ledger, result) = if can_act { ledger(s, &lanes) } else { ("—".to_string(), String::new()) };
+    let retreated_any = g.units.iter().any(|u| u.side == Side::Brood && !u.ai_controlled && u.retreated);
+    let ai_alive = g
+        .units
+        .iter()
+        .enumerate()
+        .filter(|(i, u)| u.side == Side::Brood && u.ai_controlled && s.view[*i].hp > 0)
+        .count();
     let sections = [
         match (playing, g.outcome) {
+            (true, _) if s.allied_ai_phase => "아군 일반군 행동".to_string(),
             (true, _) if s.empire_phase => "제국 행동".to_string(),
             (false, Some(Side::Brood)) => "제국 분대 전멸".to_string(),
+            (false, Some(Side::Empire)) if retreated_any => "특수부대 후퇴 생환".to_string(),
             (false, Some(Side::Empire)) => "전원 사망".to_string(),
             _ => format!("라운드 {}", g.round),
         },
@@ -339,6 +389,9 @@ fn render(s: &mut State) {
         result,
         if can_act && g.can_burrow() { "잠복".to_string() } else { String::new() },
         roster_text(s),
+        if can_act && g.can_retreat() { "후퇴".to_string() } else { String::new() },
+        s.battle_header.clone(),
+        if ai_alive > 0 { format!("AI 아군 {ai_alive}명") } else { String::new() },
     ];
     s.text = sections.join(SEP);
 }
@@ -350,7 +403,7 @@ fn roster_text(s: &State) -> String {
     g.units
         .iter()
         .enumerate()
-        .filter(|(i, u)| u.side == Side::Brood && s.view[*i].hp > 0)
+        .filter(|(i, u)| u.side == Side::Brood && !u.ai_controlled && s.view[*i].hp > 0 && !s.view[*i].retreated)
         .map(|(i, u)| {
             let v = s.view[i];
             let max = u.class.def().hp;
@@ -360,6 +413,8 @@ fn roster_text(s: &State) -> String {
             let ap = if playing { 0 } else { u.ap };
             let tag = if v.burrowed {
                 "숨음"
+            } else if v.pos.0 == 0 && ap > 0 {
+                "후퇴가능"
             } else if ap == 0 {
                 "완료"
             } else {
@@ -508,6 +563,65 @@ pub extern "C" fn ability() -> u32 {
     changed as u32
 }
 
+/// 선택한 플레이어 유닛을 좌측 가장자리에서 후퇴시킨다.
+#[no_mangle]
+pub extern "C" fn retreat() -> u32 {
+    let s = state();
+    let changed = s.game.retreat();
+    s.enqueue(false);
+    render(s);
+    changed as u32
+}
+
+/// 전투가 끝났는가. 0: 진행 중, 1: 아군 승리, 2: 패배/후퇴.
+#[no_mangle]
+pub extern "C" fn battle_done() -> u32 {
+    let s = state();
+    if s.playing() {
+        return 0;
+    }
+    match s.game.outcome {
+        None => 0,
+        Some(Side::Brood) => 1,
+        Some(Side::Empire) => 2,
+    }
+}
+
+pub(crate) fn start_world_battle(cfg: &BattleConfig) {
+    let header = if cfg.tags.is_empty() {
+        cfg.title.clone()
+    } else {
+        format!("{} · {}", cfg.title, cfg.tags.join(" · "))
+    };
+    let s = state();
+    *s = State::from_game(Game::from_battle(cfg), header);
+    render(s);
+}
+
+/// 끝난 월드 전투에서 `(won, allied_losses, empire_losses, packed_hp)`를 추출한다.
+pub(crate) fn extract_world_battle_result() -> Option<(bool, u32, u32, u32)> {
+    let s = state();
+    let outcome = s.game.outcome?;
+    let won = outcome == Side::Brood;
+    let mut packed_hp = 0u32;
+    let mut allied_losses = 0u32;
+    let mut empire_losses = 0u32;
+    for u in &s.game.units {
+        if let Some(slot) = u.squad_slot {
+            if slot < 8 && u.hp > 0 {
+                // 생존(전장 생존 또는 후퇴 생환)
+                let hp = (u.hp as u32).min(15);
+                packed_hp |= hp << (slot * 4);
+            }
+        } else if u.side == Side::Brood && u.ai_controlled && u.hp <= 0 {
+            allied_losses += 1;
+        } else if u.side == Side::Empire && u.hp <= 0 {
+            empire_losses += 1;
+        }
+    }
+    Some((won, allied_losses, empire_losses, packed_hp))
+}
+
 /// 다음 박자로 넘긴다. 종류<<16 | 길이(ms)를 돌려주고, 보여줄 게 없으면 0.
 #[no_mangle]
 pub extern "C" fn advance() -> u32 {
@@ -610,7 +724,7 @@ mod tests {
         init(3);
         assert!(state().frame.iter().all(|&c| c != 0));
         let parts: Vec<String> = state().text.split(SEP).map(String::from).collect();
-        assert_eq!(parts.len(), 5);
+        assert_eq!(parts.len(), 8);
         assert_eq!(parts[0], "라운드 1");
         assert_eq!(parts[4].lines().count(), 4);
 

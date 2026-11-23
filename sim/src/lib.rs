@@ -117,19 +117,41 @@ pub struct Unit {
     pub burrowed: bool,
     /// 남은 연막 수.
     pub charges: u8,
+    /// 합동전 아군 AI 일반군처럼 기계가 조종하는 아군 유닛인가.
+    pub ai_controlled: bool,
+    /// 전장 가장자리로 무사히 후퇴했는가.
+    pub retreated: bool,
+    /// 월드 특수부대 대원 번호 (특수부대원이 아니면 None).
+    pub squad_slot: Option<usize>,
 }
 
 impl Unit {
     fn new(side: Side, class: Class, gene: Gene, pos: Pos) -> Unit {
         let charges = if class == Class::Smoker { SMOKE_CHARGES } else { 0 };
-        Unit { side, class, gene, hp: class.def().hp, pos, ap: AP_PER_TURN, moved: false, burrowed: false, charges }
+        Unit {
+            side,
+            class,
+            gene,
+            hp: class.def().hp,
+            pos,
+            ap: AP_PER_TURN,
+            moved: false,
+            burrowed: false,
+            charges,
+            ai_controlled: false,
+            retreated: false,
+            squad_slot: None,
+        }
     }
 
     pub fn alive(&self) -> bool {
-        self.hp > 0
+        self.hp > 0 && !self.retreated
     }
 
     pub fn glyph(&self) -> char {
+        if self.side == Side::Brood && self.ai_controlled {
+            return 'a';
+        }
         match self.gene {
             Gene::Sniper => 'ψ',
             Gene::Burst => 'θ',
@@ -139,6 +161,9 @@ impl Unit {
     }
 
     pub fn name(&self) -> &'static str {
+        if self.side == Side::Brood && self.ai_controlled {
+            return "아군 일반군";
+        }
         match self.gene {
             Gene::Sniper => "저격",
             Gene::Burst => "화력",
@@ -154,6 +179,26 @@ impl Unit {
             self.class.def().range
         }
     }
+}
+
+/// 월드 충돌에서 전술 전투로 넘기는 설정.
+#[derive(Clone, Debug)]
+pub struct BattleConfig {
+    pub seed: u64,
+    /// 특수부대 대원들: `(월드 슬롯 번호, 개조, 현재 체력)`.
+    pub special: Vec<(usize, Gene, i32)>,
+    /// 합동 참전 아군 AI 일반군 수.
+    pub allied_ai: usize,
+    /// 제국 편제.
+    pub empire: Vec<Class>,
+    /// 매복 기습: 제국이 엄폐 없이 노출 시작, 잠복 개조 대원은 숨은 채 시작.
+    pub ambush: bool,
+    /// 주둔 방어: 아군 앞줄에 낮은 엄폐 보장.
+    pub garrison: bool,
+    /// 중계탑 차단 구역: 제국 중계기 제외.
+    pub relay_cut: bool,
+    pub title: String,
+    pub tags: Vec<String>,
 }
 
 /// 사격 한 번의 명중률과 그 내역. 화면에 보이는 숫자가 곧 굴리는 숫자다.
@@ -176,6 +221,8 @@ pub enum Event {
     Burrow { unit: usize },
     /// 연막이 깔렸다. `center` 둘레 3×3.
     Smoke { unit: usize, center: Pos },
+    /// 가장자리로 후퇴해 생환했다.
+    Retreat { unit: usize },
 }
 
 #[derive(Clone, Debug)]
@@ -257,6 +304,112 @@ impl Game {
         let memory = vec![None; units.len()];
         let mut g = Game {
             seed,
+            tiles,
+            units,
+            round: 1,
+            selected: None,
+            outcome: None,
+            log: Vec::new(),
+            events: Vec::new(),
+            smoke: vec![0; (W * H) as usize],
+            memory,
+            doctrine: ai::Doctrine::default(),
+            stand_in: ai::Doctrine::CAUTIOUS,
+            rng,
+        };
+        g.observe();
+        g
+    }
+
+    /// 월드 충돌 설정으로 전술 전투를 만든다. 매복·주둔·중계 차단·합동 참전을 반영한다.
+    pub fn from_battle(cfg: &BattleConfig) -> Game {
+        let mut rng = Rng::new(cfg.seed);
+        let mut tiles = vec![Tile::Floor; (W * H) as usize];
+        for y in 0..H {
+            for x in 3..W - 3 {
+                let r = rng.below(100);
+                tiles[idx((x, y))] = if r < 7 {
+                    Tile::Wall
+                } else if r < 19 {
+                    Tile::Low
+                } else {
+                    Tile::Floor
+                };
+            }
+        }
+        // 매복 기습: 제국 쪽 앞줄 엄폐물을 걷어 노출 상태로 시작하게 한다.
+        if cfg.ambush {
+            for y in 0..H {
+                for x in (W - 6)..(W - 1) {
+                    tiles[idx((x, y))] = Tile::Floor;
+                }
+            }
+        }
+        // 주둔 방어: 아군 앞줄(x=2)에 엄폐물을 배치해 엄폐에서 시작하게 한다.
+        if cfg.garrison {
+            for y in (2..H - 2).step_by(2) {
+                tiles[idx((2, y))] = Tile::Low;
+            }
+        }
+
+        let row = |i: usize, n: usize, first: i32| {
+            if n <= 5 {
+                first + 3 * i as i32
+            } else {
+                ((H - n as i32) / 2 + i as i32).clamp(0, H - 1)
+            }
+        };
+
+        let mut units = Vec::new();
+        let sp_count = cfg.special.len().min(H as usize);
+        for (i, &(slot, gene, hp)) in cfg.special.iter().take(sp_count).enumerate() {
+            let y = row(i, sp_count, 3);
+            let mut u = Unit::new(Side::Brood, Class::Proto, gene, (1, y));
+            u.hp = hp.clamp(1, u.class.def().hp);
+            u.squad_slot = Some(slot);
+            if cfg.ambush && gene == Gene::Burrow {
+                u.burrowed = true;
+            }
+            units.push(u);
+        }
+
+        // 합동 참전 아군 AI 일반군 (특수부대 앞/측면 배치, 엄폐 칸은 피한다).
+        let ai_count = cfg.allied_ai.min(4);
+        for i in 0..ai_count {
+            let mut y = row(i, ai_count, 2);
+            let x = if cfg.garrison { 3 } else { 2 };
+            while tiles[idx((x, y))] != Tile::Floor && y + 1 < H {
+                y += 1;
+            }
+            tiles[idx((x, y))] = Tile::Floor;
+            let mut u = Unit::new(Side::Brood, Class::Proto, Gene::Plain, (x, y));
+            u.ai_controlled = true;
+            units.push(u);
+        }
+
+        let emp_list: Vec<Class> = cfg
+            .empire
+            .iter()
+            .copied()
+            .filter(|&c| !(cfg.relay_cut && c == Class::Relay))
+            .take(H as usize)
+            .collect();
+        for (i, c) in emp_list.iter().enumerate() {
+            let x = if cfg.ambush {
+                if *c == Class::Relay { W - 3 } else { W - 4 }
+            } else if *c == Class::Relay {
+                W - 1
+            } else {
+                W - 2
+            };
+            let y = row(i, emp_list.len(), 2);
+            tiles[idx((x, y))] = Tile::Floor;
+            units.push(Unit::new(Side::Empire, *c, Gene::Plain, (x, y)));
+        }
+
+        let memory = vec![None; units.len()];
+        let mut g = Game {
+            seed: cfg.seed,
             tiles,
             units,
             round: 1,
@@ -618,6 +771,9 @@ impl Game {
         }
         if let Some(t) = self.unit_at(p) {
             if self.units[t].side == Side::Brood {
+                if self.units[t].ai_controlled {
+                    return false;
+                }
                 self.selected = Some(t);
                 return true;
             }
@@ -656,12 +812,48 @@ impl Game {
         })
     }
 
-    /// 플레이어 턴을 끝낸다. 제국이 움직이고 다음 라운드가 시작된다.
+    /// 선택한 플레이어 유닛이 아군 쪽 가장자리(`x == 0`)에서 후퇴할 수 있는가.
+    pub fn can_retreat(&self) -> bool {
+        self.selected.is_some_and(|s| {
+            let u = &self.units[s];
+            self.outcome.is_none()
+                && u.side == Side::Brood
+                && !u.ai_controlled
+                && u.alive()
+                && u.ap > 0
+                && u.pos.0 == 0
+        })
+    }
+
+    /// 플레이어 입력: 선택한 유닛을 전장 밖으로 후퇴시켜 생환시킨다.
+    pub fn retreat(&mut self) -> bool {
+        if !self.can_retreat() {
+            return false;
+        }
+        let s = self.selected.unwrap();
+        self.units[s].retreated = true;
+        self.units[s].ap = 0;
+        self.selected = None;
+        let name = self.units[s].name();
+        self.log.push(format!("{name} 후퇴 생환"));
+        self.events.push(Event::Retreat { unit: s });
+        self.observe();
+        self.check_outcome();
+        true
+    }
+
+    /// 플레이어 턴을 끝낸다. 합동 아군 AI → 제국 AI 순서로 움직이고 다음 라운드가 시작된다.
     pub fn end_turn(&mut self) {
         if self.outcome.is_some() {
             return;
         }
         self.selected = None;
+        if self.units.iter().any(|u| u.side == Side::Brood && u.ai_controlled && u.alive()) {
+            ai::run_allied_ai(self);
+            if self.outcome.is_some() {
+                return;
+            }
+        }
         ai::run(self, Side::Empire);
         if self.outcome.is_some() {
             return;
@@ -672,14 +864,29 @@ impl Game {
     /// 라운드를 넘긴다. 행동이 돌아오고 연막이 한 라운드만큼 걷힌다.
     pub fn next_round(&mut self) {
         for u in &mut self.units {
-            u.ap = AP_PER_TURN;
-            u.moved = false;
+            if u.alive() {
+                u.ap = AP_PER_TURN;
+                u.moved = false;
+            }
         }
         for s in &mut self.smoke {
             *s = s.saturating_sub(1);
         }
         self.round += 1;
         self.observe();
+    }
+
+    fn check_outcome(&mut self) {
+        if !self.units.iter().any(|u| u.alive() && u.side == Side::Empire) {
+            self.outcome = Some(Side::Brood);
+            return;
+        }
+        let has_player_units = self.units.iter().any(|u| u.side == Side::Brood && !u.ai_controlled);
+        let player_left = self.units.iter().any(|u| u.alive() && u.side == Side::Brood && !u.ai_controlled);
+        let brood_left = self.units.iter().any(|u| u.alive() && u.side == Side::Brood);
+        if !brood_left || (has_player_units && !player_left) {
+            self.outcome = Some(Side::Empire);
+        }
     }
 
     /// 사격. 보통은 그 유닛의 턴을 끝낸다. 화력 개조는 가까운 표적에 행동 1만 쓴다.
@@ -723,11 +930,7 @@ impl Game {
             log_lines: self.log.len() - log_before,
         });
         self.observe();
-        for side in [Side::Brood, Side::Empire] {
-            if !self.units.iter().any(|u| u.alive() && u.side == side) {
-                self.outcome = Some(if side == Side::Brood { Side::Empire } else { Side::Brood });
-            }
-        }
+        self.check_outcome();
     }
 
     /// 테스트와 세이브 검증용 상태 지문.

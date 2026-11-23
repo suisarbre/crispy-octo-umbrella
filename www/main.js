@@ -21,8 +21,8 @@ const ROWS = wasm.rows();
 ctx.font = `${FONT_PX}px ${FONT_FAMILY}`;
 const BASE_W = Math.ceil(ctx.measureText("M").width) + 4;
 const BASE_H = Math.ceil(FONT_PX * 1.3);
-// 유닛이 아닌 글리프: 바닥, 엄폐물, 벽, 길 표시, 연막, 시체.
-const TERRAIN = new Set([0xb7, 0x2584, 0x2588, 0x2022, 0x2248, 0xd7]);
+// 유닛이 아닌 글리프: 바닥, 엄폐물, 벽, 길 표시, 연막, 시체, 후퇴 경계.
+const TERRAIN = new Set([0xb7, 0x2584, 0x2588, 0x2022, 0x2248, 0xd7, 0x25c1]);
 const BROOD = 3;
 /// 탭이 유닛 칸 중심에서 이만큼(칸 단위) 안이면 그 유닛을 누른 것으로 친다.
 const SNAP = 0.95;
@@ -158,11 +158,12 @@ function draw() {
     const next = parts[i] ?? "";
     if (el.textContent !== next) el.textContent = next;
   });
-  // 네 번째 구역은 지금 쓸 수 있는 능력의 이름, 다섯 번째 구역은 분대원 목록이다.
+  // 네 번째 구역은 잠복, 다섯 번째 구역은 분대원 목록, 여섯 번째 구역은 후퇴 가능 여부.
   const ability = parts[3] ?? "";
   $("ability-name").textContent = ability;
   // 자리는 그대로 두고 감춘다. 버튼이 생겼다 없어질 때 화면이 밀리지 않게.
   $("ability").toggleAttribute("data-off", !ability);
+  $("retreat").toggleAttribute("data-off", !(parts[5] ?? ""));
   renderRoster(parts[4] ?? "");
   // 하단 바: 조준 중인 칸의 장부를 한 줄로.
   // 좁은 화면에서 잘려도 결과가 먼저 보이게 결과를 앞에 둔다.
@@ -222,6 +223,7 @@ function load(data) {
   for (const e of data.events) {
     if (e === "e") wasm.end_turn();
     else if (e === "b") wasm.ability();
+    else if (e === "r") wasm.retreat();
     else if (Array.isArray(e) && e.length === 2) wasm.click(e[0] | 0, e[1] | 0);
     else throw new Error("세이브 형식이 맞지 않음");
   }
@@ -289,7 +291,7 @@ function isOwnUnit(x, y) {
 function isReachable(x, y) {
   const c = frameNow()[y * COLS + x];
   const glyph = c & 0x1fffff;
-  return (glyph === 0xb7 || glyph === 0x2022) && ((c >>> 24) & 0xf) === BROOD;
+  return (glyph === 0xb7 || glyph === 0x2022 || glyph === 0x25c1) && ((c >>> 24) & 0xf) === BROOD;
 }
 
 function isEnemyUnit(x, y) {
@@ -439,7 +441,18 @@ function useAbility() {
   play();
 }
 
+function useRetreat() {
+  if ($("retreat").hasAttribute("data-off") || skipIfPlaying()) return;
+  clearPending();
+  if (wasm.retreat()) {
+    save.events.push("r");
+    persist();
+  }
+  play();
+}
+
 $("ability").addEventListener("click", useAbility);
+$("retreat").addEventListener("click", useRetreat);
 $("end").addEventListener("click", endTurn);
 $("end2").addEventListener("click", endTurn);
 $("new").addEventListener("click", () => {
@@ -474,6 +487,8 @@ document.addEventListener("keydown", (ev) => {
     endTurn();
   } else if (ev.code === "KeyB" && !$("ability").hasAttribute("data-off")) {
     useAbility();
+  } else if (ev.code === "KeyR" && !$("retreat").hasAttribute("data-off")) {
+    useRetreat();
   }
 });
 
